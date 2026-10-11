@@ -294,9 +294,12 @@ __global__ void __launch_bounds__(256) gqa_attn_rows_kernel(const float* __restr
 
 #if !defined(STRATA_USE_HIP)
 // ---- the same on the tensor cores (sm_70+, FP16 in, F32 accumulate) in one pass with a lazily rescaled output (see
-// below): S = Q K^T and O += P V per 32-key tile, the output in WMMA accumulators (registers).  Block (128 query rows, one query head), 8 warps
-// of 16 rows, each with its Q in 8 fragments; 32-key tiles of K and V through shared memory, S and P per warp.
-constexpr int kTQ = 128, kTK = 32, kTW = 8;
+// below): S = Q K^T and O += P V per 64-key tile, the output in WMMA accumulators (registers).  Block (128 query rows, one query head), 8 warps
+// of 16 rows, each with its Q in 8 fragments; 64-key tiles of K and V through shared memory, S and P per warp.
+#ifndef STRATA_GQA_KTK
+#define STRATA_GQA_KTK 64
+#endif
+constexpr int kTQ = 128, kTK = STRATA_GQA_KTK, kTW = 8;
 constexpr int kKH = kTK / 2;   // a lane pair's keys of a tile
 constexpr int kLdQ = kD + 8, kLdS = kTK + 4, kLdP = kTK + 8;   // (wmma: ldm % 8 halves / 4 floats)
 constexpr size_t kTcTile = 2 * (size_t) kTK * kLdQ * 2 + (size_t) kTW * 16 * kLdS * 4 + (size_t) kTW * 16 * kLdP * 2;

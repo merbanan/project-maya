@@ -1078,7 +1078,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
     std::string why;
     const auto deq_ok = [&](const WSlot& w, const char* nm, int il) {
         if (w.q == nullptr || (w.type != gf::kTypeBF16 && w.type != strata::kernels::exl3::kTypeEXL3 &&
-                               !strata::kernels::dequant_bf16_supported(w.type)))
+                               !strata::kernels::dequant_f16_supported(w.type)))   // (hgemm_q)
             why += "blk." + std::to_string(il) + "." + nm + " (type " + std::to_string(w.type) + ") ";
     };
     for (int il = l0_; il < l1_; ++il) {
