@@ -17,7 +17,8 @@
 // row's norm - takes the nearest level of the Lloyd-Max codebook of a unit Gaussian (what a rotated coordinate is close
 // to), and the row keeps one F32 scale: the least-squares fit of its values to the levels.  K's rotation is undone on q
 // instead (q.k = Rq.Rk: q is rotated by R in gqa_prep), V's on the attention's output (o = D H o').  Codes: 4-bit two
-// a byte; 3-bit eight in 3 bytes; 6-bit four in 3 bytes; the scale after them (52 / 68 / 100 bytes a row).
+// a byte; 3-bit eight in 3 bytes; 6-bit the low 4 bits as 4-bit's then the high 2 bits four a byte (aligned loads); the
+// scale after them (52 / 68 / 100 bytes a row).
 #include "strata/kernels/glm_fast.hpp"
 
 #include <cuda_fp16.h>
@@ -71,6 +72,7 @@ __device__ __forceinline__ const float* tq_cb(int kind) { return kind == kT3 ? c
 __constant__ unsigned c_sign[4] = {0x9e3779b9u, 0x7f4a7c15u, 0xf39cc060u, 0x5ced8f29u};
 __device__ __forceinline__ float rsign(int d) { return (c_sign[d >> 5] >> (d & 31)) & 1u ? -1.0f : 1.0f; }
 // the codebooks of K and V (64 levels at most each) into shared memory: a kernel's lookups then cost a shared read
+// (a table of the 32 positive levels and a sign bit - no bank conflicts - measured slower: the sign costs more ALU)
 __device__ __forceinline__ void load_cbs(float (*scb)[64], int kk, int vk, int t, int nt) {
     for (int i = t; i < 128; i += nt) {
         const int kind = i < 64 ? kk : vk, j = i & 63;
@@ -115,10 +117,12 @@ struct Rows {
                 const uint8_t* g = rp + 3 * (d >> 3);
                 const unsigned u = ((unsigned) g[0] | ((unsigned) g[1] << 8) | ((unsigned) g[2] << 16)) >> (12 * ((d >> 2) & 1));
                 c0 = u & 7; c1 = (u >> 3) & 7; c2 = (u >> 6) & 7; c3 = (u >> 9) & 7;
-            } else {                    // four 6-bit codes in 3 bytes
-                const uint8_t* g = rp + 3 * (d >> 2);
-                const unsigned u = (unsigned) g[0] | ((unsigned) g[1] << 8) | ((unsigned) g[2] << 16);
-                c0 = u & 63; c1 = (u >> 6) & 63; c2 = (u >> 12) & 63; c3 = u >> 18;
+            } else {                    // 6-bit: the low 4 bits as nibbles (64 bytes), then the high 2 bits, 4 a byte
+                const unsigned lo = *(const uint16_t*) (rp + d / 2), hi = rp[kD / 2 + d / 4];
+                c0 = (lo & 15) | ((hi & 3) << 4);
+                c1 = ((lo >> 4) & 15) | (((hi >> 2) & 3) << 4);
+                c2 = ((lo >> 8) & 15) | (((hi >> 4) & 3) << 4);
+                c3 = (lo >> 12) | ((hi >> 6) << 4);
             }
             x0 = cb[c0] * sc; x1 = cb[c1] * sc; x2 = cb[c2] * sc; x3 = cb[c3] * sc;
         } else if (kind == kL4) {
@@ -201,11 +205,17 @@ __device__ __forceinline__ void store_row(const Rows& R, long long pos, int h, i
         for (int i = 0; i + 1 < nl; ++i) code += y > 0.5f * (cb[i] + cb[i + 1]);
         const float c = cb[code];
         const float num = bsum128(val * c, red, t), den = bsum128(c * c, red, t);
-        if (R.kind == kT4) {
-            const unsigned cn = __shfl_xor_sync(0xffffffffu, code, 1);
-            if ((t & 1) == 0) rp[t / 2] = (uint8_t) (code | (cn << 4));
-        } else {   // 3-bit: eight a group of 3 bytes; 6-bit: four
-            const int per = R.kind == kT3 ? 8 : 4, bits = R.kind == kT3 ? 3 : 6;
+        if (R.kind == kT4 || R.kind == kT6) {   // (6-bit: the low nibbles as 4-bit's, the high 2 bits 4 a byte after)
+            const unsigned lo = code & 15, cn = __shfl_xor_sync(0xffffffffu, lo, 1);
+            if ((t & 1) == 0) rp[t / 2] = (uint8_t) (lo | (cn << 4));
+            if (R.kind == kT6) {
+                unsigned u = (code >> 4) << (2 * (t & 3));
+                u |= __shfl_xor_sync(0xffffffffu, u, 1);
+                u |= __shfl_xor_sync(0xffffffffu, u, 2);
+                if ((t & 3) == 0) rp[kD / 2 + t / 4] = (uint8_t) u;
+            }
+        } else {   // 3-bit: eight a group of 3 bytes
+            const int per = 8, bits = 3;
             unsigned u = code << (bits * (t & (per - 1)));
             for (int o = 1; o < per; o <<= 1) u |= __shfl_xor_sync(0xffffffffu, u, o);
             if ((t & (per - 1)) == 0) {
@@ -667,11 +677,8 @@ __global__ void __launch_bounds__(kDW * 32) gqa_attn_tc_kernel(const float* __re
     __shared__ float sm[kDW][16], sl[kDW][16];
     const int n_kv = kv.n_kv, kvh = blockIdx.x, split = blockIdx.y, G = n_head / n_kv;
     const int t = threadIdx.x, lane = t & 31, w = t >> 5;
-    __shared__ float scb[2][64];
-    load_cbs(scb, kv.kk, kv.vk, t, kDW * 32);
     const Keys ks = keys_of(kv, n_pos);
     const bool cached = kv.sel != nullptr;
-    const Rows K = k_rows(kv, scb[0], cached), V = v_rows(kv, scb[1], cached);
     for (int i = t; i < 16 * kD; i += kDW * 32) {
         const int r = i / kD, d = i % kD;
         sQ[r * kLdQ + d] = __float2half(r < G ? q[(size_t) (kvh * G + r) * kD + d] * scale : 0.0f);
@@ -680,6 +687,13 @@ __global__ void __launch_bounds__(kDW * 32) gqa_attn_tc_kernel(const float* __re
     wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fq[kD / 16];
 #pragma unroll
     for (int k = 0; k < kD / 16; ++k) wmma::load_matrix_sync(fq[k], sQ + k * 16, kLdQ);
+    // the codebooks in sQ's memory, Q being in the fragments now (a table of its own took the block past half the SM's
+    // shared memory: one block an SM instead of two, the kernel ~half as fast)
+    __syncthreads();
+    float (*scb)[64] = (float (*)[64]) (void*) sQ;
+    load_cbs(scb, kv.kk, kv.vk, t, kDW * 32);
+    __syncthreads();
+    const Rows K = k_rows(kv, scb[0], cached), V = v_rows(kv, scb[1], cached);
     __half* Kw = sKV[w];
     __half* Vw = sKV[w] + kDT * kLdQ;
     float* Sw = sS[w];
@@ -694,7 +708,7 @@ __global__ void __launch_bounds__(kDW * 32) gqa_attn_tc_kernel(const float* __re
     for (int n = 0; n < kD / 16; ++n) wmma::fill_fragment(fo[n], 0.0f);
     for (int k0 = k_lo; k0 < k_hi; k0 += kDT) {
         // the tile's K and V rows (16 rows x 32 groups of 4: 16 per lane)
-#pragma unroll 4
+#pragma unroll 16   // (all 16 rows' loads in flight: ~2% over 4)
         for (int i = lane; i < kDT * (kD / 4); i += 32) {
             const int r = i / (kD / 4), d = (i % (kD / 4)) * 4;
             float a = 0.f, b = 0.f, c = 0.f, e = 0.f, va = 0.f, vb = 0.f, vc = 0.f, ve = 0.f;
