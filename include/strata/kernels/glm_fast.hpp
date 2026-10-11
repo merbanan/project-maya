@@ -466,15 +466,26 @@ void argmax_pair(const float* x, int n, int* out, cudaStream_t s);
 /// whole row, ties to the lower index.
 void argmax_join(const int* a, const int* b, int c0, int* out, cudaStream_t s);
 // ---------------------------------------------------------------- hy_v3's grouped-query attention (glm_gqa.cu)
-// head_dim 128.  The caches are FP16 [position][n_kv][128], K and V each.
-/// q (n_head x 128 f32, in place) and k (n_kv x 128): per-head RMS norm (q_norm / k_norm, 128 each) and NeoX rope at
-/// pos; the rotated k and the raw v (n_kv x 128) go into the caches' row pos.
-void gqa_prep(float* q, const float* k, const float* v, const float* q_norm, const float* k_norm, float eps, int pos,
-              float rope_base, int n_head, int n_kv, void* k_cache, void* v_cache, cudaStream_t s);
-/// softmax(q . K[0..n_pos) / sqrt(128)) . V per query head (head h reads K/V head h / (n_head / n_kv)), written as the
-/// q8_1 of the n_head x 128 output.  scratch: gqa_attn_scratch_floats(n_head, n_pos or more) floats.
-bool gqa_attn(const float* q, const void* k_cache, const void* v_cache, int n_pos, int n_head, int n_kv,
-              float* scratch, void* out_q8_1, cudaStream_t s);
+// head_dim 128.  A layer's cache: K then V, rows [position][n_kv][128], FP16 - or INT8 codes with an FP16 scale per 32
+// values (all rows' codes, then their scales): 136 bytes a row against 256.
+struct GqaKv {
+    void* k = nullptr;
+    void* v = nullptr;
+    int q8 = 0, n_kv = 8, max_ctx = 0;
+};
+/// The bytes of one layer's K + V cache, and the view of a layer's cache at `layer_base`.
+size_t gqa_kv_layer_bytes(int n_kv, int64_t max_ctx, bool q8);
+GqaKv gqa_kv_view(void* layer_base, int n_kv, int64_t max_ctx, bool q8);
+/// T rows (q qld floats apart, k / v kld apart) at positions p0 .. p0 + T - 1: q (n_head x 128, in place) and k (n_kv x
+/// 128) take their per-head RMS norm (q_norm / k_norm) and NeoX rope; the rotated k and the raw v go into the cache.
+void gqa_prep(float* q, const float* k, const float* v, int T, int qld, int kld, const float* q_norm,
+              const float* k_norm, float eps, int p0, float rope_base, int n_head, const GqaKv& kv, cudaStream_t s);
+/// One token: softmax(q . K[0..n_pos) / sqrt(128)) . V per query head (head h reads K/V head h / (n_head / n_kv)),
+/// written as the q8_1 of the n_head x 128 output.  scratch: gqa_attn_scratch_floats(n_head, n_pos or more) floats.
+bool gqa_attn(const float* q, const GqaKv& kv, int n_pos, int n_head, float* scratch, void* out_q8_1, cudaStream_t s);
 size_t gqa_attn_scratch_floats(int n_head, int max_pos);
+/// A prompt chunk: row t (position p0 + t) attends to the cache [0, p0 + t]; FP16 output rows `old` halves apart.
+bool gqa_attn_rows(const float* q, int qld, const GqaKv& kv, int p0, int T, int n_head, void* out16, int old,
+                   cudaStream_t s);
 
 }  // namespace strata::kernels::glmf
