@@ -1225,14 +1225,14 @@ class Service:
         # GLM ends an assistant turn with the next role's token (<|user|> / <|observation|>): the engine stops on it,
         # and it must not reach the answer's text either
         self.stop_ids = set(_special_ids(IM_END) + _special_ids("<|endoftext|>") + _special_ids("<|user|>") +
-                            _special_ids("<|observation|>"))
+                            _special_ids("<|observation|>") + _special_ids("<｜hy_eos:opensource｜>"))
         # ... and a model that spells a role marker out of ordinary pieces ('<|', 'user', '|>') has ended its turn just
         # the same: the text stops there.  Only markers that are special tokens in this vocabulary count.
         self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>") if _special_ids(s)]
         # the thinking budget (run config `thinking_budget`, tokens; 0 = none): a reasoning block that reaches it is
         # closed with the template's </think> and the answer follows - GLM at High can plan for 14k+ tokens
         self.think_budget = 0
-        end = _special_ids("</think>")
+        end = _special_ids("</think:opensource>" if getattr(template, "hy3", False) else "</think>")
         self.think_end_id = end[0] if end else None
 
     def set_shared(self, defaults) -> dict:
@@ -1551,7 +1551,10 @@ class Service:
         if force is not None and tools:
             # GLM's form opens with the tool's name, Qwen's with <function=NAME>
             glm_calls = "<arg_key>" in self.template.source
-            prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
+            if getattr(self.template, "hy3", False):   # Hy3: <tool_calls> then <tool_call>NAME<tool_sep>
+                prefill = "<tool_calls:opensource>\n<tool_call:opensource>" + (f"{force}<tool_sep:opensource>" if force else "")
+            else:
+                prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
             prompt += prefill
         given["_prefill"] = prefill
         ids = self.tok.encode(prompt, parse_special=True)
@@ -1771,7 +1774,8 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True,
+                              tags=getattr(self.template, "tags", None))
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
         pre_events = parser.feed(prefill) if prefill else []
         detok, n, finish = Detokenizer(self.tok), 0, "length"

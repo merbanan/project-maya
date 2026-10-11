@@ -337,6 +337,11 @@ class Tokenizer:
             for ch in self.tokens[i]:
                 v = UNICODE_TO_BYTE.get(ch)
                 if v is None:
+                    # a special token is stored as its text, not in the byte alphabet (Hy3's
+                    # <｜hy_eos:opensource｜> has full-width bars): it decodes to that text, as in llama.cpp
+                    if i in self.special_tokens.values():
+                        raw = bytearray(self.tokens[i].encode("utf-8"))
+                        break
                     raise KeyError("token %d contains a character outside the byte alphabet: %r" % (i, ch))
                 raw.append(v)
             b = cache[i] = bytes(raw)
