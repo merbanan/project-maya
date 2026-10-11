@@ -594,6 +594,33 @@ bool Glm5Model::fast_setup(std::string& err) {
         err = "glm fast: streams/events did not create";
         return false;
     }
+    // FETCH OVERLAP (STRATA_GLM_FETCH_OVERLAP=1): a route's experts that come over PCIe are fetched on a side stream
+    // while the experts already in VRAM run their gate/up and down on the main one; the fetched ones follow when they
+    // have landed and the down combine takes every expert's values in plan order as before (moe_down's part_mode), so
+    // the answers are bit for bit the same.  The fetch's blocks: STRATA_GLM_FETCH_BLOCKS (default a quarter of the
+    // SMs - a PCIe pull needs few, the expert kernels beside it want the rest).
+    {
+        const char* fo = getenv("STRATA_GLM_FETCH_OVERLAP");
+        F->fetch_overlap = fo != nullptr && std::atoi(fo) != 0;
+        if (const char* fb = getenv("STRATA_GLM_FETCH_BLOCKS")) F->fetch_blocks = std::max(1, std::atoi(fb));
+        if (F->fetch_overlap) {
+            if (F->fetch_blocks == 0) {
+                int sms = 0;
+                cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev_);
+                F->fetch_blocks = std::max(4, sms / 4);
+            }
+            if (cudaStreamCreateWithFlags(&F->fs, cudaStreamNonBlocking) != cudaSuccess ||
+                cudaEventCreateWithFlags(&F->ev_fsplit, cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventCreateWithFlags(&F->ev_fetch, cudaEventDisableTiming) != cudaSuccess ||
+                cudaMalloc(&F->plan_split, 16 * sizeof(unsigned long long)) != cudaSuccess ||
+                cudaMalloc(&F->down_part, (size_t) 8 * g.n_embd * sizeof(float)) != cudaSuccess) {
+                err = "glm fast: the fetch overlap's stream/buffers did not create";
+                return false;
+            }
+            std::fprintf(stderr, "glm fast: CUDA%d fetch overlap on: PCIe fetches on a side stream (%d blocks) beside the "
+                                 "resident experts\n", dev_, F->fetch_blocks);
+        }
+    }
 
     // ---- the weights, resolved once
     const int NL = g.n_layers + 1;   // every per-layer table: the trunk + the NextN block's slot
@@ -2439,6 +2466,12 @@ void Glm5Model::fast_destroy() {
     if (F->mtp_tok) cudaFree(F->mtp_tok);
     if (F->mtp_tok_h) cudaFreeHost(F->mtp_tok_h);
     if (F->ev_mtp) cudaEventDestroy(F->ev_mtp);
+    if (F->fs) cudaStreamSynchronize(F->fs);   // (a fetch in flight writes into the pool)
+    if (F->plan_split) cudaFree(F->plan_split);
+    if (F->down_part) cudaFree(F->down_part);
+    if (F->ev_fsplit) cudaEventDestroy(F->ev_fsplit);
+    if (F->ev_fetch) cudaEventDestroy(F->ev_fetch);
+    if (F->fs) cudaStreamDestroy(F->fs);
     if (F->pool) cudaFree(F->pool);
     for (uint8_t* p : F->pool_more) cudaFree(p);
     if (F->xpool) cudaFree(F->xpool);
@@ -3689,12 +3722,46 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     // in VRAM is then pulled over PCIe into its slot, and all 8 run from VRAM
     gf::moe_wait(md, g.n_embd, s);
     if (F->prof_on) F->mark("moe_wait");
-    gf::moe_fetch(md, g.n_exp_used, Ly.blob, s);
-    if (F->prof_on) F->mark("moe_fetch");
-    if (pf && pf_at == 1) issue_prefetch();
+    // FETCH OVERLAP (see fast_setup): off in a captured layer graph (its stream fork would be captured with it)
+    const bool overlap = F->fetch_overlap && !F->kda_graph_on;
+    if (overlap) {
+        // the plan split once the route (and any disk wait) has settled it; the fetch then runs on fs
+        gf::moe_split_plan(md, g.n_exp_used, F->plan_split, F->plan_split + 8, s);
+        cudaEventRecord(F->ev_fsplit, s);
+        cudaStreamWaitEvent(F->fs, F->ev_fsplit, 0);
+        gf::moe_fetch(md, g.n_exp_used, Ly.blob, F->fs, F->fetch_blocks);
+        cudaEventRecord(F->ev_fetch, F->fs);
+        if (pf && pf_at == 1) {   // "after this layer's own fetch": the prefetch waits for the side stream's copy
+            cudaStreamWaitEvent(F->ps, F->ev_fetch, 0);
+            issue_prefetch();
+        }
+    } else {
+        gf::moe_fetch(md, g.n_exp_used, Ly.blob, s);
+        if (F->prof_on) F->mark("moe_fetch");
+        if (pf && pf_at == 1) issue_prefetch();
+    }
     // this layer's own prefetched experts (issued one layer ago) must have landed before they are read
     if (pf_pending) cudaStreamWaitEvent(s, F->ev_pf_prev, 0);
     pf_pending = false;
+    if (overlap) {
+        // the resident experts while the fetch is on the link (the shared expert's down rides this gate/up launch),
+        // their down values parked in down_part; then the fetched ones and the combine of all in plan order
+        gf::MoeDev mr = md, mf = md;
+        mr.plan_ptr = F->plan_split;
+        mf.plan_ptr = F->plan_split + 8;
+        gf::moe_gate_up(Ly.gu_type, mr, g.n_exp_used, g.n_embd, g.n_ff_exp, g.swiglu_exp, F->xq, F->hq, Ly.sh_down.q,
+                        Ly.sh_down.type, F->sh_hq, FFs, F->sh_out, s);
+        gf::moe_down(Ly.d_type, mr, g.n_exp_used, g.n_embd, g.n_ff_exp, Ly.down_off, F->hq, nullptr, F->ffn, s,
+                     F->down_part, 1);
+        if (F->prof_on) F->mark("moe_resident");
+        cudaStreamWaitEvent(s, F->ev_fetch, 0);
+        if (F->prof_on) F->mark("moe_fetch_wait");
+        gf::moe_gate_up(Ly.gu_type, mf, g.n_exp_used, g.n_embd, g.n_ff_exp, g.swiglu_exp, F->xq, F->hq, nullptr,
+                        Ly.sh_down.type, F->sh_hq, FFs, nullptr, s);
+        gf::moe_down(Ly.d_type, mf, g.n_exp_used, g.n_embd, g.n_ff_exp, Ly.down_off, F->hq,
+                     Ly.sh_down.q != nullptr ? F->sh_out : nullptr, F->ffn, s, F->down_part, 2);
+        if (F->prof_on) F->mark("moe_fetched");
+    } else {
     // (the shared expert's down rides the gate/up launch: sh_out)
     gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, g.swiglu_exp, F->xq, F->hq, Ly.sh_down.q,
                     Ly.sh_down.type, F->sh_hq, FFs, F->sh_out, s);
@@ -3702,6 +3769,7 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     gf::moe_down(Ly.d_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, Ly.down_off, F->hq,
                  Ly.sh_down.q != nullptr ? F->sh_out : nullptr, F->ffn, s);
     if (F->prof_on) F->mark("moe_down");
+    }
     // the CPU lane's experts last: the device's own down rows ran while the CPU worked
     if (lane) {
         gf::moe_cpu_wait(md, g.n_embd, F->ffn, s);
