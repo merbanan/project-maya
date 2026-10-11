@@ -655,7 +655,8 @@ bool Glm5Model::fast_setup(std::string& err) {
         Ly.out = q("attn_output.weight");
         }
         if (Ly.moe) {
-            if (Ly.gqa) Ly.router32 = f32("ffn_gate_inp.weight");
+            // hy_v3: BF16 when the pack holds it so (iq_pack.py: an F32 router of exact BF16 values), else F32
+            if (Ly.gqa && w16_.count(P + "ffn_gate_inp.weight") == 0) Ly.router32 = f32("ffn_gate_inp.weight");
             else Ly.router = b16("ffn_gate_inp.weight");
             // (llama.cpp's hy_v3 GGUFs name the selection bias exp_probs_b, ds4's and GLM's exp_probs_b.bias)
             Ly.router_bias = w_.count(P + "exp_probs_b.bias") == 0 && w_.count(P + "exp_probs_b") != 0

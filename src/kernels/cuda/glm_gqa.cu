@@ -501,6 +501,153 @@ __global__ void __launch_bounds__(kTW * 32) gqa_attn_rows_tc_kernel(const float*
 }
 #endif
 
+#if !defined(STRATA_USE_HIP)
+// ---- decode on the tensor cores: block (K/V head, 256-key split), 4 warps of 64 keys in 16-key tiles.  The G query
+// heads of the K/V head are the rows of one 16-row WMMA operand (rows G.. zero), so a tile's scores for all of them are
+// 8 products instead of G warp reductions a key; the online softmax is the prompt kernel's lazy one.  The warps' (m, l,
+// O) are merged in shared memory into the split's part, the layout gqa_combine_kernel reads.
+constexpr int kDW = 4, kDT = 16;                                   // warps, keys a tile
+constexpr int kDLdS = kDT + 4, kDLdP = kDT + 8, kDLdO = kD + 4;    // (wmma: ldm % 8 halves / 4 floats)
+__global__ void __launch_bounds__(kDW * 32) gqa_attn_tc_kernel(const float* __restrict__ q, GqaKv kv, int n_pos,
+                                                               int n_head, float scale, float* __restrict__ part) {
+    using namespace nvcuda;
+    __shared__ __align__(32) __half sQ[16 * kLdQ];
+    __shared__ __align__(32) __half sKV[kDW][2 * kDT * kLdQ];      // per warp: K tile, V tile (then its O, F32)
+    __shared__ __align__(32) float sS[kDW][16 * kDLdS];
+    __shared__ __align__(32) __half sP[kDW][16 * kDLdP];
+    __shared__ float sm[kDW][16], sl[kDW][16];
+    const int n_kv = kv.n_kv, kvh = blockIdx.x, split = blockIdx.y, G = n_head / n_kv;
+    const int t = threadIdx.x, lane = t & 31, w = t >> 5;
+    const Rows K = k_rows(kv), V = v_rows(kv);
+    for (int i = t; i < 16 * kD; i += kDW * 32) {
+        const int r = i / kD, d = i % kD;
+        sQ[r * kLdQ + d] = __float2half(r < G ? q[(size_t) (kvh * G + r) * kD + d] * scale : 0.0f);
+    }
+    __syncthreads();
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fq[kD / 16];
+#pragma unroll
+    for (int k = 0; k < kD / 16; ++k) wmma::load_matrix_sync(fq[k], sQ + k * 16, kLdQ);
+    __half* Kw = sKV[w];
+    __half* Vw = sKV[w] + kDT * kLdQ;
+    float* Sw = sS[w];
+    __half* Pw = sP[w];
+    const int ri = lane >> 1, half_i = lane & 1;                  // the lane pair of row (head) ri: keys 8 half_i ..
+    const bool row_ok = ri < G;
+    const int k_lo = split * kChunk + w * (kChunk / kDW), k_hi = min(k_lo + kChunk / kDW, n_pos);
+    constexpr float kLazy = 8.0f;
+    float m = -INFINITY, l = 0.0f;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> fo[kD / 16];
+#pragma unroll
+    for (int n = 0; n < kD / 16; ++n) wmma::fill_fragment(fo[n], 0.0f);
+    for (int k0 = k_lo; k0 < k_hi; k0 += kDT) {
+        // the tile's K and V rows (16 rows x 32 groups of 4: 16 per lane)
+#pragma unroll 4
+        for (int i = lane; i < kDT * (kD / 4); i += 32) {
+            const int r = i / (kD / 4), d = (i % (kD / 4)) * 4;
+            float a = 0.f, b = 0.f, c = 0.f, e = 0.f, va = 0.f, vb = 0.f, vc = 0.f, ve = 0.f;
+            if (k0 + r < k_hi) {
+                K.load4((size_t) (k0 + r) * n_kv + kvh, d, a, b, c, e);
+                V.load4((size_t) (k0 + r) * n_kv + kvh, d, va, vb, vc, ve);
+            }
+            __half2* kr = (__half2*) (Kw + r * kLdQ + d);
+            __half2* vr = (__half2*) (Vw + r * kLdQ + d);
+            kr[0] = __floats2half2_rn(a, b);
+            kr[1] = __floats2half2_rn(c, e);
+            vr[0] = __floats2half2_rn(va, vb);
+            vr[1] = __floats2half2_rn(vc, ve);
+        }
+        __syncwarp();
+        {   // S (16 x 16) = Q . K^T
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+#pragma unroll
+            for (int k = 0; k < kD / 16; ++k) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+                wmma::load_matrix_sync(fb, Kw + k * 16, kLdQ);
+                wmma::mma_sync(acc, fq[k], fb, acc);
+            }
+            wmma::store_matrix_sync(Sw, acc, kDLdS, wmma::mem_row_major);
+        }
+        __syncwarp();
+        float sv[8], mt = -INFINITY;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int c = half_i * 8 + j;
+            sv[j] = row_ok && k0 + c < k_hi ? Sw[ri * kDLdS + c] : -INFINITY;
+            mt = fmaxf(mt, sv[j]);
+        }
+        mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, 1));
+        const bool need = mt > m + kLazy;
+        float corr = 1.0f;
+        if (need) {
+            corr = m == -INFINITY ? 0.0f : __expf(m - mt);
+            l *= corr;
+            m = mt;
+        }
+        float ps = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float pj = sv[j] == -INFINITY ? 0.0f : __expf(sv[j] - m);
+            ps += pj;
+            Pw[ri * kDLdP + half_i * 8 + j] = __float2half(pj);
+        }
+        l += ps + __shfl_xor_sync(0xffffffffu, ps, 1);
+        __syncwarp();
+        if (__any_sync(0xffffffffu, need)) {
+#pragma unroll
+            for (int n = 0; n < kD / 16; ++n) {
+                wmma::store_matrix_sync(Sw, fo[n], kDLdS, wmma::mem_row_major);
+                __syncwarp();
+#pragma unroll
+                for (int j = 0; j < 8; ++j) Sw[ri * kDLdS + half_i * 8 + j] *= corr;
+                __syncwarp();
+                wmma::load_matrix_sync(fo[n], Sw, kDLdS, wmma::mem_row_major);
+                __syncwarp();
+            }
+        }
+        {   // O (16 x 128) += P (16 x 16) . V (16 x 128)
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fp;
+            wmma::load_matrix_sync(fp, Pw, kDLdP);
+#pragma unroll
+            for (int n = 0; n < kD / 16; ++n) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> fv;
+                wmma::load_matrix_sync(fv, Vw + n * 16, kLdQ);
+                wmma::mma_sync(fo[n], fp, fv, fo[n]);
+            }
+        }
+        __syncwarp();
+    }
+    // the warp's O (relative to its m) into its K / V area as F32, its m and l beside
+    float* Ow = (float*) sKV[w];
+#pragma unroll
+    for (int n = 0; n < kD / 16; ++n) wmma::store_matrix_sync(Ow + n * 16, fo[n], kDLdO, wmma::mem_row_major);
+    if (half_i == 0) {
+        sm[w][ri] = m;
+        sl[w][ri] = l;
+    }
+    __syncthreads();
+    // merge the warps: thread t = dim t, every head of the group
+    for (int g = 0; g < G; ++g) {
+        float M = -INFINITY;
+#pragma unroll
+        for (int x = 0; x < kDW; ++x) M = fmaxf(M, sm[x][g]);
+        float acc = 0.0f, L = 0.0f;
+#pragma unroll
+        for (int x = 0; x < kDW; ++x) {
+            const float f = sm[x][g] == -INFINITY ? 0.0f : __expf(sm[x][g] - M);
+            acc += f * ((const float*) sKV[x])[g * kDLdO + t];
+            L += f * sl[x][g];
+        }
+        float* o = part + ((size_t) (kvh * G + g) * gridDim.y + split) * (kD + 2);
+        o[t] = acc;
+        if (t == 0) {
+            o[kD] = M;
+            o[kD + 1] = L;
+        }
+    }
+}
+#endif
+
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) std::fprintf(stderr, "glm_gqa %s: %s\n", what, cudaGetErrorString(e));
@@ -550,6 +697,20 @@ bool gqa_attn(const float* q, const GqaKv& kv, int n_pos, int n_head, float* scr
     const int n_split = (n_pos + kChunk - 1) / kChunk;
     float* part = scratch;
     float* out = scratch + (size_t) n_head * n_split * (kD + 2);
+#if !defined(STRATA_USE_HIP)
+    // the tensor cores (sm_70+) unless STRATA_GLM_GQA_DEC_TC=0 (the warp-reduction kernel below)
+    static const bool tc = [] {
+        const char* v = getenv("STRATA_GLM_GQA_DEC_TC");
+        int dev = 0, major = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        return major >= 7 && !(v != nullptr && v[0] == '0');
+    }();
+    // (below 128 positions the warp kernel is faster: 6 against 10 us a layer at 1 position, 21 against 31 at 37)
+    if (tc && n_pos >= 128)
+        gqa_attn_tc_kernel<<<dim3(kv.n_kv, n_split), kDW * 32, 0, s>>>(q, kv, n_pos, n_head, 1.0f / sqrtf((float) kD), part);
+    else
+#endif
     gqa_attn_kernel<<<dim3(kv.n_kv, n_split), 256, 0, s>>>(q, kv, n_pos, n_head, 1.0f / sqrtf((float) kD), part);
     check("gqa_attn");
     gqa_combine_kernel<<<n_head, kD, 0, s>>>(part, n_split, out, kv.v4);
