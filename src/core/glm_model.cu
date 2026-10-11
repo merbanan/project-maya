@@ -165,6 +165,7 @@ static bool mtp_dense_vram(const std::function<const strata::TensorInfo*(const s
     }
     for (const char* n : nm.f32) {
         const strata::TensorInfo* t = find(P + n);
+        if (t == nullptr && std::string(n) == "exp_probs_b.bias") t = find(P + "exp_probs_b");   // (llama.cpp's name)
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
         bytes += ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
     }
@@ -2601,7 +2602,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     //    ranking needs sigmoid(logits) + this per-layer bias (device-side it stays as it was)
     host_probs_b_.assign((size_t) g_.n_layers * g_.n_expert, 0.0f);
     for (int il = l0_; il < l1_; ++il) {
-        const auto it = w_.find("blk." + std::to_string(il) + ".exp_probs_b.bias");
+        auto it = w_.find("blk." + std::to_string(il) + ".exp_probs_b.bias");
+        if (it == w_.end()) it = w_.find("blk." + std::to_string(il) + ".exp_probs_b");   // (llama.cpp's hy_v3 name)
         if (it != w_.end())
             cudaMemcpy(host_probs_b_.data() + (size_t) il * g_.n_expert, it->second,
                        (size_t) g_.n_expert * sizeof(float), cudaMemcpyDeviceToHost);
@@ -2941,6 +2943,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
     }
     for (const char* n : f32_names) {
         const strata::TensorInfo* t = find(P + n, si);
+        if (t == nullptr && std::string(n) == "exp_probs_b.bias") t = find(P + "exp_probs_b", si);   // (llama.cpp's name)
         if (!to_host(t, si)) return false;
         if (cudaMemcpy(base + at, host.data(), host.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: upload"; return false; }
         w_[P + n] = (const float*) (base + at);

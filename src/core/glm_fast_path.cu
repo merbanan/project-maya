@@ -657,7 +657,9 @@ bool Glm5Model::fast_setup(std::string& err) {
         if (Ly.moe) {
             if (Ly.gqa) Ly.router32 = f32("ffn_gate_inp.weight");
             else Ly.router = b16("ffn_gate_inp.weight");
-            Ly.router_bias = f32("exp_probs_b.bias");
+            // (llama.cpp's hy_v3 GGUFs name the selection bias exp_probs_b, ds4's and GLM's exp_probs_b.bias)
+            Ly.router_bias = w_.count(P + "exp_probs_b.bias") == 0 && w_.count(P + "exp_probs_b") != 0
+                                 ? f32("exp_probs_b") : f32("exp_probs_b.bias");
             Ly.sh_gate = q("ffn_gate_shexp.weight");
             Ly.sh_up = q("ffn_up_shexp.weight");
             Ly.sh_down = q("ffn_down_shexp.weight");
