@@ -334,7 +334,7 @@ private:
     // per-layer state offsets, in floats into state_ (-1: the layer has no such state)
     std::vector<int64_t> kda_S_, kda_conv_, dsa_lat_, dsa_ik_, dsa_ig_, dsa_pool_;
     std::vector<int64_t> gqa_kv_;                 // hy_v3: per layer the K then V cache (floats into state_), -1 none
-    bool gqa_q8_ = false;                         // ... INT8 + scales (STRATA_GLM_KV_INT8) instead of FP16
+    int gqa_kvm_ = 0;                             // ... its mode (glm_fast.hpp kGqa*: FP16, INT8, K8V4)
 
 public:
     // ---- per-weight serving slots (strata::core::WSlot below): F32 pointers for the
@@ -688,7 +688,9 @@ public:
     /// returns the block's greedy proposal for p + 2 (-1: no draft block).  Fills the block's caches at p.
     int mtp_draft(int32_t next_tok, std::string& err);
     bool has_mtp() const;
-    bool kv_int8() const { return lat_q8_ || gqa_q8_; }   // the KV / latent cache in INT8 (STRATA_GLM_KV_INT8=1)
+    bool kv_int8() const { return lat_q8_ || gqa_kvm_; }   // the KV / latent cache in INT8 (STRATA_GLM_KV_INT8=1)
+    /// the cache's name for the driver's INFO line: fp16, int8 or k8v4 (hy_v3's K8V4)
+    const char* kv_name() const { return gqa_kvm_ == 2 ? "k8v4" : kv_int8() ? "int8" : "fp16"; }
     /// KV streaming: the positions of each DSA layer kept in VRAM (0: all of them - not streamed); and what
     /// STRATA_GLM_KV_RESIDENT gives for a context: rounded up to whole pools and to glmf::kKvResidentMin, 0 when unset
     /// or when the context fits in that many anyway

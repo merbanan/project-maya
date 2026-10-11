@@ -2539,7 +2539,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 hgemm_q(Ly.k, KD, E, x16, E, B.k, KD, tn, 0.0f);
                 hgemm_q(Ly.v, KD, E, x16, E, B.v, KD, tn, 0.0f);
                 S->mark("gqa_proj", s);
-                const gf::GqaKv kv = gf::gqa_kv_view(state_ + gqa_kv_[(size_t) il], g.n_kv, max_ctx_, gqa_q8_);
+                const gf::GqaKv kv = gf::gqa_kv_view(state_ + gqa_kv_[(size_t) il], g.n_kv, max_ctx_, gqa_kvm_);
                 gf::gqa_prep(B.q, B.k, B.v, tn, QD, KD, Ly.q_norm, Ly.k_norm, g.norm_eps, pt, g.rope_base, g.n_head, kv, s);
                 if (!gf::gqa_attn_rows(B.q, QD, kv, pt, tn, g.n_head, B.out16, QD, s)) {
                     err = "glm prefill: gqa attention";
@@ -4082,7 +4082,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 float* vv = c2.take<float>((size_t) Tv * KD);
                 hgemm_q(Ly.k, KD, E, S->x16, E, kk, KD, Tv, 0.0f);
                 hgemm_q(Ly.v, KD, E, S->x16, E, vv, KD, Tv, 0.0f);
-                const gf::GqaKv gkv = gf::gqa_kv_view(state_ + gqa_kv_[(size_t) mtp_il_], g.n_kv, max_ctx_, gqa_q8_);
+                const gf::GqaKv gkv = gf::gqa_kv_view(state_ + gqa_kv_[(size_t) mtp_il_], g.n_kv, max_ctx_, gqa_kvm_);
                 gf::gqa_prep(nullptr, kk, vv, Tv, 0, KD, nullptr, Ly.k_norm, g.norm_eps, (int) p0, g.rope_base, 0, gkv, s);
                 S->mark("mtp_cache", s);
             } else {   // GLM: the latent and the indexer's key / gate

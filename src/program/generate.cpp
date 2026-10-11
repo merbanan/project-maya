@@ -1084,7 +1084,7 @@ static int glm_pack_generate(const Options& o) {
         std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld engine_kind=glm-fast "
                     "experts=%d vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d dflash=%d vision_lend=%zu "
                     "cpu_threads=%d cpu_threads_max=%d pcie_share=%.2f logit_bias=1\n",
-                    (long long) o.max_context, model.kv_int8() ? "int8" : "fp16", (long long) model.kv_resident(),
+                    (long long) o.max_context, model.kv_name(), (long long) model.kv_resident(),
                     (long long) st.pool_slots,
                     (long long) (st.pool_gb * 1024.0), model.geometry().n_expert * (model.geometry().n_layers - model.geometry().dense_lead),
                     (long long) st.pool_slots, st.pool_gb, (long long) st.ram_slots, st.ram_gb, model.has_mtp() ? 1 : 0,
@@ -4595,6 +4595,8 @@ int main(int argc, char** argv) {
         if (o.vram_reserve_given) set_env("STRATA_GLM_RESERVE_MB", std::to_string(o.vram_reserve_mib).c_str());
         if (o.vram_reserve_later_mib >= 0)
             set_env("STRATA_GLM_RESERVE_LATER_MB", std::to_string(o.vram_reserve_later_mib).c_str());
+        // (hy_v3's K / V cache reads STRATA_GLM_KV: fp16 / int8 / k8v4)
+        if ((o.kv == "k8v4" || o.kv == "int8") && std::getenv("STRATA_GLM_KV") == nullptr) set_env("STRATA_GLM_KV", o.kv.c_str());
         if (o.pack != "pack/full") {
             std::fprintf(stderr, "maya generate: note: --glm-pack supersedes --pack (%s ignored)\n", o.pack.c_str());
         }

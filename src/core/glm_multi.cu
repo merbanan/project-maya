@@ -90,7 +90,7 @@ uint64_t Glm5Model::seq_layout(int64_t ctx, SeqCtx& c) const {
         v->assign((size_t) g.n_layers + 1, 0);
     c.gqa_kv.assign((size_t) g.n_layers + 1, -1);
     // hy_v3: a layer's K / V cache (load_pack's rounding: whole 256-byte units)
-    const int64_t gkv = (int64_t) ((gf::gqa_kv_layer_bytes(g.n_kv, ctx, gqa_q8_) + 255) / 256 * 64);
+    const int64_t gkv = (int64_t) ((gf::gqa_kv_layer_bytes(g.n_kv, ctx, gqa_kvm_) + 255) / 256 * 64);
     c.ik_ring = (int) std::min<int64_t>(ctx, 8192 + 64);
     const auto dsa = [&](int il) {
         c.dsa_lat[(size_t) il] = floats;

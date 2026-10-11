@@ -466,16 +466,19 @@ void argmax_pair(const float* x, int n, int* out, cudaStream_t s);
 /// whole row, ties to the lower index.
 void argmax_join(const int* a, const int* b, int c0, int* out, cudaStream_t s);
 // ---------------------------------------------------------------- hy_v3's grouped-query attention (glm_gqa.cu)
-// head_dim 128.  A layer's cache: K then V, rows [position][n_kv][128], FP16 - or INT8 codes with an FP16 scale per 32
-// values (all rows' codes, then their scales): 136 bytes a row against 256.
+// head_dim 128.  A layer's cache: K then V, rows [position][n_kv][128].  The mode: 0 FP16 (256 bytes a row); 1 INT8
+// codes with an FP16 scale per 32 values (all rows' codes, then their scales: 136 bytes); 2 K8V4 - INT8 K and 4-bit V
+// (two codes a byte + a scale per 32: 72 bytes), the V rows Walsh-Hadamard rotated (glm_gqa.cu).
+constexpr int kGqaFp16 = 0, kGqaInt8 = 1, kGqaK8V4 = 2;
 struct GqaKv {
     void* k = nullptr;
     void* v = nullptr;
-    int q8 = 0, n_kv = 8, max_ctx = 0;
+    int q8 = 0, v4 = 0, n_kv = 8, max_ctx = 0;   // q8: K (and V unless v4) INT8; v4: V 4-bit, rotated
 };
-/// The bytes of one layer's K + V cache, and the view of a layer's cache at `layer_base`.
-size_t gqa_kv_layer_bytes(int n_kv, int64_t max_ctx, bool q8);
-GqaKv gqa_kv_view(void* layer_base, int n_kv, int64_t max_ctx, bool q8);
+/// The bytes of one layer's K + V cache (and of its K part), and the view of a layer's cache at `layer_base`.
+size_t gqa_kv_layer_bytes(int n_kv, int64_t max_ctx, int mode);
+size_t gqa_kv_k_bytes(int n_kv, int64_t max_ctx, int mode);
+GqaKv gqa_kv_view(void* layer_base, int n_kv, int64_t max_ctx, int mode);
 /// T rows (q qld floats apart, k / v kld apart) at positions p0 .. p0 + T - 1: q (n_head x 128, in place) and k (n_kv x
 /// 128) take their per-head RMS norm (q_norm / k_norm) and NeoX rope; the rotated k and the raw v go into the cache.
 void gqa_prep(float* q, const float* k, const float* v, int T, int qld, int kld, const float* q_norm,
