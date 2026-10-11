@@ -575,7 +575,18 @@ bool Glm5Model::fast_setup(std::string& err) {
         Ly.recr = is_mtp ? false : g.is_recr(il);
         Ly.moe = il >= g.dense_lead;
         Ly.mtp = is_mtp;
-        if (is_mtp) {
+        Ly.gqa = g.gqa() && !is_mtp;
+        if (Ly.gqa) {
+            // hy_v3: plain pre-norm residuals, grouped-query attention, the router in F32
+            Ly.attn_norm = f32("attn_norm.weight");
+            Ly.ffn_norm = f32("ffn_norm.weight");
+            Ly.q = q("attn_q.weight");
+            Ly.k = q("attn_k.weight");
+            Ly.v = q("attn_v.weight");
+            Ly.out = q("attn_output.weight");
+            Ly.q_norm = f32("attn_q_norm.weight");
+            Ly.k_norm = f32("attn_k_norm.weight");
+        } else if (is_mtp) {
             // no hyper-connections: eh_proj in, plain residuals, the shared head's norm out
             Ly.eh = q("nextn.eh_proj.weight");
             Ly.enorm = f32("nextn.enorm.weight");
@@ -589,6 +600,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.hc_ffn_scale = f32("hc_ffn_scale.weight");
             Ly.hc_ffn_base = f32("hc_ffn_base.weight");
         }
+        if (!Ly.gqa) {
         Ly.attn_norm = f32("attn_norm.weight");
         Ly.ffn_norm = f32("ffn_norm.weight");
         if (Ly.recr) {
@@ -623,8 +635,10 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.v_b = b16("attn_v_b.weight");
         }
         Ly.out = q("attn_output.weight");
+        }
         if (Ly.moe) {
-            Ly.router = b16("ffn_gate_inp.weight");
+            if (Ly.gqa) Ly.router32 = f32("ffn_gate_inp.weight");
+            else Ly.router = b16("ffn_gate_inp.weight");
             Ly.router_bias = f32("exp_probs_b.bias");
             Ly.sh_gate = q("ffn_gate_shexp.weight");
             Ly.sh_up = q("ffn_up_shexp.weight");
@@ -744,6 +758,17 @@ bool Glm5Model::fast_setup(std::string& err) {
     if ((size_t) (at - (uint8_t*) F->arena) > need) {
         err = "glm fast: the activation arena overflowed its estimate";
         return false;
+    }
+    if (g.gqa()) {
+        const size_t qf = (size_t) g.n_head * g.head_dim, kf = (size_t) g.n_kv * g.head_dim;
+        const size_t sf = gf::gqa_attn_scratch_floats(g.n_head, (int) max_ctx_);
+        if (cudaMalloc(&F->gq, (qf + 2 * kf + sf) * sizeof(float)) != cudaSuccess) {
+            err = "glm fast: the attention buffers did not allocate";
+            return false;
+        }
+        F->gk = F->gq + qf;
+        F->gv = F->gk + kf;
+        F->gscr = F->gv + kf;
     }
     if (mtp_il_ >= 0) {
         if (cudaMalloc(&F->mtp_h, (size_t) g.n_embd * sizeof(float)) != cudaSuccess ||
@@ -2348,6 +2373,7 @@ void Glm5Model::fast_destroy() {
     if (F->tok_h) cudaFreeHost(F->tok_h);
     if (F->scratch) cudaFree(F->scratch);
     if (F->mtp_h) cudaFree(F->mtp_h);
+    if (F->gq) cudaFree(F->gq);
     if (F->mtp_catq) cudaFree(F->mtp_catq);
     if (F->mtp_logits) cudaFree(F->mtp_logits);
     if (F->mtp_tok) cudaFree(F->mtp_tok);
@@ -3513,22 +3539,25 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     const int FFs = g.n_ff_exp * g.n_shared;
     gf::MvJob j[gf::kMaxMvJobs];
     int nj = 3;
-    j[0] = {Ly.router, nullptr, F->x, F->rlog, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.n_expert};
+    // a router job: BF16 (GLM's packs) or F32 (hy_v3's, as its GGUF stores it)
+    const auto rjob = [&](const FastState::Layer& La, float* y) -> gf::MvJob {
+        if (La.router32 != nullptr) return {La.router32, nullptr, F->x, y, nullptr, 1.0f, gf::kTypeF32, g.n_embd, g.n_expert};
+        return {La.router, nullptr, F->x, y, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.n_expert};
+    };
+    j[0] = rjob(Ly, F->rlog);
     j[1] = {Ly.sh_gate.q, F->xq, nullptr, F->sh_g, nullptr, 1.0f, Ly.sh_gate.type, g.n_embd, FFs};
     j[2] = {Ly.sh_up.q, F->xq, nullptr, F->sh_u, nullptr, 1.0f, Ly.sh_up.type, g.n_embd, FFs};
     // the next layer's router on THIS layer's FFN input: its experts, one layer early
     // (only with prefetch on: the prediction costs a router GEMV and a second top-k per layer)
     const bool pred = F->max_pf > 0 && il + 1 < l1_ && F->L[(size_t) il + 1].moe;
     if (pred)
-        j[nj++] = {F->L[(size_t) il + 1].router, nullptr, F->x, F->plog, nullptr, 1.0f, gf::kTypeBF16, g.n_embd,
-                   g.n_expert};
+        j[nj++] = rjob(F->L[(size_t) il + 1], F->plog);
     // LOOKAHEAD: the next layers' routers on this input too (their disk-only experts are read ahead)
     int n_ah = 0;
     const float* ah_bias[gf::kAhead] = {nullptr, nullptr, nullptr, nullptr};
     for (int d = 0; d < F->n_ahead && il + 1 + d < l1_ && F->L[(size_t) il + 1 + d].moe && nj < gf::kMaxMvJobs; ++d) {
         const auto& La = F->L[(size_t) il + 1 + d];
-        j[nj++] = {La.router, nullptr, F->x, F->alog + (size_t) d * g.n_expert, nullptr, 1.0f, gf::kTypeBF16, g.n_embd,
-                   g.n_expert};
+        j[nj++] = rjob(La, F->alog + (size_t) d * g.n_expert);
         ah_bias[d] = La.router_bias;
         ++n_ah;
     }
@@ -3608,8 +3637,87 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     return true;
 }
 
+// ---- one hy_v3 attention: F->xq (the attn_norm output) -> F->mixer at position p.  q / k / v projections, the
+// per-head norms + NeoX rope with the K/V rows into this layer's FP16 caches (gqa_kv_), split-K decode attention over
+// [0, p], the output projection
+bool Glm5Model::fast_gqa(int il, int64_t p, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const auto& Ly = F->L[(size_t) il];
+    const int QD = g.n_head * g.head_dim, KD = g.n_kv * g.head_dim;
+    gf::MvJob j[3];
+    j[0] = {Ly.q.q, F->xq, F->x, F->gq, nullptr, 1.0f, Ly.q.type, g.n_embd, QD};
+    j[1] = {Ly.k.q, F->xq, F->x, F->gk, nullptr, 1.0f, Ly.k.type, g.n_embd, KD};
+    j[2] = {Ly.v.q, F->xq, F->x, F->gv, nullptr, 1.0f, Ly.v.type, g.n_embd, KD};
+    if (!gf::mv(j, 3, s)) { err = "glm fast: gqa projections"; return false; }
+    if (F->prof_on) F->mark("gqa_qkv_mv");
+    uint16_t* kc = (uint16_t*) (state_ + gqa_kv_[(size_t) il]);
+    uint16_t* vc = kc + (size_t) max_ctx_ * KD;
+    gf::gqa_prep(F->gq, F->gk, F->gv, Ly.q_norm, Ly.k_norm, g.norm_eps, (int) p, g.rope_base, g.n_head, g.n_kv, kc, vc,
+                 s);
+    if (F->prof_on) F->mark("gqa_prep");
+    if (!gf::gqa_attn(F->gq, kc, vc, (int) p + 1, g.n_head, g.n_kv, F->gscr, F->attn_q, s)) {
+        err = "glm fast: gqa attention";
+        return false;
+    }
+    if (F->prof_on) F->mark("gqa_attn");
+    gf::MvJob o = {Ly.out.q, F->attn_q, nullptr, F->mixer, nullptr, 1.0f, Ly.out.type, QD, g.n_embd};
+    if (!gf::mv(&o, 1, s)) { err = "glm fast: gqa output"; return false; }
+    if (F->prof_on) F->mark("gqa_out_mv");
+    return true;
+}
+
+// ---- hy_v3's layers: one residual stream R (= state_), plain pre-norm residuals (rms_q8 adds the block's output
+// to R and normalises the next block's input in one launch)
+bool Glm5Model::fast_layers_gqa(int64_t p, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
+    bool pf_pending = false;
+    float* R = state_;
+    if (F->prof_on) F->mark("start");
+    for (int il = l0_; il < l1_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        gf::rms_q8(R, il == l0_ ? nullptr : F->ffn, Ly.attn_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
+        if (F->prof_on) F->mark("attn_norm");
+        if (dumps) {
+            if (il != l0_) fast_dump(s, "l_out-" + std::to_string(il - 1), R, g.n_embd);
+            fast_dump(s, "attn_norm-" + std::to_string(il), F->x, g.n_embd);
+        }
+        if (!fast_gqa(il, p, err)) return false;
+        gf::rms_q8(R, F->mixer, Ly.ffn_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
+        if (F->prof_on) F->mark("ffn_norm");
+        if (dumps) {
+            fast_dump(s, "attn_out-" + std::to_string(il), F->mixer, g.n_embd);
+            fast_dump(s, "ffn_norm-" + std::to_string(il), F->x, g.n_embd);
+        }
+        if (!Ly.moe) {
+            gf::MvJob j[2];
+            j[0] = {Ly.ffn_gate.q, F->xq, nullptr, F->dg, nullptr, 1.0f, Ly.ffn_gate.type, g.n_embd, g.n_ff_dense};
+            j[1] = {Ly.ffn_up.q, F->xq, nullptr, F->du, nullptr, 1.0f, Ly.ffn_up.type, g.n_embd, g.n_ff_dense};
+            if (!gf::mv(j, 2, s)) { err = "glm fast: dense ffn"; return false; }
+            gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, g.n_ff_dense, F->dhq, s);
+            gf::MvJob dn = {Ly.ffn_down.q, F->dhq, nullptr, F->ffn, nullptr, 1.0f, Ly.ffn_down.type, g.n_ff_dense,
+                            g.n_embd};
+            if (!gf::mv(&dn, 1, s)) { err = "glm fast: dense ffn down"; return false; }
+            if (F->prof_on) F->mark("dense_ffn");
+        } else if (!fast_moe(il, pf_pending, err)) {
+            return false;
+        }
+        if (dumps) fast_dump(s, "ffn_out-" + std::to_string(il), F->ffn, g.n_embd);
+    }
+    // the last FFN's residual add (the head reads R); the normalised copy it also writes is not used
+    gf::rms_q8(R, F->ffn, F->L[(size_t) l1_ - 1].ffn_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
+    if (dumps) fast_dump(s, "l_out-" + std::to_string(l1_ - 1), R, g.n_embd);
+    { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string("glm fast: ") + cudaGetErrorString(e); return false; } }
+    return true;
+}
+
 bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
     (void) hop_in;
+    if (g_.gqa()) return fast_layers_gqa(p, err);
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
@@ -3780,7 +3888,10 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
                  g.n_embd);
     if (const float* img = image_row(p)) std::memcpy(F->emb_h, img, (size_t) g.n_embd * sizeof(float));   // an image
     cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
-    gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
+    if (g.gqa())   // one residual stream
+        cudaMemcpyAsync(state_, F->emb, (size_t) g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
+    else
+        gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
     if (!fast_layers(p, false, err)) return false;
     // each later part of a split: the residual crosses over through the previous part's pinned hop buffer, the
     // copy ordered on the devices by an event (the host never waits between the parts)
@@ -3801,8 +3912,12 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     }
     FastState* FT = tail->fast_;
     cudaSetDevice(tail->dev_);
-    gf::head_prep(tail->state_, tail->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FT->head_x, FT->head_xq,
-                  FT->cs);
+    if (g.gqa())
+        gf::rms_q8(tail->state_, nullptr, tail->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FT->head_x,
+                   FT->head_xq, FT->cs);
+    else
+        gf::head_prep(tail->state_, tail->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FT->head_x, FT->head_xq,
+                      FT->cs);
     // GLM_DUMP_H=<file> (debug): append every position's final hidden state (output_norm of the stream mean - what the
     // NextN/MTP block reads) as n_embd floats
     static const char* dh = getenv("GLM_DUMP_H");
@@ -4392,7 +4507,7 @@ std::vector<int> Glm5Model::dsa_layers() const {
     std::vector<int> r;
     if (mtp_il_ >= 0) r.push_back(mtp_il_);
     for (int il = l0_; il < l1_; ++il)
-        if (!g_.is_recr(il)) r.push_back(il);
+        if (g_.is_dsa(il)) r.push_back(il);
     return r;
 }
 
@@ -4500,12 +4615,16 @@ std::vector<std::pair<int64_t, int64_t>> slot_dsa_runs(const Glm5Geometry& g, bo
     };
     if (mtp_il >= 0) dsa((size_t) mtp_il);
     for (int il = l0; il < l1; ++il)
-        if (!g.is_recr(il)) dsa((size_t) il);
+        if (g.is_dsa(il)) dsa((size_t) il);
     return r;
 }
 }  // namespace
 
 uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
+    if (g_.gqa()) {
+        err = "conversation slots are not implemented for hy_v3 yet";
+        return 0;
+    }
     std::vector<Glm5Model*> halves;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr || m->snap_pos_ < 0 || m->snap_pos_ != snap_pos_) {
@@ -4580,6 +4699,10 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
 }
 
 bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& err) {
+    if (g_.gqa()) {
+        err = "conversation slots are not implemented for hy_v3 yet";
+        return false;
+    }
     std::ifstream f(path, std::ios::binary);
     if (!f) {
         err = "cannot read " + path;

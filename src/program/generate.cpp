@@ -994,7 +994,9 @@ static int glm_pack_generate(const Options& o) {
     sp.temperature = o.temperature;
     sp.seed = o.seed;
 
-    const std::vector<int64_t> glm_eos = {154820, 154827, 154829};
+    // GLM's stop set, or the model's own end-of-generation ids when its GGUF names them (hy_v3)
+    std::vector<int64_t> glm_eos = {154820, 154827, 154829};
+    if (!model.geometry().eog.empty()) glm_eos.assign(model.geometry().eog.begin(), model.geometry().eog.end());
     const std::vector<int64_t>& eos = o.eos_given ? o.eos_ids : glm_eos;
     const bool stop_on_eos = o.eos_given || o.stop_eos || o.serve;
 

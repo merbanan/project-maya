@@ -208,6 +208,8 @@ struct Glm5Model::FastState {
     float *q = nullptr, *iq = nullptr, *score = nullptr;
     int* cells = nullptr;
     void *qr_q = nullptr, *attn_q = nullptr;
+    // hy_v3's attention: q (n_head x 128), k and v (n_kv x 128), the attention scratch (splits + output)
+    float *gq = nullptr, *gk = nullptr, *gv = nullptr, *gscr = nullptr;
     float *rlog = nullptr, *plog = nullptr, *sh_g = nullptr, *sh_u = nullptr;
     float* sh_out = nullptr;   // the shared expert's down (n_embd), computed alongside the routed gate/up
     // prediction quality (the next layer's router on this layer's FFN input)
@@ -263,7 +265,9 @@ struct Glm5Model::FastState {
     int* tok_h = nullptr;       // pinned
     // per layer: the resolved weights
     struct Layer {
-        bool recr = false, moe = false, mtp = false;
+        bool recr = false, moe = false, mtp = false, gqa = false;
+        const float *q_norm = nullptr, *k_norm = nullptr;          // hy_v3: per-head q / k RMS norms (head_dim)
+        const float* router32 = nullptr;                            // hy_v3: the router in F32 (as the GGUF stores it)
         WSlot eh;                                                   // the NextN block: eh_proj and its norms
         const float *enorm = nullptr, *hnorm = nullptr, *shnorm = nullptr;
         const uint16_t *hc_attn_fn = nullptr, *hc_ffn_fn = nullptr;
