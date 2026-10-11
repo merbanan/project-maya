@@ -293,7 +293,7 @@ struct Glm5Model::FastState {
     //      device, which may fill it during a token and mark it resident itself) or DRAINING (its old expert
     //      is being demoted to the RAM tier by a D2H; it becomes free when that copy lands).
     // kLanding: a background promotion's copy is on its way into the slot (fast_boundary step 5)
-    enum : char { kFree = 0, kResident = 1, kSpare = 2, kDraining = 3, kLent = 4, kLanding = 5 };
+    enum : char { kFree = 0, kResident = 1, kSpare = 2, kDraining = 3, kLent = 4, kLanding = 5, kKvLent = 6 };   // (kKvLent: hy_v3's K / V cache)
     // A layer's slots [0, n_main) are at base, [n_main, n) at xbase: every layer's tail lies in ONE region (xpool),
     // which the prompt path borrows for its buffers while a prompt runs (those slots are kLent then) - and an
     // on-demand vision encoder while it encodes (the region is freed; xbase is null until it comes back).

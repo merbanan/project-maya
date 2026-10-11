@@ -267,19 +267,27 @@ void mtp_in(const float* emb, const float* h, const float* enorm, const float* h
 void rms_q8(float* h, const float* add, const float* w, float eps, int n, float* x, void* xq, cudaStream_t s);
 
 // ---------------------------------------------------------------- hy_v3's grouped-query attention (glm_gqa.cu)
-// head_dim 128.  A layer's cache: K then V, rows [position][n_kv][128].  The mode: 0 FP16 (256 bytes a row); 1 INT8
-// codes with an FP16 scale per 32 values (all rows' codes, then their scales: 136 bytes); 2 K8V4 - INT8 K and 4-bit V
-// (two codes a byte + a scale per 32: 72 bytes), the V rows Walsh-Hadamard rotated (glm_gqa.cu).
-constexpr int kGqaFp16 = 0, kGqaInt8 = 1, kGqaK8V4 = 2;
+// head_dim 128.  The cache is POSITION-MAJOR: a position's record holds every layer's K rows then V rows (n_kv each).
+// The mode: 0 FP16 (256 bytes a row); 1 INT8 codes + an FP16 scale per 32 values (136 bytes); 2 K8V4 - INT8 K and 4-bit
+// V (two codes a byte + a scale per 32: 72 bytes), the V rows Walsh-Hadamard rotated (glm_gqa.cu); 3..5 TurboQuant -
+// TQ4 (4-bit K and V), TQ6V4 (6-bit K, 4-bit V), TQ4V3 (4-bit K, 3-bit V): rotated rows, Lloyd-Max levels, a scale a
+// row (68 / 100 / 52 bytes for 4 / 6 / 3 bits).  Positions below p0 live in region a (record pos at a + pos * rec), the
+// rest in region b, downward (at b - (pos - p0) * rec).
+constexpr int kGqaFp16 = 0, kGqaInt8 = 1, kGqaK8V4 = 2, kGqaTq4 = 3, kGqaTq6V4 = 4, kGqaTq4V3 = 5;
 struct GqaKv {
-    void* k = nullptr;
-    void* v = nullptr;
-    int q8 = 0, v4 = 0, n_kv = 8, max_ctx = 0;   // q8: K (and V unless v4) INT8; v4: V 4-bit, rotated
+    void* a = nullptr;
+    void* b = nullptr;
+    long long p0 = 0, rec = 0;            // region a's positions; a record's bytes
+    int k_off = 0;                        // this layer's K rows in a record (its V rows follow them)
+    int kk = 0, vk = 0, n_kv = 8, max_ctx = 0;   // K's and V's row formats (glm_gqa.cu kF16 .. kT6)
 };
-/// The bytes of one layer's K + V cache (and of its K part), and the view of a layer's cache at `layer_base`.
-size_t gqa_kv_layer_bytes(int n_kv, int64_t max_ctx, int mode);
-size_t gqa_kv_k_bytes(int n_kv, int64_t max_ctx, int mode);
-GqaKv gqa_kv_view(void* layer_base, int n_kv, int64_t max_ctx, int mode);
+/// a mode's name (STRATA_GLM_KV: fp16 int8 k8v4 tq4 tq6v4 tq4v3), and the mode of a name (-1: none)
+const char* gqa_kv_mode_name(int mode);
+int gqa_kv_mode_parse(const char* s);
+/// One layer's part of a record (its K and V rows), and the view of a layer: a / b the regions' record 0, p0 the first
+/// position of region b, rec the record's bytes (every layer), layer_off this layer's offset inside a record.
+size_t gqa_kv_rec_bytes(int n_kv, int mode);
+GqaKv gqa_kv_view(void* a, void* b, int64_t p0, int64_t rec, int64_t layer_off, int n_kv, int64_t max_ctx, int mode);
 /// T rows (q qld floats apart, k / v kld apart) at positions p0 .. p0 + T - 1: q (n_head x 128, in place) and k (n_kv x
 /// 128) take their per-head RMS norm (q_norm / k_norm) and NeoX rope; the rotated k and the raw v go into the cache.
 void gqa_prep(float* q, const float* k, const float* v, int T, int qld, int kld, const float* q_norm,

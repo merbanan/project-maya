@@ -765,6 +765,7 @@ void Glm5Model::reset() {
     cudaSetDevice(dev_);
     cudaMemset(state_, 0, state_bytes_);
     pos_ = 0;
+    kv_trim(std::max<int64_t>(snap_pos_, 0));   // hy_v3: the K / V records' pool slots past the kept prefix go back
     if (fast_ && fast_->route_error_h && cudaStreamSynchronize(fast_->cs) == cudaSuccess)
         *fast_->route_error_h = 0;   // a failed route belongs to the previous request
     if (split_next_) {
@@ -1093,10 +1094,10 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     const double lat = fast ? (double) g.kv_lora * (double) max_ctx / 2 : (double) g.kv_lora * (double) max_ctx;
     // (hy_v3: an attention layer's K / V cache, FP16 or with STRATA_GLM_KV_INT8 INT8)
     const char* gkv_env = getenv("STRATA_GLM_KV");
-    const int gkv8 = gkv_env != nullptr && std::strcmp(gkv_env, "k8v4") == 0 ? 2
-                   : (gkv_env != nullptr && std::strcmp(gkv_env, "int8") == 0) ||
-                             (getenv("STRATA_GLM_KV_INT8") != nullptr && std::atoi(getenv("STRATA_GLM_KV_INT8")) != 0) ? 1 : 0;
-    const double dsa_state = g.gqa() ? (double) strata::kernels::glmf::gqa_kv_layer_bytes(g.n_kv, max_ctx, gkv8)
+    const int gkv_m = strata::kernels::glmf::gqa_kv_mode_parse(gkv_env);
+    const int gkv8 = gkv_m >= 0 ? gkv_m
+                   : (getenv("STRATA_GLM_KV_INT8") != nullptr && std::atoi(getenv("STRATA_GLM_KV_INT8")) != 0) ? 1 : 0;
+    const double dsa_state = g.gqa() ? (double) strata::kernels::glmf::gqa_kv_rec_bytes(g.n_kv, gkv8) * (double) max_ctx
                                      : 4.0 * (lat + 2.0 * g.idx_key * (double) max_ctx + (double) g.idx_key * max_pools);
     const double kda_state = 4.0 * ((double) g.d_inner() * g.kda_head_dim + 3.0 * g.d_inner() * (g.d_conv - 1));
     // the experts: a layer's blob and its VRAM slot's stride (native_experts.txt)
@@ -2626,20 +2627,21 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                                             : (int64_t) g_.kv_lora * max_ctx;
     if (lat_q8_) std::fprintf(stderr, "glm pack: CUDA%d latent cache INT8 (%d bytes a position and layer)\n", dev_,
                               strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora));
-    // hy_v3's K / V cache: STRATA_GLM_KV=k8v4 | int8 | fp16 (generate's --kv sets it), else STRATA_GLM_KV_INT8=1 INT8
+    // hy_v3's K / V cache: STRATA_GLM_KV=fp16 | int8 | k8v4 | tq4 | tq6v4 | tq4v3 (generate's --kv sets it), else
+    // STRATA_GLM_KV_INT8=1 INT8
     gqa_kvm_ = strata::kernels::glmf::kGqaFp16;
     if (g_.gqa()) {
         const char* kv = getenv("STRATA_GLM_KV");
         const char* k8 = getenv("STRATA_GLM_KV_INT8");
-        if (kv != nullptr && std::strcmp(kv, "k8v4") == 0) gqa_kvm_ = strata::kernels::glmf::kGqaK8V4;
-        else if (kv != nullptr && std::strcmp(kv, "int8") == 0) gqa_kvm_ = strata::kernels::glmf::kGqaInt8;
-        else if ((kv == nullptr || std::strcmp(kv, "fp16") != 0) && k8 != nullptr && std::atoi(k8) != 0)
-            gqa_kvm_ = strata::kernels::glmf::kGqaInt8;
+        const int m = strata::kernels::glmf::gqa_kv_mode_parse(kv);
+        if (m >= 0) gqa_kvm_ = m;
+        else if (kv != nullptr) std::fprintf(stderr, "glm pack: STRATA_GLM_KV=%s is not a K/V cache mode - FP16\n", kv);
+        else if (k8 != nullptr && std::atoi(k8) != 0) gqa_kvm_ = strata::kernels::glmf::kGqaInt8;
     }
     if (g_.gqa())
         std::fprintf(stderr, "glm pack: CUDA%d K/V cache %s (%zu bytes a position and layer)\n", dev_,
-                     gqa_kvm_ == 2 ? "K8V4 (INT8 K, 4-bit rotated V)" : gqa_kvm_ == 1 ? "INT8" : "FP16",
-                     strata::kernels::glmf::gqa_kv_layer_bytes(g_.n_kv, 1, gqa_kvm_));
+                     strata::kernels::glmf::gqa_kv_mode_name(gqa_kvm_),
+                     strata::kernels::glmf::gqa_kv_rec_bytes(g_.n_kv, gqa_kvm_));
     // (one entry past the trunk: the NextN block's DSA caches, when this half carries it)
     kda_S_.assign((size_t) g_.n_layers + 1, 0);
     kda_conv_.assign((size_t) g_.n_layers + 1, 0);
@@ -2651,10 +2653,37 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // ik_ring_), the whole context on the reference path (whose kernels index them by position)
     ik_ring_ = fast_mode_ ? (int) std::min<int64_t>(max_ctx, 8192 + 64) : (int) max_ctx;
     gqa_kv_.assign((size_t) g_.n_layers + 1, -1);
-    const int64_t gqa_floats = (int64_t) ((strata::kernels::glmf::gqa_kv_layer_bytes(g_.n_kv, max_ctx, gqa_kvm_) + 255) / 256 * 64);
-    if (mtp_il_ >= 0 && g_.gqa()) {   // hy_v3's draft block: a K / V cache like the trunk's layers
-        gqa_kv_[(size_t) mtp_il_] = floats;
-        floats += gqa_floats;
+    kv_loff_.assign((size_t) g_.n_layers + 1, 0);
+    kv_b_ = nullptr;
+    kv_b_bytes_ = 0;
+    if (g_.gqa()) {
+        // hy_v3's K / V records: per position every layer's rows (the draft block's first), region a in this arena for
+        // positions [0, p0), region b - positions [p0, max_ctx) - in the expert pool's lendable tail (fast_setup), lent to
+        // the cache as the context grows.  STRATA_GLM_KV_LEND_FROM=<positions> (4096) sets p0; STRATA_GLM_KV_LEND=0, the
+        // reference path and several sequences keep the whole context here.
+        kv_rec_ = 0;
+        const auto layer = [&](int il) {
+            kv_loff_[(size_t) il] = kv_rec_;
+            kv_rec_ += (int64_t) strata::kernels::glmf::gqa_kv_rec_bytes(g_.n_kv, gqa_kvm_);
+        };
+        if (mtp_il_ >= 0) layer(mtp_il_);
+        for (int il = l0_; il < l1_; ++il) layer(il);
+        const char* lend = getenv("STRATA_GLM_KV_LEND");
+        const char* from = getenv("STRATA_GLM_KV_LEND_FROM");
+        const bool seqs = getenv("STRATA_GLM_SEQS") != nullptr && std::atoi(getenv("STRATA_GLM_SEQS")) > 1;
+        const int64_t want = from != nullptr ? std::max<int64_t>(0, std::atoll(from)) : 4096;
+        kv_p0_ = fast_mode_ && !seqs && !(lend != nullptr && lend[0] == '0') && want < max_ctx ? want : max_ctx;
+        kv_b_bytes_ = (size_t) ((max_ctx - kv_p0_) * kv_rec_ + 255) / 256 * 256;
+        for (auto& v : gqa_kv_) v = floats;
+        if (mtp_il_ < 0) gqa_kv_[(size_t) g_.n_layers] = -1;
+        floats += (kv_p0_ * kv_rec_ + 255) / 256 * 64;
+        kv_lent_ = kv_p0_;
+        if (kv_b_bytes_ > 0)
+            std::fprintf(stderr, "glm pack: CUDA%d K/V records %lld bytes a position: [0, %lld) here, [%lld, %lld) (%.2f GB) "
+                                 "lent from the expert pool as the context grows\n", dev_, (long long) kv_rec_,
+                         (long long) kv_p0_, (long long) kv_p0_, (long long) max_ctx, (double) kv_b_bytes_ / 1073741824.0);
+    }
+    if (mtp_il_ >= 0 && g_.gqa()) {   // hy_v3's draft block: its rows are in the records
     } else if (mtp_il_ >= 0) {
         dsa_lat_[(size_t) mtp_il_] = floats;
         floats += lat_floats;
@@ -2668,9 +2697,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     for (int il = 0; il < g_.n_layers; ++il) {
         if (il < l0_ || il >= l1_) continue;   // the other half's caches stay on the other device
         if (g_.gqa()) {
-            // hy_v3: the layer's K then V cache (glm_fast.hpp GqaKv: FP16, or INT8 + scales with STRATA_GLM_KV_INT8)
-            gqa_kv_[(size_t) il] = floats;
-            floats += gqa_floats;
+            // hy_v3: the layer's rows are in the records (above)
         } else if (g_.is_recr(il)) {
             kda_S_[(size_t) il] = floats;
             floats += (int64_t) g_.d_inner() * g_.kda_head_dim;

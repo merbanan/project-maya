@@ -2916,8 +2916,10 @@ int main(int argc, char** argv) {
     if (!o.glm_pack.empty()) {
         // --kv int8 on the GLM path: the INT8 latent cache (Glm5Model::lat_q8_, read at load)
         if (o.kv == "int8" && std::getenv("STRATA_GLM_KV_INT8") == nullptr) set_env("STRATA_GLM_KV_INT8", "1");
-        // (hy_v3's K / V cache reads STRATA_GLM_KV: fp16 / int8 / k8v4)
-        if ((o.kv == "k8v4" || o.kv == "int8") && std::getenv("STRATA_GLM_KV") == nullptr) set_env("STRATA_GLM_KV", o.kv.c_str());
+        // (hy_v3's K / V cache reads STRATA_GLM_KV: fp16 / int8 / k8v4 / tq4 / tq6v4 / tq4v3)
+        if ((o.kv == "k8v4" || o.kv == "int8" || o.kv == "tq4" || o.kv == "tq6v4" || o.kv == "tq4v3") &&
+            std::getenv("STRATA_GLM_KV") == nullptr)
+            set_env("STRATA_GLM_KV", o.kv.c_str());
         if (o.pack != "pack/full") {
             std::fprintf(stderr, "maya generate: note: --glm-pack supersedes --pack (%s ignored)\n", o.pack.c_str());
         }

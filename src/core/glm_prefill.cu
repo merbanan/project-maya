@@ -1024,6 +1024,12 @@ bool Glm5Model::vision_reclaim(std::string& err) {
 // The tail's slots below xpool + limit leave the decode: a resident expert takes the slot of a colder main-slot
 // resident (a device copy) or goes; a spare there leaves the spare table; the slots are kLent after this.
 bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err) {
+    return lend_range(fast_->xpool, fast_->xpool + limit, FastState::kLent, moved, dropped, err);
+}
+
+// ... any range [lo, hi) of it: the slots it touches (not lent already) end in state
+bool Glm5Model::lend_range(const uint8_t* lo, const uint8_t* hi, char state, uint64_t& moved, uint64_t& dropped,
+                           std::string& err) {
     FastState* F = fast_;
     // background moves in flight land first and no new ones start (fast_boundary step 5): a slot with a copy on its
     // way would otherwise be lent under it
@@ -1123,9 +1129,11 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
             });
             size_t ci = 0;
             for (int s = P.n_main; s < P.n; ++s) {
-                // a slot past the bytes this lending uses (a prompt's layout) stays with the decode
-                if (P.slot_ptr(s) >= F->xpool + limit) continue;
+                // a slot outside the bytes this lending uses (a prompt's layout, the K / V records' part) stays
+                const uint8_t* sp = P.slot_ptr(s);
+                if (sp >= hi || sp + P.stride <= lo) continue;
                 char& st = P.st[(size_t) s];
+                if (st == FastState::kLent || st == FastState::kKvLent) continue;
                 if (st == FastState::kResident && P.key[(size_t) s] >= 0) {
                     const int key = il * NE + P.key[(size_t) s];
                     if (ci < cold.size() && cold[ci].first < (uint64_t) F->cnt[(size_t) key]) {
@@ -1160,7 +1168,7 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
                         }
                 }
                 P.key[(size_t) s] = -1;
-                st = FastState::kLent;
+                st = state;
             }
         }
         flush();
@@ -1591,7 +1599,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 hgemm_q(Ly.k, KD, E, x16, E, B.k, KD, tn, 0.0f);
                 hgemm_q(Ly.v, KD, E, x16, E, B.v, KD, tn, 0.0f);
                 S->mark("gqa_proj", s);
-                const gf::GqaKv kv = gf::gqa_kv_view(state_ + gqa_kv_[(size_t) il], g.n_kv, max_ctx_, gqa_kvm_);
+                const gf::GqaKv kv = kv_view(il);
                 gf::gqa_prep(B.q, B.k, B.v, tn, QD, KD, Ly.q_norm, Ly.k_norm, g.norm_eps, pt, g.rope_base, g.n_head, kv, s);
                 if (!gf::gqa_attn_rows(B.q, QD, kv, pt, tn, g.n_head, B.out16, QD, s)) {
                     err = "glm prefill: gqa attention";
@@ -2536,7 +2544,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 float* vv = c2.take<float>((size_t) Tv * KD);
                 hgemm_q(Ly.k, KD, E, S->x16, E, kk, KD, Tv, 0.0f);
                 hgemm_q(Ly.v, KD, E, S->x16, E, vv, KD, Tv, 0.0f);
-                const gf::GqaKv gkv = gf::gqa_kv_view(state_ + gqa_kv_[(size_t) mtp_il_], g.n_kv, max_ctx_, gqa_kvm_);
+                const gf::GqaKv gkv = kv_view(mtp_il_);
                 gf::gqa_prep(nullptr, kk, vv, Tv, 0, KD, nullptr, Ly.k_norm, g.norm_eps, (int) p0, g.rope_base, 0, gkv, s);
                 S->mark("mtp_cache", s);
             } else {   // GLM: the latent and the indexer's key / gate
@@ -2657,9 +2665,29 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
                                             : (int) std::min<int64_t>(Tmax, ((nn + nchunks - 1) / nchunks + 63) / 64 * 64);
     bool ok = true;
     progress_at("the prompt: lending the expert pool's tail");   // (the serve watchdog's stages, issue #40)
+    // hy_v3: the K / V records the prompt reaches are lent first; the chunk then halves until its buffers fit below them
+    int Tr = Trun;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         cudaSetDevice(m->dev_);
-        m->prefill_carve(Trun);
+        if (!m->kv_ensure(m->pos_ + nn + 16, err)) {
+            cudaSetDevice(dev_);
+            return false;
+        }
+        while (Tr > 256 && m->prefill_carve(Tr) > m->kv_room(m->pos_ + nn + 16))
+            Tr = std::max(256, Tr / 2 / 64 * 64);
+    }
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        cudaSetDevice(m->dev_);
+        if (m->prefill_carve(Tr) > m->kv_room(m->pos_ + nn + 16)) {   // (no room even for 256 rows: the token path)
+            cudaSetDevice(dev_);
+            return false;
+        }
+    }
+    if (Tr != Trun)
+        std::fprintf(stderr, "glm prefill: chunks of %d tokens (the K / V records leave the prompt path %zu MB)\n", Tr,
+                     kv_room(pos_ + nn + 16) >> 20);
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        cudaSetDevice(m->dev_);
         if (!m->prefill_lend(err)) { ok = false; break; }
     }
     // STRATA_GLM_STALL_TEST=<s> (a test of the serve watchdog): every batched prompt stops here for s seconds
