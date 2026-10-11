@@ -89,8 +89,6 @@ uint64_t Glm5Model::seq_layout(int64_t ctx, SeqCtx& c) const {
     for (auto* v : {&c.kda_S, &c.kda_conv, &c.dsa_lat, &c.dsa_ik, &c.dsa_ig, &c.dsa_pool})
         v->assign((size_t) g.n_layers + 1, 0);
     c.gqa_kv.assign((size_t) g.n_layers + 1, -1);
-    // hy_v3: a layer's K / V cache (load_pack's rounding: whole 256-byte units)
-    const int64_t gkv = (int64_t) ((gf::gqa_kv_layer_bytes(g.n_kv, ctx, gqa_kvm_) + 255) / 256 * 64);
     c.ik_ring = (int) std::min<int64_t>(ctx, 8192 + 64);
     const auto dsa = [&](int il) {
         c.dsa_lat[(size_t) il] = floats;
@@ -102,18 +100,16 @@ uint64_t Glm5Model::seq_layout(int64_t ctx, SeqCtx& c) const {
         c.dsa_pool[(size_t) il] = floats;
         floats += (int64_t) g.idx_key * max_pools;
     };
-    if (mtp_il_ >= 0) {
-        if (g.gqa()) {
-            c.gqa_kv[(size_t) mtp_il_] = floats;
-            floats += gkv;
-        } else {
-            dsa(mtp_il_);
-        }
+    if (g.gqa()) {
+        // hy_v3: the K / V records of the whole context (load_pack's layout with p0 = ctx: several sequences lend none)
+        for (auto& v : c.gqa_kv) v = floats;
+        if (mtp_il_ < 0) c.gqa_kv[(size_t) g.n_layers] = -1;
+        floats += (ctx * kv_rec_ + 255) / 256 * 64;
+    } else if (mtp_il_ >= 0) {
+        dsa(mtp_il_);
     }
     for (int il = l0_; il < l1_; ++il) {
         if (g.gqa()) {
-            c.gqa_kv[(size_t) il] = floats;
-            floats += gkv;
         } else if (g.is_recr(il)) {
             c.kda_S[(size_t) il] = floats;
             floats += (int64_t) g.d_inner() * g.kda_head_dim;

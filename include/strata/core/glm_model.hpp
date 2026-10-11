@@ -43,6 +43,8 @@ namespace strata::kernels::glmf {
 struct MoeRequest;
 struct CpuAnswer;
 struct MoeDev;
+struct GqaKv;   // (kernels/glm_fast.hpp)
+const char* gqa_kv_mode_name(int mode);
 }  // namespace strata::kernels::glmf
 
 namespace strata::core {
@@ -333,8 +335,15 @@ private:
 
     // per-layer state offsets, in floats into state_ (-1: the layer has no such state)
     std::vector<int64_t> kda_S_, kda_conv_, dsa_lat_, dsa_ik_, dsa_ig_, dsa_pool_;
-    std::vector<int64_t> gqa_kv_;                 // hy_v3: per layer the K then V cache (floats into state_), -1 none
-    int gqa_kvm_ = 0;                             // ... its mode (glm_fast.hpp kGqa*: FP16, INT8, K8V4)
+    std::vector<int64_t> gqa_kv_;                 // hy_v3: per layer region a of the K / V records (floats into state_), -1 none
+    // hy_v3's position-major K / V records (glm_fast.hpp GqaKv): a record's bytes, each layer's offset inside it, the
+    // first position of region b - the expert pool's lendable tail (xpool), lent to the cache as the context grows
+    // (kv_ensure) and back when it shrinks (kv_trim) - its bytes, and the positions lent so far ([p0, kv_lent_))
+    int64_t kv_rec_ = 0, kv_p0_ = 0, kv_lent_ = 0;
+    std::vector<int64_t> kv_loff_;
+    uint8_t* kv_b_ = nullptr;
+    size_t kv_b_bytes_ = 0;
+    int gqa_kvm_ = 0;                             // ... its mode (glm_fast.hpp kGqa*: FP16 .. TQ4V3)
 
 public:
     // ---- per-weight serving slots (strata::core::WSlot below): F32 pointers for the
@@ -604,6 +613,15 @@ public:
     // (glm_rows.cu); false with err empty: not here (the rows go one by one)
     bool rows_moe_grouped(int il, int n, std::string& err);
     bool fast_gqa(int il, int64_t p, std::string& err);     // hy_v3: one attention mixer (xq -> mixer)
+    bool kv_ensure(int64_t pos_end, std::string& err);      // hy_v3: region b lent to the cache up to pos_end
+    const uint8_t* kv_lo(int64_t pos_end) const;            // ... the lowest byte of positions [p0, pos_end) there
+    size_t kv_room(int64_t pos_end) const;                  // ... the tail's bytes below them (the prompt path's)
+    void kv_trim(int64_t keep);                             // ... and handed back to the pool beyond keep
+    // a layer's view of the K / V records
+    strata::kernels::glmf::GqaKv kv_view(int il) const;
+    // the slots of the pool's lendable tail whose memory meets [lo, hi): lent (to the prompt path: kLent, to the cache:
+    // kKvLent) - their experts moved over colder main-slot ones or parked in the RAM tier
+    bool lend_range(const uint8_t* lo, const uint8_t* hi, char state, uint64_t& moved, uint64_t& dropped, std::string& err);
     bool fast_layers_gqa(int64_t p, std::string& err);      // hy_v3: this part's layers
     void fast_service();
     // gate / up / down of one expert from the shards (or its chunk-th of n_chunks pieces)
@@ -690,6 +708,9 @@ public:
     bool has_mtp() const;
     bool kv_int8() const { return lat_q8_ || gqa_kvm_; }   // the KV / latent cache in INT8 (STRATA_GLM_KV_INT8=1)
     /// the cache's name for the driver's INFO line: fp16, int8 or k8v4 (hy_v3's K8V4)
+    const char* kv_name() const {
+        return g_.gqa() ? strata::kernels::glmf::gqa_kv_mode_name(gqa_kvm_) : kv_int8() ? "int8" : "fp16";
+    }
     const char* kv_name() const { return gqa_kvm_ == 2 ? "k8v4" : kv_int8() ? "int8" : "fp16"; }
     /// KV streaming: the positions of each DSA layer kept in VRAM (0: all of them - not streamed); and what
     /// STRATA_GLM_KV_RESIDENT gives for a context: rounded up to whole pools and to glmf::kKvResidentMin, 0 when unset

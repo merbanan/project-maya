@@ -1604,6 +1604,12 @@ bool Glm5Model::prefill_carve(int Tn, int64_t end) {
                      S->region_bytes);
         return false;
     }
+    // hy_v3: the K / V records fill the tail from the top down - the layout must stay below those the prompt reaches
+    if (end >= 0 && kv_b_ != nullptr && S->need > kv_room(end + 16)) {
+        std::fprintf(stderr, "glm prefill: CUDA%d the layout needs %zu bytes below the K / V records' %zu\n", dev_,
+                     S->need, kv_room(end + 16));
+        return false;
+    }
     return true;
 }
 
@@ -1720,6 +1726,12 @@ bool Glm5Model::vision_reclaim(std::string& err) {
 // The tail's slots below xpool + limit leave the decode: a resident expert takes the slot of a colder main-slot
 // resident (a device copy) or goes; a spare there leaves the spare table; the slots are kLent after this.
 bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err) {
+    return lend_range(fast_->xpool, fast_->xpool + limit, FastState::kLent, moved, dropped, err);
+}
+
+// ... any range [lo, hi) of it: the slots it touches (not lent already) end in state
+bool Glm5Model::lend_range(const uint8_t* lo, const uint8_t* hi, char state, uint64_t& moved, uint64_t& dropped,
+                           std::string& err) {
     FastState* F = fast_;
     // background moves in flight land first and no new ones start (fast_boundary step 5): a slot with a copy on its
     // way would otherwise be lent under it
@@ -1732,7 +1744,8 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
         return false;
     }
     const int NE = g_.n_expert;
-    F->lend_end = (size_t) F->xpool + F->xpool_bytes;   // narrowed below to the first slot the lending keeps
+    if (state == FastState::kLent)   // (a prompt's lending; the K / V records' leaves it as it is)
+        F->lend_end = (size_t) F->xpool + F->xpool_bytes;   // narrowed below to the first slot the lending keeps
     {
         std::lock_guard<std::mutex> lk(F->mu);
         int nu = 0;
@@ -1839,13 +1852,16 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
             });
             size_t ci = 0;
             for (int s = P.n_main; s < P.n; ++s) {
-                // a slot past the bytes this lending uses (a prompt's layout) stays with the decode
-                if (P.slot_ptr(s) >= F->xpool + limit) {
-                    // ... and it is the first live byte of this layer's tail: what precedes it is a loan nobody uses
-                    F->lend_end = std::min(F->lend_end, (size_t) P.slot_ptr(s));
+                // a slot outside the bytes this lending uses (a prompt's layout, the K / V records' part) stays with
+                // the decode - and for a prompt's lending, a slot past them is the first live byte of this layer's
+                // tail: what precedes it is a loan nobody uses
+                const uint8_t* sp = P.slot_ptr(s);
+                if (sp >= hi || sp + P.stride <= lo) {
+                    if (state == FastState::kLent && sp >= hi) F->lend_end = std::min(F->lend_end, (size_t) sp);
                     continue;
                 }
                 char& st = P.st[(size_t) s];
+                if (st == FastState::kLent || st == FastState::kKvLent) continue;
                 if (st == FastState::kResident && P.key[(size_t) s] >= 0) {
                     const int key = il * NE + P.key[(size_t) s];
                     static const bool lru_ties = getenv("STRATA_GLM_LEND_PARK_LRU") == nullptr ||
@@ -1885,7 +1901,7 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
                         }
                 }
                 P.key[(size_t) s] = -1;
-                st = FastState::kLent;
+                st = state;
             }
         }
         flush();
@@ -2539,7 +2555,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 hgemm_q(Ly.k, KD, E, x16, E, B.k, KD, tn, 0.0f);
                 hgemm_q(Ly.v, KD, E, x16, E, B.v, KD, tn, 0.0f);
                 S->mark("gqa_proj", s);
-                const gf::GqaKv kv = gf::gqa_kv_view(state_ + gqa_kv_[(size_t) il], g.n_kv, max_ctx_, gqa_kvm_);
+                const gf::GqaKv kv = kv_view(il);
                 gf::gqa_prep(B.q, B.k, B.v, tn, QD, KD, Ly.q_norm, Ly.k_norm, g.norm_eps, pt, g.rope_base, g.n_head, kv, s);
                 if (!gf::gqa_attn_rows(B.q, QD, kv, pt, tn, g.n_head, B.out16, QD, s)) {
                     err = "glm prefill: gqa attention";
@@ -4082,7 +4098,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 float* vv = c2.take<float>((size_t) Tv * KD);
                 hgemm_q(Ly.k, KD, E, S->x16, E, kk, KD, Tv, 0.0f);
                 hgemm_q(Ly.v, KD, E, S->x16, E, vv, KD, Tv, 0.0f);
-                const gf::GqaKv gkv = gf::gqa_kv_view(state_ + gqa_kv_[(size_t) mtp_il_], g.n_kv, max_ctx_, gqa_kvm_);
+                const gf::GqaKv gkv = kv_view(mtp_il_);
                 gf::gqa_prep(nullptr, kk, vv, Tv, 0, KD, nullptr, Ly.k_norm, g.norm_eps, (int) p0, g.rope_base, 0, gkv, s);
                 S->mark("mtp_cache", s);
             } else {   // GLM: the latent and the indexer's key / gate
@@ -4321,6 +4337,15 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     // The layout of the chunk: it must fit the lendable region.  A chunk whose layout does not fit is read again
     // with a smaller one (nothing has been computed yet, so this is safe) - and a chunk that does not fit at 256
     // tokens is the end of the prompt path's memory: the request ends with an error, the engine lives.
+    // hy_v3: the K / V records the prompt reaches are lent first; the chunk's layout must then fit below them
+    // (prefill_carve: kv_room)
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        cudaSetDevice(m->dev_);
+        if (!m->kv_ensure(m->pos_ + nn + 16, err)) {
+            cudaSetDevice(dev_);
+            return false;
+        }
+    }
     int Trun = Trun_max;
     for (;;) {
         bool laid_out = true;

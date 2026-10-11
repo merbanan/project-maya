@@ -4595,8 +4595,10 @@ int main(int argc, char** argv) {
         if (o.vram_reserve_given) set_env("STRATA_GLM_RESERVE_MB", std::to_string(o.vram_reserve_mib).c_str());
         if (o.vram_reserve_later_mib >= 0)
             set_env("STRATA_GLM_RESERVE_LATER_MB", std::to_string(o.vram_reserve_later_mib).c_str());
-        // (hy_v3's K / V cache reads STRATA_GLM_KV: fp16 / int8 / k8v4)
-        if ((o.kv == "k8v4" || o.kv == "int8") && std::getenv("STRATA_GLM_KV") == nullptr) set_env("STRATA_GLM_KV", o.kv.c_str());
+        // (hy_v3's K / V cache reads STRATA_GLM_KV: fp16 / int8 / k8v4 / tq4 / tq6v4 / tq4v3)
+        if ((o.kv == "k8v4" || o.kv == "int8" || o.kv == "tq4" || o.kv == "tq6v4" || o.kv == "tq4v3") &&
+            std::getenv("STRATA_GLM_KV") == nullptr)
+            set_env("STRATA_GLM_KV", o.kv.c_str());
         if (o.pack != "pack/full") {
             std::fprintf(stderr, "maya generate: note: --glm-pack supersedes --pack (%s ignored)\n", o.pack.c_str());
         }

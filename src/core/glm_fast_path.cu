@@ -1248,6 +1248,15 @@ bool Glm5Model::fast_setup(std::string& err) {
         const auto tail_slots = [&](size_t bytes) {
             return (int) ((bytes + stride_sum - 1) / std::max<size_t>(1, stride_sum));
         };
+        // hy_v3: region b of the K / V records is the tail's last kv_b_bytes_ - slots of the decode until the context
+        // reaches them (kv_ensure); the prompt path's and the vision encoder's needs are sized from the slots before it
+        const int k_kv = kv_b_bytes_ > 0 ? tail_slots(kv_b_bytes_ + 256) : 0;
+        if (k_kv > 0 && per - k_kv < g.n_exp_used + gf::kSpares + 2) {
+            err = "glm fast: the expert pool (" + std::to_string(per) + " slots/layer) cannot hold the K / V cache's " +
+                  std::to_string(kv_b_bytes_ >> 20) + " MB beyond position " + std::to_string(kv_p0_) +
+                  " - a smaller context or STRATA_GLM_KV=k8v4";
+            return false;
+        }
         // A COMPLETE pool where the budget holds one: every expert and the spares in each layer's main slots, the tail
         // the prompt path (and the vision encoder) borrows BEYOND them.  The cap of n_expert slots a layer, with the
         // tail carved out of it, left a pool that could hold everything short: Windows sizes the 8065S's 160 GB
@@ -1260,7 +1269,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // else used); Linux's unified-memory budget is the experts' bytes exactly, so it keeps its own policy there.
         // STRATA_GLM_COMPLETE_POOL=0: the capped pool (A/B); on by default on every GPU (complete_pool_on, #474).
         {
-            int k_full = pf_ != nullptr ? tail_slots(prefill_borrow_bytes()) : 0;
+            int k_full = std::max(pf_ != nullptr ? tail_slots(prefill_borrow_bytes()) : 0, k_kv);   // (hy_v3: the K / V records share it)
             if (const char* v = getenv("STRATA_GLM_VISION_LEND_MB"); v != nullptr && dev_ == 0)
                 k_full = std::max(k_full, tail_slots((size_t) std::max(0LL, std::atoll(v)) << 20));
             const int full = glmfast::complete_pool_on() && !F->unified_memory
@@ -1289,7 +1298,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // an on-demand vision encoder on the first GPU (the server sets STRATA_GLM_VISION_LEND_MB) borrows the same
         // tail while it encodes, so the tail there is the larger of the two needs
         vis_lend_ok_ = false;
-        if (const char* v = getenv("STRATA_GLM_VISION_LEND_MB"); v != nullptr && dev_ == 0) {
+        if (const char* v = getenv("STRATA_GLM_VISION_LEND_MB"); v != nullptr && dev_ == 0 && k_kv == 0) {
             const size_t vb = (size_t) std::max(0LL, std::atoll(v)) << 20;
             if (vb > 0 && per - tail_slots(vb) >= g.n_exp_used + gf::kSpares + 8) {
                 k_extra = std::max(k_extra, tail_slots(vb));
@@ -1299,6 +1308,13 @@ bool Glm5Model::fast_setup(std::string& err) {
                                      "encoder\n", dev_, per, vb >> 20);
             }
         }
+        // (the two share the tail: the records fill it from the top down, the prompt path's buffers from the bottom up,
+        // and a prompt's chunk shrinks to the room below the records it needs - prefill().  The tail holds both whole
+        // when the main slots keep their floor: a tail slot is an expert slot whenever it is not lent, so the decode
+        // loses nothing by it)
+        if (k_kv > 0)
+            k_extra = std::max(std::max(k_extra, k_kv),
+                               std::min(k_extra + k_kv, per - (g.n_exp_used + gf::kSpares + 2)));
         // the expert profile (--expert-profile, Strata's profile.bin): read once per half, before the split below
         if (!profile_path_.empty() && profile_.empty()) {
             int64_t pslots = 0;
@@ -1493,6 +1509,13 @@ bool Glm5Model::fast_setup(std::string& err) {
             auto& P = F->lp[(size_t) il];
             P.xbase = b;
             b += (size_t) k_extra * P.stride;
+        }
+        if (k_kv > 0) {
+            kv_b_ = F->xpool + xtot - kv_rec_;   // (record p0: the top one)
+            kv_lent_ = kv_p0_;
+            std::fprintf(stderr, "glm fast: CUDA%d the pool's last %.2f GB (%d slots/layer) hold the K / V records past "
+                                 "position %lld as the context reaches them\n", dev_, (double) kv_b_bytes_ / 1073741824.0,
+                         k_kv, (long long) kv_p0_);
         }
         if (pf_ != nullptr && !prefill_bind(xregion, xtot, err)) return false;
         if (vis_lend_ok_)
@@ -5698,7 +5721,7 @@ bool Glm5Model::fast_gqa(int il, int64_t p, std::string& err) {
     j[2] = {Ly.v.q, F->xq, F->x, F->gv, nullptr, 1.0f, Ly.v.type, g.n_embd, KD};
     if (!gf::mv(j, 3, s)) { err = "glm fast: gqa projections"; return false; }
     if (F->prof_on) F->mark("gqa_qkv_mv");
-    const gf::GqaKv kv = gf::gqa_kv_view(state_ + gqa_kv_[(size_t) il], g.n_kv, max_ctx_, gqa_kvm_);
+    const gf::GqaKv kv = kv_view(il);
     gf::gqa_prep(F->gq, F->gk, F->gv, 1, QD, KD, Ly.q_norm, Ly.k_norm, g.norm_eps, (int) p, g.rope_base, g.n_head, kv, s);
     if (F->prof_on) F->mark("gqa_prep");
     if (!gf::gqa_attn(F->gq, kv, (int) p + 1, g.n_head, F->gscr, F->attn_q, s)) {
@@ -5714,8 +5737,71 @@ bool Glm5Model::fast_gqa(int il, int64_t p, std::string& err) {
 
 // ---- hy_v3's layers: one residual stream R (= state_), plain pre-norm residuals (rms_q8 adds the block's output
 // to R and normalises the next block's input in one launch)
+gf::GqaKv Glm5Model::kv_view(int il) const {
+    return gf::gqa_kv_view(state_ + gqa_kv_[(size_t) il], kv_b_, kv_b_ != nullptr ? kv_p0_ : max_ctx_, kv_rec_,
+                           kv_loff_[(size_t) il], g_.n_kv, max_ctx_, gqa_kvm_);
+}
+
+// hy_v3: region b of the K / V records holds positions up to pos_end: the pool's slots under the new part are lent to
+// the cache (kKvLent), in steps of 1024 positions (a slot is ~40 positions of every layer) - at most once every ~1000
+// tokens of decode
+const uint8_t* Glm5Model::kv_lo(int64_t pos_end) const {
+    pos_end = std::min(pos_end, max_ctx_);
+    return pos_end <= kv_p0_ ? kv_b_ + kv_rec_ : kv_b_ - (pos_end - 1 - kv_p0_) * kv_rec_;
+}
+
+size_t Glm5Model::kv_room(int64_t pos_end) const {
+    if (fast_ == nullptr) return 0;
+    if (kv_b_ == nullptr) return fast_->xpool_bytes;
+    const uint8_t* lo = kv_lo(pos_end);
+    return lo > fast_->xpool ? (size_t) (lo - fast_->xpool) : 0;
+}
+
+bool Glm5Model::kv_ensure(int64_t pos_end, std::string& err) {
+    if (kv_b_ == nullptr || pos_end <= kv_lent_) return true;
+    const int64_t to = std::min<int64_t>(max_ctx_, (pos_end + 1023) / 1024 * 1024);
+    uint64_t moved = 0, dropped = 0;
+    if (!lend_range(kv_lo(to), kv_lo(kv_lent_), FastState::kKvLent, moved, dropped, err)) return false;
+    kv_lent_ = to;
+    return true;
+}
+
+// ... and the slots wholly past position keep (rounded up to 1024) go back to the pool, free (the decode's boundaries
+// hand them out as spares) - between requests, when the conversation in the model is shorter
+void Glm5Model::kv_trim(int64_t keep) {
+    FastState* F = fast_;
+    if (F == nullptr || kv_b_ == nullptr) return;
+    const int64_t to = std::max(kv_p0_, std::min<int64_t>(max_ctx_, (keep + 1023) / 1024 * 1024));
+    if (to >= kv_lent_) return;
+    const uint8_t* lo = kv_lo(to);   // (region b runs down: the slots wholly below lo go)
+    std::lock_guard<std::mutex> lk(F->mu);
+    int back = 0;
+    for (int il = l0_; il < lt_; ++il) {
+        if (!F->L[(size_t) il].moe) continue;
+        auto& P = F->lp[(size_t) il];
+        for (int s = P.n_main; s < P.n; ++s)
+            if (P.st[(size_t) s] == FastState::kKvLent && P.slot_ptr(s) + P.stride <= lo) {
+                P.st[(size_t) s] = FastState::kFree;
+                ++back;
+            }
+    }
+    // (a slot that straddles `to` stays lent: the lent positions end where its memory ends, at most one slot past to)
+    kv_lent_ = to;
+    const uint8_t* low = lo;
+    for (int il = l0_; il < lt_; ++il) {
+        if (!F->L[(size_t) il].moe) continue;
+        const auto& P = F->lp[(size_t) il];
+        for (int s = P.n_main; s < P.n; ++s)
+            if (P.st[(size_t) s] == FastState::kKvLent && P.slot_ptr(s) < low) low = P.slot_ptr(s);
+    }
+    // the positions whose records lie wholly at or above the lowest lent byte
+    if (low <= kv_b_) kv_lent_ = std::max(kv_lent_, std::min<int64_t>(max_ctx_, kv_p0_ + (kv_b_ - low) / kv_rec_ + 1));
+    (void) back;
+}
+
 bool Glm5Model::fast_layers_gqa(int64_t p, std::string& err) {
     FastState* F = fast_;
+    if (!kv_ensure(p + 16, err)) return false;   // (+16: the draft block's rows ahead of p)
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
     static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
@@ -7330,26 +7416,13 @@ std::vector<std::pair<float*, int64_t>> slot_dsa_runs(const Glm5Geometry& g, boo
 // hy_v3: (state_ offset, floats) of each K / V cache run a slot of n positions holds on this part - per attention layer
 // (the NextN block's first) the K rows, the V rows, and with an INT8 cache their scales
 std::vector<std::pair<int64_t, int64_t>> Glm5Model::slot_gqa_runs(int64_t n) const {
+    // the records of positions [0, n): region a's in this arena, region b's in the pool's tail (an offset from state_
+    // as well: the save and the load add it to state_)
     std::vector<std::pair<int64_t, int64_t>> r;
     if (!g_.gqa()) return r;
-    const int64_t rows = n * g_.n_kv, all = max_ctx_ * g_.n_kv, hd = g_.head_dim;
-    const int64_t kfl = (int64_t) gf::gqa_kv_k_bytes(g_.n_kv, max_ctx_, gqa_kvm_) / 4;   // floats to V
-    const auto layer = [&](int il) {
-        const int64_t b = gqa_kv_[(size_t) il];
-        for (int part = 0; part < 2; ++part) {
-            const int64_t at = part == 0 ? b : b + kfl;
-            const int kind = gqa_kvm_ == 0 ? 0 : (part == 1 && gqa_kvm_ == 2) ? 2 : 1;   // FP16, INT8, 4-bit
-            if (kind == 0) {
-                r.push_back({at, rows * hd / 2});                          // FP16 rows
-            } else {
-                const int64_t code = kind == 1 ? hd : hd / 2;              // code bytes a row
-                r.push_back({at, rows * code / 4});                        // the codes
-                r.push_back({at + all * code / 4, rows * (hd / 32) / 2});  // FP16 scales, one per 32 values
-            }
-        }
-    };
-    if (mtp_il_ >= 0) layer(mtp_il_);
-    for (int il = l0_; il < l1_; ++il) layer(il);
+    const int64_t p0 = kv_b_ != nullptr ? kv_p0_ : max_ctx_, first = gqa_kv_[(size_t) l0_];
+    r.push_back({first, std::min(n, p0) * kv_rec_ / 4});
+    if (kv_b_ != nullptr && n > p0) r.push_back({(int64_t) ((const float*) kv_lo(n) - state_), (n - p0) * kv_rec_ / 4});
     return r;
 }
 
@@ -7480,6 +7553,10 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
             }
         }
         cudaSetDevice(m->dev_);
+        if (!m->kv_ensure(n, err)) {
+            cudaSetDevice(dev_);
+            return false;
+        }
         cudaStreamSynchronize(m->fast_->cs);
         if (m->snap_ == nullptr && n_rec > 0 &&
             cudaMalloc(&m->snap_, (size_t) n_rec * run * sizeof(float)) != cudaSuccess) {

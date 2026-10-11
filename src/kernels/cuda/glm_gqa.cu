@@ -3,11 +3,20 @@
 // (llm_build_norm over head_dim), NeoX rope over the whole head (ggml-cuda/rope.cu's rope_neox: theta = pos *
 // base^(-2i/n_dims), the pair (i, i + n_dims/2)), K and V in a cache, softmax(q.k / sqrt(head_dim)) . v.
 //
-// The cache (GqaKv): per layer K then V, rows [position][n_kv][128] - FP16, or INT8 codes with one FP16 scale per 32
-// values (symmetric, absmax / 127; the codes of every row first, then the scales: 136 bytes a row against 256), or
-// K8V4: INT8 K and 4-bit V (symmetric, absmax / 7, two codes a byte, an FP16 scale per 32: 72 bytes a row).  K8V4's V
+// The cache (GqaKv): POSITION-MAJOR records - a position's record holds every layer's K rows then V rows (n_kv heads
+// each); a row is FP16 (256 bytes), INT8 codes + one FP16 scale per 32 values (symmetric, absmax / 127: 136 bytes), or
+// - K8V4: INT8 K and 4-bit V - 4-bit codes, two a byte, + a scale per 32 (absmax / 7: 72 bytes).  Positions below p0
+// are in region a, the rest in region b (the expert pool's lendable tail, lent to the cache as the context grows; its
+// records run DOWN from b, so the prompt path's buffers at the tail's start meet them only near a full context).  K8V4's V
 // rows are rotated by the orthonormal 128-point Walsh-Hadamard transform H before they are quantized (outliers spread
 // over the row, as Strata's K8V4); attention is linear in V, so its output is rotated back by H (H H = I) per head.
+//
+// The TurboQuant modes (TQ4: 4-bit K and V; TQ6V4: 6-bit K, 4-bit V; TQ4V3: 4-bit K, 3-bit V; no QJL residual): a
+// row is rotated by R = H D (D a fixed random sign per dimension), each rotated value - scaled to unit variance by the
+// row's norm - takes the nearest level of the Lloyd-Max codebook of a unit Gaussian (what a rotated coordinate is close
+// to), and the row keeps one F32 scale: the least-squares fit of its values to the levels.  K's rotation is undone on q
+// instead (q.k = Rq.Rk: q is rotated by R in gqa_prep), V's on the attention's output (o = D H o').  Codes: 4-bit two
+// a byte; 3-bit eight in 3 bytes; 6-bit four in 3 bytes; the scale after them (52 / 68 / 100 bytes a row).
 #include "strata/kernels/glm_fast.hpp"
 
 #include <cuda_fp16.h>
@@ -24,6 +33,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace strata::kernels::glmf {
 namespace {
@@ -31,6 +41,41 @@ namespace {
 constexpr int kD = 128;           // head_dim (hy3_geometry requires it)
 constexpr int kChunk = 256;       // positions per split of the decode attention
 constexpr int kMaxGroup = 16;     // query heads per K/V head
+
+// a row's format: FP16, INT8 (a scale per 32), K8V4's 4-bit V (a scale per 32), TurboQuant 3 / 4 / 6 bits
+enum : int { kF16 = 0, kI8 = 1, kL4 = 2, kT3 = 3, kT4 = 4, kT6 = 5 };
+__host__ __device__ __forceinline__ int row_bytes(int kind) {
+    return kind == kF16 ? kD * 2 : kind == kI8 ? kD + (kD / 32) * 2 : kind == kL4 ? kD / 2 + (kD / 32) * 2
+         : kind == kT3 ? kD * 3 / 8 + 4 : kind == kT4 ? kD / 2 + 4 : kD * 6 / 8 + 4;
+}
+__host__ __device__ __forceinline__ int tq_levels(int kind) { return kind == kT3 ? 8 : kind == kT4 ? 16 : 64; }
+__host__ __device__ __forceinline__ int tq_code_bytes(int kind) { return row_bytes(kind) - 4; }
+// the Lloyd-Max levels of a unit Gaussian (MSE 0.0346 / 0.0095 / 0.00064)
+__constant__ float c_cb3[8] = {-2.151946f, -1.343909f, -0.756005f, -0.245094f, 0.245094f, 0.756005f, 1.343909f,
+                               2.151946f};
+__constant__ float c_cb4[16] = {-2.732590f, -2.069017f, -1.618046f, -1.256231f, -0.942340f, -0.656759f, -0.388048f,
+                                -0.128395f, 0.128395f, 0.388048f, 0.656759f, 0.942340f, 1.256231f, 1.618046f,
+                                2.069017f, 2.732590f};
+__constant__ float c_cb6[64] = {
+    -3.744101f, -3.240437f, -2.917407f, -2.672274f, -2.471305f, -2.298981f, -2.146810f, -2.009611f, -1.883977f,
+    -1.767542f, -1.658589f, -1.555831f, -1.458276f, -1.365141f, -1.275794f, -1.189720f, -1.106488f, -1.025736f,
+    -0.947155f, -0.870477f, -0.795468f, -0.721922f, -0.649656f, -0.578503f, -0.508314f, -0.438950f, -0.370283f,
+    -0.302193f, -0.234567f, -0.167297f, -0.100278f, -0.033410f, 0.033410f,  0.100278f,  0.167297f,  0.234567f,
+    0.302193f,  0.370283f,  0.438950f,  0.508314f,  0.578503f,  0.649656f,  0.721922f,  0.795468f,  0.870477f,
+    0.947155f,  1.025736f,  1.106488f,  1.189720f,  1.275794f,  1.365141f,  1.458276f,  1.555831f,  1.658589f,
+    1.767542f,  1.883977f,  2.009611f,  2.146810f,  2.298981f,  2.471305f,  2.672274f,  2.917407f,  3.240437f,
+    3.744101f};
+__device__ __forceinline__ const float* tq_cb(int kind) { return kind == kT3 ? c_cb3 : kind == kT4 ? c_cb4 : c_cb6; }
+// D: a fixed random sign per dimension (128 bits)
+__constant__ unsigned c_sign[4] = {0x9e3779b9u, 0x7f4a7c15u, 0xf39cc060u, 0x5ced8f29u};
+__device__ __forceinline__ float rsign(int d) { return (c_sign[d >> 5] >> (d & 31)) & 1u ? -1.0f : 1.0f; }
+// the codebooks of K and V (64 levels at most each) into shared memory: a kernel's lookups then cost a shared read
+__device__ __forceinline__ void load_cbs(float (*scb)[64], int kk, int vk, int t, int nt) {
+    for (int i = t; i < 128; i += nt) {
+        const int kind = i < 64 ? kk : vk, j = i & 63;
+        scb[i >> 6][j] = kind >= kT3 && j < tq_levels(kind) ? tq_cb(kind)[j] : 0.0f;
+    }
+}
 
 __device__ __forceinline__ float wsum(float v) {
 #pragma unroll
@@ -43,35 +88,69 @@ __device__ __forceinline__ float wmax(float v) {
     return v;
 }
 
-// row r = pos * n_kv + head of one of the two caches
+// a K or V row (position, head): its record (region a below p0, else b), the layer's K / V part, the head's row
 struct Rows {
-    uint8_t* base;
-    int q8, q4;
-    size_t n_rows;   // max_ctx * n_kv (where a quantized cache's scales start)
-    __device__ __forceinline__ void load4(size_t r, int d, float& a, float& b, float& c, float& e) const {
-        if (q4) {
-            const uint16_t qq = *(const uint16_t*) (base + r * (kD / 2) + d / 2);
-            const float sc = __half2float(((const __half*) (base + n_rows * (kD / 2)))[r * (kD / 32) + d / 32]);
-            a = (float) ((int) (qq & 15) - 8) * sc;
-            b = (float) ((int) ((qq >> 4) & 15) - 8) * sc;
-            c = (float) ((int) ((qq >> 8) & 15) - 8) * sc;
-            e = (float) ((int) ((qq >> 12) & 15) - 8) * sc;
-        } else if (q8) {
-            const char4 q = *(const char4*) (base + r * kD + d);
-            const float sc = __half2float(((const __half*) (base + n_rows * kD))[r * (kD / 32) + d / 32]);
-            a = q.x * sc; b = q.y * sc; c = q.z * sc; e = q.w * sc;
+    const uint8_t* a;
+    const uint8_t* b;
+    long long p0, rec;
+    int off, rb, kind;   // kind: kF16 .. kT6
+    const float* cb;     // a TurboQuant kind's levels (shared memory)
+    __device__ __forceinline__ const uint8_t* row(long long pos, int h) const {
+        return (pos < p0 ? a + pos * rec : b - (pos - p0) * rec) + off + h * rb;   // (region b grows down)
+    }
+    __device__ __forceinline__ void load4(long long pos, int h, int d, float& x0, float& x1, float& x2, float& x3) const {
+        const uint8_t* rp = row(pos, h);
+        if (kind >= kT3) {
+            const float sc = *(const float*) (rp + tq_code_bytes(kind));
+            unsigned c0, c1, c2, c3;
+            if (kind == kT4) {
+                const unsigned qq = *(const uint16_t*) (rp + d / 2);
+                c0 = qq & 15; c1 = (qq >> 4) & 15; c2 = (qq >> 8) & 15; c3 = qq >> 12;
+            } else if (kind == kT3) {   // eight codes in 3 bytes: d's four from bit 12 ((d / 4) & 1)
+                const uint8_t* g = rp + 3 * (d >> 3);
+                const unsigned u = ((unsigned) g[0] | ((unsigned) g[1] << 8) | ((unsigned) g[2] << 16)) >> (12 * ((d >> 2) & 1));
+                c0 = u & 7; c1 = (u >> 3) & 7; c2 = (u >> 6) & 7; c3 = (u >> 9) & 7;
+            } else {                    // four 6-bit codes in 3 bytes
+                const uint8_t* g = rp + 3 * (d >> 2);
+                const unsigned u = (unsigned) g[0] | ((unsigned) g[1] << 8) | ((unsigned) g[2] << 16);
+                c0 = u & 63; c1 = (u >> 6) & 63; c2 = (u >> 12) & 63; c3 = u >> 18;
+            }
+            x0 = cb[c0] * sc; x1 = cb[c1] * sc; x2 = cb[c2] * sc; x3 = cb[c3] * sc;
+        } else if (kind == kL4) {
+            const uint16_t qq = *(const uint16_t*) (rp + d / 2);
+            const float sc = __half2float(((const __half*) (rp + kD / 2))[d / 32]);
+            x0 = (float) ((int) (qq & 15) - 8) * sc;
+            x1 = (float) ((int) ((qq >> 4) & 15) - 8) * sc;
+            x2 = (float) ((int) ((qq >> 8) & 15) - 8) * sc;
+            x3 = (float) ((int) ((qq >> 12) & 15) - 8) * sc;
+        } else if (kind == kI8) {
+            const char4 q = *(const char4*) (rp + d);
+            const float sc = __half2float(((const __half*) (rp + kD))[d / 32]);
+            x0 = q.x * sc; x1 = q.y * sc; x2 = q.z * sc; x3 = q.w * sc;
         } else {
-            const __half2* h = (const __half2*) ((const __half*) base + r * kD + d);
-            const float2 x = __half22float2(h[0]), y = __half22float2(h[1]);
-            a = x.x; b = x.y; c = y.x; e = y.y;
+            const __half2* hp = (const __half2*) ((const __half*) rp + d);
+            const float2 u = __half22float2(hp[0]), w = __half22float2(hp[1]);
+            x0 = u.x; x1 = u.y; x2 = w.x; x3 = w.y;
         }
     }
 };
-__device__ __forceinline__ Rows k_rows(const GqaKv& kv) {
-    return {(uint8_t*) kv.k, kv.q8, 0, (size_t) kv.max_ctx * kv.n_kv};
+__device__ __forceinline__ Rows k_rows(const GqaKv& kv, const float* cb = nullptr) {
+    return {(const uint8_t*) kv.a, (const uint8_t*) kv.b, kv.p0, kv.rec, kv.k_off, row_bytes(kv.kk), kv.kk, cb};
 }
-__device__ __forceinline__ Rows v_rows(const GqaKv& kv) {
-    return {(uint8_t*) kv.v, kv.v4 ? 0 : kv.q8, kv.v4, (size_t) kv.max_ctx * kv.n_kv};
+__device__ __forceinline__ Rows v_rows(const GqaKv& kv, const float* cb = nullptr) {
+    return {(const uint8_t*) kv.a, (const uint8_t*) kv.b, kv.p0, kv.rec, kv.k_off + kv.n_kv * row_bytes(kv.kk),
+            row_bytes(kv.vk), kv.vk, cb};
+}
+// the rotations: K by R = H D (TurboQuant kinds); V by H (K8V4's 4-bit: 1) or R (2)
+__host__ __device__ __forceinline__ bool k_rot(const GqaKv& kv) { return kv.kk >= kT3; }
+__host__ __device__ __forceinline__ int v_rot(const GqaKv& kv) { return kv.vk == kL4 ? 1 : kv.vk >= kT3 ? 2 : 0; }
+// the sum of v over the block's 128 threads (every thread calls it; red: 4 floats of shared memory)
+__device__ __forceinline__ float bsum128(float v, float* red, int t) {
+    v = wsum(v);
+    __syncthreads();
+    if ((t & 31) == 0) red[t >> 5] = v;
+    __syncthreads();
+    return red[0] + red[1] + red[2] + red[3];
 }
 
 // the orthonormal 128-point Walsh-Hadamard transform of s (shared, 128 values) by 128 threads, in place
@@ -89,25 +168,49 @@ __device__ __forceinline__ void fwht128(float* s, int t) {
 }
 
 // one row of 128 values into the cache (kD threads, value t from each): FP16, INT8 with a scale per 32 (a warp), or
-// (q4) 4-bit codes, two a byte (the even thread writes the pair), with a scale per 32
-__device__ __forceinline__ void store_row(const GqaKv& kv, uint8_t* base, size_t r, int t, float val, bool q4 = false) {
-    if (q4) {
+// 4-bit codes, two a byte (the even thread writes the pair), with a scale per 32
+__device__ __forceinline__ void store_row(const Rows& R, long long pos, int h, int t, float val) {
+    uint8_t* rp = (uint8_t*) R.row(pos, h);
+    if (R.kind >= kT3) {   // TurboQuant (a rotated row): the nearest level of val * sqrt(128) / |row|, the LS scale
+        __shared__ float red[4];
+        const float* cb = tq_cb(R.kind);
+        const int nl = tq_levels(R.kind);
+        const float ss = bsum128(val * val, red, t);
+        const float y = ss > 0.0f ? val * sqrtf((float) kD / ss) : 0.0f;
+        unsigned code = 0;
+        for (int i = 0; i + 1 < nl; ++i) code += y > 0.5f * (cb[i] + cb[i + 1]);
+        const float c = cb[code];
+        const float num = bsum128(val * c, red, t), den = bsum128(c * c, red, t);
+        if (R.kind == kT4) {
+            const unsigned cn = __shfl_xor_sync(0xffffffffu, code, 1);
+            if ((t & 1) == 0) rp[t / 2] = (uint8_t) (code | (cn << 4));
+        } else {   // 3-bit: eight a group of 3 bytes; 6-bit: four
+            const int per = R.kind == kT3 ? 8 : 4, bits = R.kind == kT3 ? 3 : 6;
+            unsigned u = code << (bits * (t & (per - 1)));
+            for (int o = 1; o < per; o <<= 1) u |= __shfl_xor_sync(0xffffffffu, u, o);
+            if ((t & (per - 1)) == 0) {
+                uint8_t* g = rp + 3 * (t / per);
+                g[0] = (uint8_t) u;
+                g[1] = (uint8_t) (u >> 8);
+                g[2] = (uint8_t) (u >> 16);
+            }
+        }
+        if (t == 0) *(float*) (rp + tq_code_bytes(R.kind)) = den > 0.0f ? num / den : 0.0f;
+    } else if (R.kind == kL4) {
         const float amax = wmax(fabsf(val));
         const float sc = amax / 7.0f;
         const int q = sc > 0.0f ? max(-7, min(7, __float2int_rn(val / sc))) : 0;
         const int qn = __shfl_xor_sync(0xffffffffu, q, 1);
-        if ((t & 1) == 0) base[r * (kD / 2) + t / 2] = (uint8_t) ((q + 8) | ((qn + 8) << 4));
-        if ((t & 31) == 0)
-            ((__half*) (base + (size_t) kv.max_ctx * kv.n_kv * (kD / 2)))[r * (kD / 32) + t / 32] = __float2half(sc);
-    } else if (kv.q8) {
+        if ((t & 1) == 0) rp[t / 2] = (uint8_t) ((q + 8) | ((qn + 8) << 4));
+        if ((t & 31) == 0) ((__half*) (rp + kD / 2))[t / 32] = __float2half(sc);
+    } else if (R.kind == kI8) {
         const float amax = wmax(fabsf(val));
         const float sc = amax / 127.0f;
         const int q = sc > 0.0f ? __float2int_rn(val / sc) : 0;
-        base[r * kD + t] = (uint8_t) (int8_t) max(-127, min(127, q));
-        if ((t & 31) == 0)
-            ((__half*) (base + (size_t) kv.max_ctx * kv.n_kv * kD))[r * (kD / 32) + t / 32] = __float2half(sc);
+        rp[t] = (uint8_t) (int8_t) max(-127, min(127, q));
+        if ((t & 31) == 0) ((__half*) (rp + kD))[t / 32] = __float2half(sc);
     } else {
-        ((__half*) base)[r * kD + t] = __float2half(val);
+        ((__half*) rp)[t] = __float2half(val);
     }
 }
 
@@ -124,12 +227,12 @@ __global__ void __launch_bounds__(kD) gqa_prep_kernel(float* __restrict__ q, con
     if (b >= n_head + n_kv) {                                  // a v head
         const int h = b - n_head - n_kv;
         float val = v[(size_t) row * kld + (size_t) h * kD + t];
-        if (kv.v4) {   // K8V4: the row rotated by H before its 4-bit codes
-            sy[t] = val;
+        if (const int vr = v_rot(kv)) {   // K8V4: the row rotated by H before its 4-bit codes; TurboQuant: by H D
+            sy[t] = vr == 2 ? val * rsign(t) : val;
             fwht128(sy, t);
             val = sy[t];
         }
-        store_row(kv, (uint8_t*) kv.v, (size_t) pos * n_kv + h, t, val, kv.v4 != 0);
+        store_row(v_rows(kv), pos, h, t, val);
         return;
     }
     const bool is_q = b < n_head;
@@ -149,9 +252,15 @@ __global__ void __launch_bounds__(kD) gqa_prep_kernel(float* __restrict__ q, con
     const float theta = (float) pos * powf(theta_scale, (float) i);
     const float c = cosf(theta), s = sinf(theta);
     const float x0 = sy[i], x1 = sy[i + kD / 2];
-    const float o = t < kD / 2 ? x0 * c - x1 * s : x0 * s + x1 * c;
+    float o = t < kD / 2 ? x0 * c - x1 * s : x0 * s + x1 * c;
+    if (k_rot(kv)) {   // TurboQuant K: k and q both rotated by H D (q.k unchanged)
+        __syncthreads();   // (every thread has read its rope pair)
+        sy[t] = o * rsign(t);
+        fwht128(sy, t);
+        o = sy[t];
+    }
     if (is_q) q[(size_t) row * qld + (size_t) h * kD + t] = o;
-    else store_row(kv, (uint8_t*) kv.k, (size_t) pos * n_kv + h, t, o);
+    else store_row(k_rows(kv), pos, h, t, o);
 }
 
 // ---- decode: split-K over [0, n_pos) for the G query heads of one K/V head; per (head, split) the running max m,
@@ -164,12 +273,14 @@ __global__ void __launch_bounds__(256) gqa_attn_kernel(const float* __restrict__
     const int n_kv = kv.n_kv, kvh = blockIdx.x, split = blockIdx.y, G = n_head / n_kv;
     const int t = threadIdx.x, lane = t & 31, w = t >> 5;
     const int p0 = split * kChunk, np = min(kChunk, n_pos - p0);
-    const Rows K = k_rows(kv), V = v_rows(kv);
+    __shared__ float scb[2][64];
+    load_cbs(scb, kv.kk, kv.vk, t, blockDim.x);
+    const Rows K = k_rows(kv, scb[0]), V = v_rows(kv, scb[1]);
     for (int i = t; i < G * kD; i += blockDim.x) sq[i] = q[(size_t) (kvh * G) * kD + i] * scale;
     __syncthreads();
     for (int j = w; j < np; j += 8) {
         float k0, k1, k2, k3;
-        K.load4((size_t) (p0 + j) * n_kv + kvh, 4 * lane, k0, k1, k2, k3);
+        K.load4(p0 + j, kvh, 4 * lane, k0, k1, k2, k3);
         for (int g = 0; g < G; ++g) {
             const float* qg = sq + g * kD + 4 * lane;
             float d = qg[0] * k0 + qg[1] * k1 + qg[2] * k2 + qg[3] * k3;
@@ -200,7 +311,7 @@ __global__ void __launch_bounds__(256) gqa_attn_kernel(const float* __restrict__
         float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
         for (int j = 0; j < np; ++j) {
             float v0, v1, v2, v3;
-            V.load4((size_t) (p0 + j) * n_kv + kvh, d4, v0, v1, v2, v3);
+            V.load4(p0 + j, kvh, d4, v0, v1, v2, v3);
             const float pj = sp[g * kChunk + j];
             a0 += pj * v0;
             a1 += pj * v1;
@@ -221,7 +332,7 @@ __global__ void __launch_bounds__(256) gqa_attn_kernel(const float* __restrict__
 }
 
 __global__ void __launch_bounds__(kD) gqa_combine_kernel(const float* __restrict__ part, int n_split,
-                                                         float* __restrict__ out, int v4) {
+                                                         float* __restrict__ out, int vrot) {
     __shared__ float so[kD];
     const int h = blockIdx.x, t = threadIdx.x;
     const float* ph = part + (size_t) h * n_split * (kD + 2);
@@ -234,23 +345,23 @@ __global__ void __launch_bounds__(kD) gqa_combine_kernel(const float* __restrict
         acc += f * ps[t];
         den += f * ps[kD + 1];
     }
-    if (v4) {   // K8V4: the output was made of rotated V rows - rotate it back
+    if (vrot) {   // the output was made of rotated V rows - rotate it back (H, or D H)
         so[t] = acc / den;
         fwht128(so, t);
-        out[(size_t) h * kD + t] = so[t];
+        out[(size_t) h * kD + t] = vrot == 2 ? so[t] * rsign(t) : so[t];
         return;
     }
     out[(size_t) h * kD + t] = acc / den;
 }
 
 // K8V4, the prompt path: each FP16 output row (T rows of n_head heads, old halves apart) rotated back by H
-__global__ void __launch_bounds__(kD) gqa_unrotate_rows_kernel(__half* __restrict__ out, int n_head, int old) {
+__global__ void __launch_bounds__(kD) gqa_unrotate_rows_kernel(__half* __restrict__ out, int n_head, int old, int vrot) {
     __shared__ float so[kD];
     const int row = blockIdx.x, h = blockIdx.y, t = threadIdx.x;
     __half* o = out + (size_t) row * old + (size_t) h * kD;
     so[t] = __half2float(o[t]);
     fwht128(so, t);
-    o[t] = __float2half(so[t]);
+    o[t] = __float2half(vrot == 2 ? so[t] * rsign(t) : so[t]);
 }
 
 // ---- a prompt chunk: causal attention of rows [0, T) (positions p0 + row) over the cache [0, p0 + row].  Block (32
@@ -268,7 +379,9 @@ __global__ void __launch_bounds__(256) gqa_attn_rows_kernel(const float* __restr
     __shared__ float sP[kQT][kKT + 1];
     const int h = blockIdx.y, r0 = blockIdx.x * kQT, t = threadIdx.x, lane = t & 31, w = t >> 5;
     const int n_kv = kv.n_kv, kvh = h / (n_head / n_kv);
-    const Rows K = k_rows(kv), V = v_rows(kv);
+    __shared__ float scb[2][64];
+    load_cbs(scb, kv.kk, kv.vk, t, 256);
+    const Rows K = k_rows(kv, scb[0]), V = v_rows(kv, scb[1]);
     for (int i = t; i < kQT * kD; i += 256) {
         const int r = i / kD, d = i % kD;
         sQ[r][d] = r0 + r < T ? q[(size_t) (r0 + r) * qld + (size_t) h * kD + d] * scale : 0.0f;
@@ -289,8 +402,8 @@ __global__ void __launch_bounds__(256) gqa_attn_rows_kernel(const float* __restr
             const int r = i / (kD / 4), d = (i % (kD / 4)) * 4;
             float a = 0.f, b = 0.f, c = 0.f, e = 0.f, va = 0.f, vb = 0.f, vc = 0.f, ve = 0.f;
             if (k0 + r <= last) {
-                K.load4((size_t) (k0 + r) * n_kv + kvh, d, a, b, c, e);
-                V.load4((size_t) (k0 + r) * n_kv + kvh, d, va, vb, vc, ve);
+                K.load4(k0 + r, kvh, d, a, b, c, e);
+                V.load4(k0 + r, kvh, d, va, vb, vc, ve);
             }
             sK[r][d / 2] = __floats2half2_rn(a, b);
             sK[r][d / 2 + 1] = __floats2half2_rn(c, e);
@@ -371,7 +484,9 @@ __global__ void __launch_bounds__(kTW * 32) gqa_attn_rows_tc_kernel(const float*
     __half* sP = (__half*) (sS + kTW * 16 * kLdS);             // [kTW][16][kLdP]
     const int h = blockIdx.y, r0 = blockIdx.x * kTQ, t = threadIdx.x, lane = t & 31, w = t >> 5;
     const int n_kv = kv.n_kv, kvh = h / (n_head / n_kv);
-    const Rows K = k_rows(kv), V = v_rows(kv);
+    __shared__ float scb[2][64];
+    load_cbs(scb, kv.kk, kv.vk, t, kTW * 32);
+    const Rows K = k_rows(kv, scb[0]), V = v_rows(kv, scb[1]);
     // Q (scaled) -> FP16 staging -> each warp's 8 fragments
     __half* sQ = (__half*) smem;
     for (int i = t; i < kTQ * kD; i += kTW * 32) {
@@ -394,12 +509,12 @@ __global__ void __launch_bounds__(kTW * 32) gqa_attn_rows_tc_kernel(const float*
         for (int i = t; i < kTK * (kD / 4); i += kTW * 32) {
             const int r = i / (kD / 4), d = (i % (kD / 4)) * 4;
             float a = 0.f, b = 0.f, c = 0.f, e = 0.f;
-            if (k0 + r <= last) K.load4((size_t) (k0 + r) * n_kv + kvh, d, a, b, c, e);
+            if (k0 + r <= last) K.load4(k0 + r, kvh, d, a, b, c, e);
             __half2* kr = (__half2*) (sK + r * kLdQ + d);
             kr[0] = __floats2half2_rn(a, b);
             kr[1] = __floats2half2_rn(c, e);
             if (with_v) {
-                if (k0 + r <= last) V.load4((size_t) (k0 + r) * n_kv + kvh, d, a, b, c, e);
+                if (k0 + r <= last) V.load4(k0 + r, kvh, d, a, b, c, e);
                 __half2* vr = (__half2*) (sV + r * kLdQ + d);
                 vr[0] = __floats2half2_rn(a, b);
                 vr[1] = __floats2half2_rn(c, e);
@@ -518,7 +633,9 @@ __global__ void __launch_bounds__(kDW * 32) gqa_attn_tc_kernel(const float* __re
     __shared__ float sm[kDW][16], sl[kDW][16];
     const int n_kv = kv.n_kv, kvh = blockIdx.x, split = blockIdx.y, G = n_head / n_kv;
     const int t = threadIdx.x, lane = t & 31, w = t >> 5;
-    const Rows K = k_rows(kv), V = v_rows(kv);
+    __shared__ float scb[2][64];
+    load_cbs(scb, kv.kk, kv.vk, t, kDW * 32);
+    const Rows K = k_rows(kv, scb[0]), V = v_rows(kv, scb[1]);
     for (int i = t; i < 16 * kD; i += kDW * 32) {
         const int r = i / kD, d = i % kD;
         sQ[r * kLdQ + d] = __float2half(r < G ? q[(size_t) (kvh * G + r) * kD + d] * scale : 0.0f);
@@ -546,8 +663,8 @@ __global__ void __launch_bounds__(kDW * 32) gqa_attn_tc_kernel(const float* __re
             const int r = i / (kD / 4), d = (i % (kD / 4)) * 4;
             float a = 0.f, b = 0.f, c = 0.f, e = 0.f, va = 0.f, vb = 0.f, vc = 0.f, ve = 0.f;
             if (k0 + r < k_hi) {
-                K.load4((size_t) (k0 + r) * n_kv + kvh, d, a, b, c, e);
-                V.load4((size_t) (k0 + r) * n_kv + kvh, d, va, vb, vc, ve);
+                K.load4(k0 + r, kvh, d, a, b, c, e);
+                V.load4(k0 + r, kvh, d, va, vb, vc, ve);
             }
             __half2* kr = (__half2*) (Kw + r * kLdQ + d);
             __half2* vr = (__half2*) (Vw + r * kLdQ + d);
@@ -655,23 +772,40 @@ void check(const char* what) {
 
 }  // namespace
 
-// a cache row's bytes: FP16 256; INT8 128 codes + 4 scales; 4-bit 64 codes + 4 scales
-static size_t row_bytes_of(int kind) {   // 0 FP16, 1 INT8, 2 4-bit
-    return kind == 0 ? (size_t) kD * sizeof(__half) : (kind == 1 ? (size_t) kD : (size_t) kD / 2) + (kD / 32) * sizeof(__half);
+namespace {
+// a mode's K and V kinds
+void mode_kinds(int mode, int& kk, int& vk) {
+    static const int K[] = {kF16, kI8, kI8, kT4, kT6, kT4}, V[] = {kF16, kI8, kL4, kT4, kT4, kT3};
+    if (mode < 0 || mode > kGqaTq4V3) mode = kGqaFp16;
+    kk = K[mode];
+    vk = V[mode];
 }
-size_t gqa_kv_k_bytes(int n_kv, int64_t max_ctx, int mode) {
-    return (size_t) max_ctx * n_kv * row_bytes_of(mode == 0 ? 0 : 1);
-}
-size_t gqa_kv_layer_bytes(int n_kv, int64_t max_ctx, int mode) {
-    return gqa_kv_k_bytes(n_kv, max_ctx, mode) + (size_t) max_ctx * n_kv * row_bytes_of(mode == 0 ? 0 : mode == 1 ? 1 : 2);
+const char* const kModeNames[] = {"fp16", "int8", "k8v4", "tq4", "tq6v4", "tq4v3"};
+}  // namespace
+
+const char* gqa_kv_mode_name(int mode) { return mode >= 0 && mode <= kGqaTq4V3 ? kModeNames[mode] : "?"; }
+
+int gqa_kv_mode_parse(const char* s) {
+    if (s == nullptr) return -1;
+    for (int m = 0; m <= kGqaTq4V3; ++m)
+        if (std::strcmp(s, kModeNames[m]) == 0) return m;
+    return -1;
 }
 
-GqaKv gqa_kv_view(void* layer_base, int n_kv, int64_t max_ctx, int mode) {
+size_t gqa_kv_rec_bytes(int n_kv, int mode) {
+    int kk = 0, vk = 0;
+    mode_kinds(mode, kk, vk);
+    return (size_t) n_kv * (row_bytes(kk) + row_bytes(vk));
+}
+
+GqaKv gqa_kv_view(void* a, void* b, int64_t p0, int64_t rec, int64_t layer_off, int n_kv, int64_t max_ctx, int mode) {
     GqaKv kv;
-    kv.k = layer_base;
-    kv.v = (uint8_t*) layer_base + gqa_kv_k_bytes(n_kv, max_ctx, mode);
-    kv.q8 = mode != 0 ? 1 : 0;
-    kv.v4 = mode == 2 ? 1 : 0;
+    kv.a = a;
+    kv.b = b;
+    kv.p0 = p0;
+    kv.rec = rec;
+    kv.k_off = (int) layer_off;
+    mode_kinds(mode, kv.kk, kv.vk);
     kv.n_kv = n_kv;
     kv.max_ctx = (int) max_ctx;
     return kv;
@@ -713,7 +847,7 @@ bool gqa_attn(const float* q, const GqaKv& kv, int n_pos, int n_head, float* scr
 #endif
     gqa_attn_kernel<<<dim3(kv.n_kv, n_split), 256, 0, s>>>(q, kv, n_pos, n_head, 1.0f / sqrtf((float) kD), part);
     check("gqa_attn");
-    gqa_combine_kernel<<<n_head, kD, 0, s>>>(part, n_split, out, kv.v4);
+    gqa_combine_kernel<<<n_head, kD, 0, s>>>(part, n_split, out, v_rot(kv));
     check("gqa_combine");
     quantize_q8_1(out, out_q8_1, n_head * kD, s);
     return true;
@@ -737,8 +871,8 @@ bool gqa_attn_rows(const float* q, int qld, const GqaKv& kv, int p0, int T, int 
         gqa_attn_rows_tc_kernel<<<dim3((T + kTQ - 1) / kTQ, n_head), kTW * 32, kTcSmem, s>>>(
             q, qld, kv, p0, T, n_head, 1.0f / sqrtf((float) kD), (__half*) out16, old);
         check("gqa_attn_rows_tc");
-        if (kv.v4) {
-            gqa_unrotate_rows_kernel<<<dim3(T, n_head), kD, 0, s>>>((__half*) out16, n_head, old);
+        if (v_rot(kv)) {
+            gqa_unrotate_rows_kernel<<<dim3(T, n_head), kD, 0, s>>>((__half*) out16, n_head, old, v_rot(kv));
             check("gqa_unrotate_rows");
         }
         return true;
@@ -747,8 +881,8 @@ bool gqa_attn_rows(const float* q, int qld, const GqaKv& kv, int p0, int T, int 
     gqa_attn_rows_kernel<<<dim3((T + kQT - 1) / kQT, n_head), 256, 0, s>>>(q, qld, kv, p0, T, n_head,
                                                                           1.0f / sqrtf((float) kD), (__half*) out16, old);
     check("gqa_attn_rows");
-    if (kv.v4) {
-        gqa_unrotate_rows_kernel<<<dim3(T, n_head), kD, 0, s>>>((__half*) out16, n_head, old);
+    if (v_rot(kv)) {
+        gqa_unrotate_rows_kernel<<<dim3(T, n_head), kD, 0, s>>>((__half*) out16, n_head, old, v_rot(kv));
         check("gqa_unrotate_rows");
     }
     return true;
