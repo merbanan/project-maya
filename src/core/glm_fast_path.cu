@@ -562,7 +562,13 @@ bool Glm5Model::fast_setup(std::string& err) {
                 cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev_);
                 F->fetch_blocks = std::max(4, sms / 4);
             }
-            if (cudaStreamCreateWithFlags(&F->fs, cudaStreamNonBlocking) != cudaSuccess ||
+            // the side stream at the highest priority: its few fetch blocks are dispatched ahead of the expert
+            // kernels' many (at equal priority they queued behind them and the copy started late)
+            int prio_lo = 0, prio_hi = 0;
+            cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);
+            static const bool fs_prio = getenv("STRATA_GLM_FETCH_PRIO") == nullptr ||
+                                        std::atoi(getenv("STRATA_GLM_FETCH_PRIO")) != 0;
+            if (cudaStreamCreateWithPriority(&F->fs, cudaStreamNonBlocking, fs_prio ? prio_hi : prio_lo) != cudaSuccess ||
                 cudaEventCreateWithFlags(&F->ev_fsplit, cudaEventDisableTiming) != cudaSuccess ||
                 cudaEventCreateWithFlags(&F->ev_fetch, cudaEventDisableTiming) != cudaSuccess ||
                 cudaMalloc(&F->plan_split, 16 * sizeof(unsigned long long)) != cudaSuccess ||
