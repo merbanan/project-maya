@@ -504,7 +504,84 @@ static bool pack_dequant_tensor(const strata::TensorInfo& t, const uint8_t* src,
 
 // ================================ geometry ================================
 
+// hy_v3 (Tencent Hy3, llama.cpp's LLM_ARCH_HY_V3): grouped-query attention with q/k norms and NeoX rope on every
+// layer, plain pre-norm residuals, the leading dense block(s) found by their missing router, and GLM's MoE (sigmoid
+// router + selection bias, normalised weights times expert_weights_scale, one ungated shared expert, no swiglu clamp)
+static bool hy3_geometry(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
+    const std::string p = "hy_v3.";
+    const auto num = [&](const std::string& key, double def) -> double {
+        const auto* v = g.get(p + key);
+        if (!v) return def;
+        if (v->type == strata::MetaType::ARRAY) return v->items.empty() || !v->items[0].is_num() ? def : v->items[0].num();
+        return v->is_num() ? v->num() : def;
+    };
+    out.arch = 1;
+    out.n_embd = (int) num("embedding_length", 4096);
+    const int block_count = (int) num("block_count", 81);
+    out.nextn = (int) num("nextn_predict_layers", 0);
+    out.n_layers = block_count - out.nextn;
+    out.n_head = (int) num("attention.head_count", 64);
+    out.n_kv = (int) num("attention.head_count_kv", 8);
+    out.head_dim = (int) num("attention.key_length", 128);
+    const int v_len = (int) num("attention.value_length", out.head_dim);
+    const int n_rot = (int) num("rope.dimension_count", out.head_dim);
+    out.rope_base = (float) num("rope.freq_base", 10000.0);
+    out.norm_eps = (float) num("attention.layer_norm_rms_epsilon", 1e-5);
+    out.n_expert = (int) num("expert_count", 192);
+    out.n_exp_used = (int) num("expert_used_count", 8);
+    out.n_ff_exp = (int) num("expert_feed_forward_length", 1536);
+    out.n_ff_dense = (int) num("feed_forward_length", 13312);
+    const int n_ff_sh = (int) num("expert_shared_feed_forward_length", out.n_ff_exp);
+    out.n_shared = (int) num("expert_shared_count", 1);
+    out.w_scale = (float) num("expert_weights_scale", 1.0);
+    out.norm_w = (int) num("expert_weights_norm", 1);
+    const int gating = (int) num("expert_gating_func", 2);   // llama.cpp: 1 softmax, 2 sigmoid
+    out.swiglu_exp = out.swiglu_shexp = INFINITY;            // no clamp
+    out.hc = 1;
+    // (llama.cpp's hy_v3 GGUFs carry no vocab_size; the reader keeps only the head of long arrays, so the token
+    // list's length is its count, and the output head's rows are the authority)
+    if (const auto* v = g.get(p + "vocab_size")) out.n_vocab = (int) v->u;
+    else if (const auto* t = g.get("tokenizer.ggml.tokens")) out.n_vocab = (int) t->count;
+    if (const auto* ow = g.find("output.weight"); ow != nullptr && ow->shape.size() >= 2) out.n_vocab = (int) ow->shape[1];
+    // the leading dense blocks: the layers before the first router
+    out.dense_lead = 0;
+    while (out.dense_lead < out.n_layers &&
+           g.find("blk." + std::to_string(out.dense_lead) + ".ffn_gate_inp.weight") == nullptr)
+        ++out.dense_lead;
+    out.n_head_kv.assign((size_t) out.n_layers, out.n_kv);
+    out.indexer_full.assign((size_t) out.n_layers, 1);
+    out.eog.clear();
+    for (const char* k : {"tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"})
+        if (const auto* v = g.get(k))
+            if (std::find(out.eog.begin(), out.eog.end(), (int32_t) v->u) == out.eog.end()) out.eog.push_back((int32_t) v->u);
+    if (gating != 2) {
+        err = "hy_v3: expert_gating_func " + std::to_string(gating) + " (only the sigmoid router is implemented)";
+        return false;
+    }
+    if (v_len != out.head_dim || n_rot != out.head_dim || out.head_dim != 128) {
+        err = "hy_v3: head_dim 128 with full-width rope and value_length == key_length is required (key " +
+              std::to_string(out.head_dim) + ", value " + std::to_string(v_len) + ", rope " + std::to_string(n_rot) + ")";
+        return false;
+    }
+    if (out.n_head % out.n_kv != 0 || out.n_head / out.n_kv > 16) {
+        err = "hy_v3: " + std::to_string(out.n_head) + " query heads over " + std::to_string(out.n_kv) +
+              " K/V heads is not supported (a whole number up to 16 per K/V head)";
+        return false;
+    }
+    if (n_ff_sh != out.n_ff_exp || out.n_shared != 1) {
+        err = "hy_v3: the shared expert must be one expert of the routed width";
+        return false;
+    }
+    if (out.n_embd > 4096 || out.n_embd % 256 != 0) {
+        err = "hy_v3: n_embd " + std::to_string(out.n_embd) + " (the fast path's kernels take at most 4096)";
+        return false;
+    }
+    return true;
+}
+
 bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
+    if (const auto* a = g.get("general.architecture"))
+        if (a->s == "hy_v3") return hy3_geometry(g, out, err);
     // two spellings in the wild: llama.cpp's canonical "glm5-next" and unsloth's "glm5next" -
     // the KV PREFIX follows the file's own arch string, so it is detected once here
     const std::string p = g.get("glm5next.block_count") ? "glm5next." : "glm5-next.";
@@ -713,6 +790,10 @@ Glm5Model::~Glm5Model() {
 bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string& err) {
     strata::GgufFile gguf(gguf_path);
     if (!Glm5Geometry::from_gguf(gguf, g_, err)) return false;
+    if (g_.gqa()) {
+        err = "glm5_model: hy_v3 runs from a pack on the fast path only (tools/iq_pack.py, --glm-pack)";
+        return false;
+    }
     max_ctx_ = max_ctx;
     dev_ = 0;
     l0_ = 0;
@@ -2846,6 +2927,12 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         err = "pack: bad layer range [" + std::to_string(l0_) + ", " + std::to_string(l1_) + ")";
         return false;
     }
+    if (g_.gqa() && (l0_ != 0 || l1_ != g_.n_layers || getenv("STRATA_GLM_SLOW") != nullptr ||
+                     getenv("STRATA_GLM_SEQS") != nullptr)) {
+        err = "pack: hy_v3 runs on the fast path, on one GPU and one sequence (no layer split, STRATA_GLM_SLOW or "
+              "STRATA_GLM_SEQS yet)";
+        return false;
+    }
     // the layer split: this instance carries only ITS layers' rows (token_embd lives on the first
     // half, the head's tensors on the last); every per-layer array stays indexed by the ABSOLUTE
     // layer id, so all offsets and kernels are unchanged
@@ -3361,7 +3448,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // (the pipelined speculative decode is a two-part one: a longer split leaves the block unloaded; one GPU loads it
     // for the one-GPU MTP decode - glm_mtp.cu: by default on the Strix / Gorgon Halo APUs)
     const bool mtp_one = l0_ == 0 && mtp_decode_wanted(dev_, n_parts_);
-    if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) && getenv("STRATA_GLM_NO_MTP") == nullptr &&
+    if (fast_mode_ && !g_.gqa() && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) && getenv("STRATA_GLM_NO_MTP") == nullptr &&
         (l0_ > 0 || getenv("STRATA_GLM_MTP") != nullptr || mtp_one)) {   // any split: the speculative decode, 2+ parts
         if (!load_mtp(gfs, err)) return false;
         if (mtp_il_ >= 0) lt_ = l1_ + 1;
@@ -3385,7 +3472,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     int64_t floats = 2 * hc_dim;
     // the fast path keeps the DSA latent cache in FP16 (half the bytes: at 128k context ~0.8 GB more for experts on
     // each card, and the prompt attention reads half as much); the reference path (STRATA_GLM_SLOW) keeps F32
-    lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0 && getenv("STRATA_GLM_KV_INT8") != nullptr &&
+    lat_q8_ = fast_mode_ && !g_.gqa() && g_.kv_lora % 32 == 0 && getenv("STRATA_GLM_KV_INT8") != nullptr &&
               std::atoi(getenv("STRATA_GLM_KV_INT8")) != 0;
     // KV streaming (--kv-resident N): the latent cache lives in pinned RAM and the state holds N positions of VRAM slots
     // a layer (kv_stream_setup, below)
@@ -3417,9 +3504,14 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         dsa_pool_[(size_t) mtp_il_] = floats;
         floats += (int64_t) g_.idx_key * max_pools;
     }
+    gqa_kv_.assign((size_t) g_.n_layers + 1, -1);
     for (int il = 0; il < g_.n_layers; ++il) {
         if (il < l0_ || il >= l1_) continue;   // the other half's caches stay on the other device
-        if (g_.is_recr(il)) {
+        if (g_.gqa()) {
+            // hy_v3: the layer's K then V cache, FP16 [max_ctx][n_kv][head_dim] each (2 halves = 1 float)
+            gqa_kv_[(size_t) il] = floats;
+            floats += (int64_t) g_.n_kv * g_.head_dim * max_ctx;
+        } else if (g_.is_recr(il)) {
             kda_S_[(size_t) il] = floats;
             floats += (int64_t) g_.d_inner() * g_.kda_head_dim;
             kda_conv_[(size_t) il] = floats;

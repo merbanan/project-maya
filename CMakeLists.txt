@@ -292,6 +292,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/cuda/glm_fast.cu
+                          src/kernels/cuda/glm_gqa.cu
                           src/kernels/cuda/glm_batch.cu
                           src/kernels/cuda/exl3.cu
                           src/kernels/cuda/exl3_legacy.cu

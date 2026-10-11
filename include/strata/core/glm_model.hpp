@@ -83,11 +83,20 @@ struct Glm5Geometry {
     float w_scale = 1.0f;
     int norm_w = 1;
     float swiglu_exp = 10.0f, swiglu_shexp = 10.0f;
+    // hy_v3 (Tencent Hy3): every layer is grouped-query attention (n_head query heads over n_kv K/V heads of
+    // head_dim, per-head RMS norms on q and k, NeoX rope over the whole head) with plain pre-norm residuals - no
+    // hyper-connections (hc = 1), no KDA, no DSA; the MoE side is GLM's (sigmoid router + bias, shared expert)
+    int arch = 0;                      // 0 glm5-next, 1 hy_v3
+    int n_kv = 8, head_dim = 128;
+    float rope_base = 10000.0f;
+    std::vector<int32_t> eog;          // the end-of-generation ids from the GGUF (empty: the driver's GLM set)
 
     int d_inner() const { return kda_head_dim * n_head; }
     int top_pools_max() const { return idx_top_k / idx_kpool; }
     int n_sel_max() const { return idx_top_k + (idx_select_tail ? idx_kpool - 1 : 0); }
-    bool is_recr(int il) const { return n_head_kv[(size_t) il] == 0; }
+    bool gqa() const { return arch == 1; }
+    bool is_recr(int il) const { return !gqa() && n_head_kv[(size_t) il] == 0; }
+    bool is_dsa(int il) const { return !gqa() && n_head_kv[(size_t) il] != 0; }
 
     static bool from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
 };
@@ -323,6 +332,7 @@ private:
 
     // per-layer state offsets, in floats into state_ (-1: the layer has no such state)
     std::vector<int64_t> kda_S_, kda_conv_, dsa_lat_, dsa_ik_, dsa_ig_, dsa_pool_;
+    std::vector<int64_t> gqa_kv_;                 // hy_v3: per layer the K then V cache (FP16), -1 none
 
 public:
     // ---- per-weight serving slots (strata::core::WSlot below): F32 pointers for the
@@ -591,6 +601,8 @@ public:
     // STRATA_GLM_GROUP_EXPERTS: the routed experts of a batched step's n rows, each distinct one once for its rows
     // (glm_rows.cu); false with err empty: not here (the rows go one by one)
     bool rows_moe_grouped(int il, int n, std::string& err);
+    bool fast_gqa(int il, int64_t p, std::string& err);     // hy_v3: one attention mixer (xq -> mixer)
+    bool fast_layers_gqa(int64_t p, std::string& err);      // hy_v3: this part's layers
     void fast_service();
     // gate / up / down of one expert from the shards (or its chunk-th of n_chunks pieces)
     void fast_read_part(int il, int e, int role, uint8_t* blob, int chunk = 0, int n_chunks = 1);
