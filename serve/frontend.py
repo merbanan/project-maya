@@ -50,7 +50,7 @@ class ChatTemplate:
         # is "Max", its most verbose - and it always opens <think> (no enable_thinking).  The server's levels are
         # GLM's own (low / high / max, or thinking off: the think block closed the way the template writes a turn
         # without reasoning).  Another model's template gets them in its own words (Qwen: low / medium / xhigh).
-        self.glm_effort = "reasoning_effort in ['low', 'high']" in self.source
+        self.glm_effort = "reasoning_effort in ['low', 'high']" in self.source and "hy_Assistant" not in self.source
         # DeepSeek-V4.1 (tools/ds4/chat_template.jinja): the levels by their own names (its budgets 50 / 75 / 100), tool
         # calls in DSML (OutputParser(dsml=True) reads them)
         self.deepseek = "｜DSML｜" in self.source
@@ -61,6 +61,11 @@ class ChatTemplate:
         # is told.  Thinking off (a client's, or a forced tool call's) closes the block the way its Qwen base's template
         # writes thinking off - <think>\n\n</think>\n\n - so the prompt and the server's parser agree
         self.forced_thinking = bool(re.search(r"set\s+enable_thinking\s*=\s*true", self.source))
+        # Tencent Hy3: reasoning_effort no_think / low / high (no_think is its default: the template writes an empty
+        # think block), and its own tags (`<think:opensource>`, `<tool_call:opensource>`, ...) - the parser reads
+        # them through HY3_TAGS
+        self.hy3 = "hy_Assistant" in self.source
+        self.tags = HY3_TAGS if self.hy3 else None
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -113,7 +118,11 @@ class ChatTemplate:
             return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                         **kwargs)
         off = False
-        if self.glm_effort:
+        if self.hy3:
+            off = kwargs.pop("enable_thinking", True) is False
+            level = kwargs.pop("reasoning_effort", None)
+            kwargs["reasoning_effort"] = "no_think" if off or level is None else "low" if level == "low" else "high"
+        elif self.glm_effort:
             off = kwargs.pop("enable_thinking", True) is False
             level = kwargs.pop("reasoning_effort", None)
             kwargs["reasoning_effort"] = "low" if off else level if level in ("low", "high") else "max"
@@ -649,6 +658,49 @@ class Event:
 
 
 THINK_END = "</think>"
+# Tencent Hy3's tags -> the GLM form the parser reads (its calls are GLM's: NAME then <arg_key>/<arg_value> pairs, with
+# a <tool_sep> after the name and the calls wrapped in <tool_calls>)
+HY3_TAGS = {
+    "<think:opensource>": "<think>", "</think:opensource>": "</think>",
+    "<tool_calls:opensource>": "", "</tool_calls:opensource>": "",
+    "<tool_call:opensource>": "<tool_call>", "</tool_call:opensource>": "</tool_call>",
+    "<tool_sep:opensource>": "",
+    "<arg_key:opensource>": "<arg_key>", "</arg_key:opensource>": "</arg_key>",
+    "<arg_value:opensource>": "<arg_value>", "</arg_value:opensource>": "</arg_value>",
+}
+
+
+class TagTranslator:
+    """Rewrites a model's own tags to the parser's while text streams in; a tag split across deltas is held back."""
+
+    def __init__(self, tags: dict[str, str]):
+        self.tags, self.buf = tags, ""
+
+    def feed(self, delta: str) -> str:
+        self.buf += delta
+        out = []
+        while True:
+            i = self.buf.find("<")
+            if i < 0:
+                out.append(self.buf)
+                self.buf = ""
+                break
+            out.append(self.buf[:i])
+            self.buf = self.buf[i:]
+            hit = next((t for t in self.tags if self.buf.startswith(t)), None)
+            if hit is not None:
+                out.append(self.tags[hit])
+                self.buf = self.buf[len(hit):]
+                continue
+            if any(t.startswith(self.buf) for t in self.tags):   # maybe a tag still arriving
+                break
+            out.append("<")
+            self.buf = self.buf[1:]
+        return "".join(out)
+
+    def flush(self) -> str:
+        rest, self.buf = self.buf, ""
+        return rest
 CALL_START = "<tool_call>"
 CALL_END = "</tool_call>"
 FUNC_START = "<function="                       # Qwen's form: <function=NAME><parameter=P>V</parameter>...</function>
@@ -1058,7 +1110,9 @@ class OutputParser:
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
-                 dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False):
+                 dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False,
+                 tags: dict[str, str] | None = None):
+        self.tr = TagTranslator(tags) if tags else None   # a model's own tags (Hy3) -> the ones parsed below
         self.state = "reasoning" if thinking else "content"
         # DeepSeek-V4.1's tool calls, read as GLM's (DsmlRewriter); MiniMax-M3.1's the same way (MinimaxRewriter):
         # both send JSON values, so the parser takes them without the tools' schemas
@@ -1284,6 +1338,8 @@ class OutputParser:
     def feed(self, delta: str) -> list[Event]:
         if self.finished:
             return []
+        if self.tr is not None:
+            delta = self.tr.feed(delta)
         if self.dsml is not None:
             delta = self.dsml.feed(delta)
         return self._feed(delta)
@@ -1383,7 +1439,14 @@ class OutputParser:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content)."""
         if self.finished:
             return []
-        out = self._feed(self.dsml.finish()) if self.dsml is not None else []
+        out = []
+        if self.tr is not None:                 # a partial tag the translator held: plain text after all
+            rest = self.tr.flush()
+            if rest:
+                self.tr = None
+                out += self.feed(rest)
+        if self.dsml is not None:
+            out += self._feed(self.dsml.finish())
         if self.finished:
             return out
         if self.state == "call" and self.stream_tools and self.scall is not None:
