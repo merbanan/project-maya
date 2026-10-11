@@ -16,6 +16,7 @@
 // rounding (FP16 activations instead of q8_1), as between llama.cpp's batched and one-token paths.  The prompt's
 // routing also feeds the expert tiers' LFU counts, so the decode that follows starts from this conversation's
 // experts.  STRATA_GLM_NO_PREFILL=1 keeps the token-at-a-time prompt (A/B).
+#include "glm_kv_stream.hpp"
 #include "glm_fast_state.hpp"
 
 #include "strata/core/progress.hpp"
@@ -1599,11 +1600,23 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 hgemm_q(Ly.k, KD, E, x16, E, B.k, KD, tn, 0.0f);
                 hgemm_q(Ly.v, KD, E, x16, E, B.v, KD, tn, 0.0f);
                 S->mark("gqa_proj", s);
-                const gf::GqaKv kv = kv_view(il);
+                // (streamed: the layer's earlier records staged into VRAM once a chunk, this sub-batch's rows written
+                // there, then into host memory with their pages' summaries, and those pages' cached copies dropped)
+                const size_t slb = kvs_ != nullptr ? kvs_->slice : 0;
+                if (kvs_ != nullptr && t0 == 0 && p0 > 0)
+                    cudaMemcpyAsync(kvs_->stage, kvs_->lay[(size_t) il].host, (size_t) p0 * slb, cudaMemcpyDefault, s);
+                const gf::GqaKv kv = kvs_ != nullptr ? kv_stage_view(il) : kv_view(il);
                 gf::gqa_prep(B.q, B.k, B.v, tn, QD, KD, Ly.q_norm, Ly.k_norm, g.norm_eps, pt, g.rope_base, g.n_head, kv, s);
                 if (!gf::gqa_attn_rows(B.q, QD, kv, pt, tn, g.n_head, B.out16, QD, s)) {
                     err = "glm prefill: gqa attention";
                     return false;
+                }
+                if (kvs_ != nullptr) {
+                    const gf::GqaStream& st = kvs_->lay[(size_t) il];
+                    cudaMemcpyAsync(st.host + (size_t) pt * slb, kvs_->stage + (size_t) pt * slb, (size_t) tn * slb,
+                                    cudaMemcpyDefault, s);
+                    gf::gqa_stream_summarize(kv, st, pt, pt + tn, s);
+                    gf::gqa_stream_invalidate(st, pt / gf::kGqaPage, (pt + tn + gf::kGqaPage - 1) / gf::kGqaPage, s);
                 }
                 S->mark("gqa_attn", s);
                 if (!skip_output) hgemm_q(Ly.out, E, QD, B.out16, QD, mixer, E, tn, 0.0f);
@@ -2544,8 +2557,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 float* vv = c2.take<float>((size_t) Tv * KD);
                 hgemm_q(Ly.k, KD, E, S->x16, E, kk, KD, Tv, 0.0f);
                 hgemm_q(Ly.v, KD, E, S->x16, E, vv, KD, Tv, 0.0f);
-                const gf::GqaKv gkv = kv_view(mtp_il_);
+                const gf::GqaKv gkv = kv_view(mtp_il_);   // (streamed: the host records, and a cached page's copy)
                 gf::gqa_prep(nullptr, kk, vv, Tv, 0, KD, nullptr, Ly.k_norm, g.norm_eps, (int) p0, g.rope_base, 0, gkv, s);
+                if (kvs_ != nullptr)
+                    gf::gqa_stream_summarize(gkv, kvs_->lay[(size_t) mtp_il_], (int) p0, (int) p0 + Tv, s);
                 S->mark("mtp_cache", s);
             } else {   // GLM: the latent and the indexer's key / gate
             hgemm_q(Ly.kv_a, g.kv_lora, E, S->x16, E, kv, g.kv_lora, Tv, 0.0f);

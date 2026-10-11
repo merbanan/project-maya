@@ -280,7 +280,55 @@ struct GqaKv {
     long long p0 = 0, rec = 0;            // region a's positions; a record's bytes
     int k_off = 0;                        // this layer's K rows in a record (its V rows follow them)
     int kk = 0, vk = 0, n_kv = 8, max_ctx = 0;   // K's and V's row formats (glm_gqa.cu kF16 .. kT6)
+    // KV streaming (GqaStream): the rows of a cached page are in slots (page table ptab, -1: not cached); with sel set
+    // the decode attention reads only the pages sel names (*nsel of them, at most max_sel) - all cached by then
+    const int* ptab = nullptr;
+    const uint8_t* slots = nullptr;
+    const int* sel = nullptr;
+    const int* nsel = nullptr;
+    int max_sel = 0;
 };
+
+// ---- KV streaming: the whole cache in pinned host memory (a layer's records [max_ctx][slice], device-mapped), in VRAM
+// a cache of R pages of kGqaPage positions (slots, page table, CLOCK replacement - all on the device) and every page's
+// summary (the per-dimension min and max of its K rows, FP16).  A decode step scores every page against q (Quest: the
+// bound sum_d max(q_d min_d, q_d max_d) per query head, relative to the head's best page, the max over the heads),
+// keeps the best budget pages + the first page + the recent ones, loads the missing ones from host memory and attends
+// to those pages only.
+constexpr int kGqaPage = 64;
+struct GqaStream {
+    uint8_t* host = nullptr;    // [max_ctx][slice] (device pointer of pinned, mapped memory)
+    uint8_t* slots = nullptr;   // [R][kGqaPage][slice]
+    int* ptab = nullptr;        // [max_pages]: page -> slot, -1
+    int* spage = nullptr;       // [R]: slot -> page, -1
+    int* sepoch = nullptr;      // [R]: the last step that used the slot
+    int* sref = nullptr;        // [R]: CLOCK's reference bit
+    int* ctl = nullptr;         // [2]: the clock hand, the step counter
+    void* summ = nullptr;       // [max_pages][n_kv][2][128] FP16: min, max
+    int R = 0, max_pages = 0;
+};
+struct GqaSelBufs {             // one decode step's selection (shared by the layers, which run one after another)
+    int* sel = nullptr;         // [max_sel] page ids
+    int* nsel = nullptr;
+    int* miss = nullptr;        // [max_sel] the pages to load, and their slots
+    int* mslot = nullptr;
+    int* nmiss = nullptr;
+    float* ub = nullptr;        // [n_head][max_pages]
+    int max_sel = 0;
+};
+/// the summaries of the pages holding positions [pos_lo, pos_hi) from the K rows of src (a plain view: host memory or
+/// a staging copy; a page's rows from its start to pos_hi)
+void gqa_stream_summarize(const GqaKv& src, const GqaStream& st, int pos_lo, int pos_hi, cudaStream_t s);
+/// the pages a decode step at n_pos positions attends to: budget_pages by score + the first sink_pages + the last
+/// recent_pages (every page when they cover them all) -> b.sel / b.nsel
+void gqa_stream_select(const float* q, int n_head, int n_kv, const GqaStream& st, int n_pos, int budget_pages,
+                       int sink_pages, int recent_pages, const GqaSelBufs& b, cudaStream_t s);
+/// every selected page cached (missing ones over PCIe into CLOCK's victims, never a slot this step uses)
+void gqa_stream_resolve(const GqaStream& st, int slice, const GqaSelBufs& b, cudaStream_t s);
+/// pages [page_lo, page_hi) no longer cached (their rows were rewritten in host memory)
+void gqa_stream_invalidate(const GqaStream& st, int page_lo, int page_hi, cudaStream_t s);
+/// nothing cached
+void gqa_stream_reset(const GqaStream& st, cudaStream_t s);
 /// a mode's name (STRATA_GLM_KV: fp16 int8 k8v4 tq4 tq6v4 tq4v3), and the mode of a name (-1: none)
 const char* gqa_kv_mode_name(int mode);
 int gqa_kv_mode_parse(const char* s);

@@ -41,6 +41,7 @@ const char* gqa_kv_mode_name(int mode);
 }
 
 namespace strata::core {
+struct KvStream;   // (src/core/glm_kv_stream.hpp: hy_v3's KV streaming)
 
 /// One served weight: F32 (dequantized at load) or a ggml-quantized row tensor uploaded RAW to
 /// VRAM and dotted by the device MMVQ.  type 0 = F32.
@@ -400,6 +401,14 @@ public:
     bool fast_layers(int64_t p, bool hop_in, std::string& err);
     bool fast_dsa(int il, int64_t p, std::string& err);     // one DSA mixer (x -> mixer)
     bool fast_gqa(int il, int64_t p, std::string& err);     // hy_v3: one attention mixer (xq -> mixer)
+    // hy_v3, STRATA_GLM_KV_STREAM=<positions>: the whole cache in host memory, that many positions a layer cached in
+    // VRAM, a decode step attending to the best pages (glm_kv_stream.hpp)
+    KvStream* kvs_ = nullptr;
+    bool kv_stream_init(int64_t resident, std::string& err);
+    void kv_stream_free();
+    strata::kernels::glmf::GqaKv kv_host_view(int il) const;    // a streamed layer: its host records (+ the cache)
+    strata::kernels::glmf::GqaKv kv_stage_view(int il) const;   // ... its staging copy (the prompt path)
+    void kv_stream_reload(int64_t n);                           // nothing cached, the summaries of [0, n) again
     bool kv_ensure(int64_t pos_end, std::string& err);      // hy_v3: region b lent to the cache up to pos_end
     const uint8_t* kv_lo(int64_t pos_end) const;            // ... the lowest byte of positions [p0, pos_end) there
     size_t kv_room(int64_t pos_end) const;                  // ... the tail's bytes below them (the prompt path's)

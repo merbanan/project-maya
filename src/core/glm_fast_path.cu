@@ -15,6 +15,7 @@
 // Victims come only from the requesting layer's own slot partition, so no kernel can be reading a
 // slot while it is overwritten: the device is parked in that layer's wait kernel, the layer's
 // resident experts are excluded, and every other layer's slots are untouched.
+#include "glm_kv_stream.hpp"
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -782,7 +783,8 @@ bool Glm5Model::fast_setup(std::string& err) {
     }
     if (g.gqa()) {
         const size_t qf = (size_t) g.n_head * g.head_dim, kf = (size_t) g.n_kv * g.head_dim;
-        const size_t sf = gf::gqa_attn_scratch_floats(g.n_head, (int) max_ctx_);
+        const int max_keys = (int) std::max<int64_t>(max_ctx_, kvs_ != nullptr ? (int64_t) kvs_->sel.max_sel * gf::kGqaPage : 0);
+        const size_t sf = gf::gqa_attn_scratch_floats(g.n_head, max_keys);
         if (cudaMalloc(&F->gq, (qf + 2 * kf + sf) * sizeof(float)) != cudaSuccess) {
             err = "glm fast: the attention buffers did not allocate";
             return false;
@@ -3699,6 +3701,14 @@ bool Glm5Model::fast_gqa(int il, int64_t p, std::string& err) {
     const gf::GqaKv kv = kv_view(il);
     gf::gqa_prep(F->gq, F->gk, F->gv, 1, QD, KD, Ly.q_norm, Ly.k_norm, g.norm_eps, (int) p, g.rope_base, g.n_head, kv, s);
     if (F->prof_on) F->mark("gqa_prep");
+    if (kvs_ != nullptr) {   // streamed: the page's summary, the pages to attend to, those cached
+        const gf::GqaStream& st = kvs_->lay[(size_t) il];
+        gf::gqa_stream_summarize(kv, st, (int) p, (int) p + 1, s);
+        gf::gqa_stream_select(F->gq, g.n_head, g.n_kv, st, (int) p + 1, kvs_->budget, kvs_->sink, kvs_->recent,
+                              kvs_->sel, s);
+        gf::gqa_stream_resolve(st, (int) kvs_->slice, kvs_->sel, s);
+        if (F->prof_on) F->mark("gqa_stream");
+    }
     if (!gf::gqa_attn(F->gq, kv, (int) p + 1, g.n_head, F->gscr, F->attn_q, s)) {
         err = "glm fast: gqa attention";
         return false;
@@ -3713,8 +3723,127 @@ bool Glm5Model::fast_gqa(int il, int64_t p, std::string& err) {
 // ---- hy_v3's layers: one residual stream R (= state_), plain pre-norm residuals (rms_q8 adds the block's output
 // to R and normalises the next block's input in one launch)
 gf::GqaKv Glm5Model::kv_view(int il) const {
+    if (kvs_ != nullptr) return kv_host_view(il);
     return gf::gqa_kv_view(state_ + gqa_kv_[(size_t) il], kv_b_, kv_b_ != nullptr ? kv_p0_ : max_ctx_, kv_rec_,
                            kv_loff_[(size_t) il], g_.n_kv, max_ctx_, gqa_kvm_);
+}
+
+// ---- KV streaming (glm_kv_stream.hpp).  STRATA_GLM_KV_STREAM=<positions> cached a layer (load_pack: below the
+// context); STRATA_GLM_KV_SELECT=<positions> (8192) a decode step attends to by score, STRATA_GLM_KV_RECENT=<positions>
+// (1024) the latest ones it always attends to (and the first page).
+bool Glm5Model::kv_stream_init(int64_t resident, std::string& err) {
+    const Glm5Geometry& g = g_;
+    const auto envi = [](const char* k, int64_t d) {
+        const char* v = getenv(k);
+        return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : d;
+    };
+    const int P = gf::kGqaPage;
+    auto* K = new KvStream;
+    kvs_ = K;
+    K->slice = gf::gqa_kv_rec_bytes(g.n_kv, gqa_kvm_);
+    K->budget = (int) ((envi("STRATA_GLM_KV_SELECT", 8192) + P - 1) / P);
+    K->recent = (int) ((envi("STRATA_GLM_KV_RECENT", 1024) + P - 1) / P) + 1;   // (+ the page being written)
+    K->sink = 1;
+    const int max_sel = K->budget + K->recent + K->sink + 4;
+    const int R = std::max<int>((int) ((resident + P - 1) / P), max_sel + 16);
+    const int max_pages = (int) ((max_ctx_ + P - 1) / P);
+    if (mtp_il_ >= 0) K->layers.push_back(mtp_il_);
+    for (int il = l0_; il < l1_; ++il) K->layers.push_back(il);
+    const size_t NL = K->layers.size(), page_b = (size_t) P * K->slice;
+    const size_t lay_host = (size_t) max_pages * page_b;
+    K->host_bytes = NL * lay_host;
+    if (cudaHostAlloc((void**) &K->host, K->host_bytes, cudaHostAllocMapped) != cudaSuccess) {
+        cudaGetLastError();
+        K->host = nullptr;
+        err = "glm kv stream: " + std::to_string(K->host_bytes >> 20) + " MB of pinned host memory did not allocate";
+        return false;
+    }
+    uint8_t* hdev = nullptr;
+    if (cudaHostGetDevicePointer((void**) &hdev, K->host, 0) != cudaSuccess) {
+        err = "glm kv stream: no device pointer for the host records";
+        return false;
+    }
+    // the device side: per layer the slots, the tables, the summaries; then the selection buffers, the staging copy
+    const auto al = [](size_t b) { return (b + 255) / 256 * 256; };
+    const size_t summ_b = (size_t) max_pages * g.n_kv * 2 * g.head_dim * 2;
+    const size_t lay_dev = al((size_t) R * page_b) + al((size_t) max_pages * 4) + 3 * al((size_t) R * 4) + al(8) + al(summ_b);
+    const size_t sel_b = 4 * al((size_t) max_sel * 4) + al(8) + al((size_t) g.n_head * max_pages * 4);
+    const size_t stage_b = al(lay_host);
+    const size_t dev_b = NL * lay_dev + sel_b + stage_b;
+    if (cudaMalloc(&K->dev, dev_b) != cudaSuccess) {
+        cudaGetLastError();
+        K->dev = nullptr;
+        err = "glm kv stream: " + std::to_string(dev_b >> 20) + " MB of VRAM did not allocate";
+        return false;
+    }
+    uint8_t* d = K->dev;
+    const auto take = [&](size_t b) { uint8_t* r = d; d += al(b); return r; };
+    K->lay.assign((size_t) g.n_layers + 1, gf::GqaStream{});
+    for (size_t i = 0; i < NL; ++i) {
+        gf::GqaStream& st = K->lay[(size_t) K->layers[i]];
+        st.host = hdev + i * lay_host;
+        st.slots = take((size_t) R * page_b);
+        st.ptab = (int*) take((size_t) max_pages * 4);
+        st.spage = (int*) take((size_t) R * 4);
+        st.sepoch = (int*) take((size_t) R * 4);
+        st.sref = (int*) take((size_t) R * 4);
+        st.ctl = (int*) take(8);
+        st.summ = take(summ_b);
+        st.R = R;
+        st.max_pages = max_pages;
+        gf::gqa_stream_reset(st, 0);
+    }
+    K->sel.sel = (int*) take((size_t) max_sel * 4);
+    K->sel.miss = (int*) take((size_t) max_sel * 4);
+    K->sel.mslot = (int*) take((size_t) max_sel * 4);
+    K->sel.nsel = (int*) take(4);
+    K->sel.nmiss = (int*) take(4);
+    K->sel.ub = (float*) take((size_t) g.n_head * max_pages * 4);
+    K->sel.max_sel = max_sel;
+    K->stage = take(lay_host);
+    cudaDeviceSynchronize();
+    std::fprintf(stderr, "glm kv stream: CUDA%d the K/V cache in host memory (%.2f GB pinned, %zu bytes a position and "
+                         "layer); in VRAM %.2f GB - %d pages of %d positions a layer cached, the page summaries, a "
+                         "staging copy; a decode step attends to %d pages by score + the first + the last %d\n",
+                 dev_, (double) K->host_bytes / 1073741824.0, K->slice, (double) dev_b / 1073741824.0, R, P, K->budget,
+                 K->recent);
+    return true;
+}
+
+void Glm5Model::kv_stream_free() {
+    if (kvs_ == nullptr) return;
+    if (kvs_->dev) cudaFree(kvs_->dev);
+    if (kvs_->host) cudaFreeHost(kvs_->host);
+    delete kvs_;
+    kvs_ = nullptr;
+}
+
+gf::GqaKv Glm5Model::kv_host_view(int il) const {
+    const gf::GqaStream& st = kvs_->lay[(size_t) il];
+    gf::GqaKv kv = gf::gqa_kv_view(st.host, nullptr, max_ctx_, (int64_t) kvs_->slice, 0, g_.n_kv, max_ctx_, gqa_kvm_);
+    kv.ptab = st.ptab;
+    kv.slots = st.slots;
+    kv.sel = kvs_->sel.sel;
+    kv.nsel = kvs_->sel.nsel;
+    kv.max_sel = kvs_->sel.max_sel;
+    return kv;
+}
+
+gf::GqaKv Glm5Model::kv_stage_view(int il) const {
+    (void) il;
+    return gf::gqa_kv_view(kvs_->stage, nullptr, max_ctx_, (int64_t) kvs_->slice, 0, g_.n_kv, max_ctx_, gqa_kvm_);
+}
+
+void Glm5Model::kv_stream_reload(int64_t n) {
+    if (kvs_ == nullptr) return;
+    cudaStream_t s = fast_ != nullptr ? fast_->cs : 0;
+    for (int il : kvs_->layers) {
+        const gf::GqaStream& st = kvs_->lay[(size_t) il];
+        gf::gqa_stream_reset(st, s);
+        gf::GqaKv v = kv_host_view(il);
+        gf::gqa_stream_summarize(v, st, 0, (int) n, s);
+    }
+    cudaStreamSynchronize(s);
 }
 
 // hy_v3: region b of the K / V records holds positions up to pos_end: the pool's slots under the new part are lent to
@@ -4732,6 +4861,11 @@ std::vector<std::pair<int64_t, int64_t>> Glm5Model::slot_gqa_runs(int64_t n) con
     // as well: the save and the load add it to state_)
     std::vector<std::pair<int64_t, int64_t>> r;
     if (!g_.gqa()) return r;
+    if (kvs_ != nullptr) {   // streamed: every layer's host records (an offset from state_ as well)
+        for (int il : kvs_->layers)
+            r.push_back({(int64_t) ((const float*) kvs_->lay[(size_t) il].host - state_), n * (int64_t) kvs_->slice / 4});
+        return r;
+    }
     const int64_t p0 = kv_b_ != nullptr ? kv_p0_ : max_ctx_, first = gqa_kv_[(size_t) l0_];
     r.push_back({first, std::min(n, p0) * kv_rec_ / 4});
     if (kv_b_ != nullptr && n > p0) r.push_back({(int64_t) ((const float*) kv_lo(n) - state_), (n - p0) * kv_rec_ / 4});
@@ -4788,7 +4922,7 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
                 const int64_t c = std::min(kChunk, s.second - at);
                 buf.resize((size_t) c);
                 tq = std::chrono::steady_clock::now();
-                if (cudaMemcpy(buf.data(), s.first + at, (size_t) c * sizeof(float), cudaMemcpyDeviceToHost) !=
+                if (cudaMemcpy(buf.data(), s.first + at, (size_t) c * sizeof(float), cudaMemcpyDefault) !=
                     cudaSuccess) {
                     cudaGetLastError();
                     cudaSetDevice(dev_);
@@ -4893,7 +5027,7 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
                 const int64_t c = std::min(kChunk, d.second - at);
                 buf.resize((size_t) c);
                 if (!get(buf.data(), (size_t) c * sizeof(float)) ||
-                    cudaMemcpy(d.first + at, buf.data(), (size_t) c * sizeof(float), cudaMemcpyHostToDevice) !=
+                    cudaMemcpy(d.first + at, buf.data(), (size_t) c * sizeof(float), cudaMemcpyDefault) !=
                         cudaSuccess) {
                     cudaGetLastError();
                     cudaSetDevice(dev_);
@@ -4903,6 +5037,7 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
             }
         }
         m->snap_pos_ = n;
+        m->kv_stream_reload(n);   // (streamed: the pages' summaries of the records read back, nothing cached)
     }
     cudaSetDevice(dev_);
     // the KDA states go from the snapshot into the live state, as snapshot_restore does (it also sets the position)
