@@ -227,7 +227,7 @@ private:
     std::vector<int64_t> kv_loff_;
     uint8_t* kv_b_ = nullptr;
     size_t kv_b_bytes_ = 0;
-    int gqa_kvm_ = 0;                             // ... its mode (glm_fast.hpp kGqa*: FP16 .. TQ4V3)
+    int gqa_kvm_ = 0;                             // ... its mode (glm_fast.hpp kGqa*: FP16 .. TQ6V3)
 
 public:
     // ---- per-weight serving slots (strata::core::WSlot below): F32 pointers for the

@@ -2629,7 +2629,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                                             : (int64_t) g_.kv_lora * max_ctx;
     if (lat_q8_) std::fprintf(stderr, "glm pack: CUDA%d latent cache INT8 (%d bytes a position and layer)\n", dev_,
                               strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora));
-    // hy_v3's K / V cache: STRATA_GLM_KV=fp16 | int8 | k8v4 | tq4 | tq6v4 | tq4v3 (generate's --kv sets it), else
+    // hy_v3's K / V cache: STRATA_GLM_KV=fp16 | int8 | k8v4 | tq4 | tq6v4 | tq4v3 | tq6v3 (generate's --kv sets it), else
     // STRATA_GLM_KV_INT8=1 INT8
     gqa_kvm_ = strata::kernels::glmf::kGqaFp16;
     if (g_.gqa()) {

@@ -270,10 +270,11 @@ void rms_q8(float* h, const float* add, const float* w, float eps, int n, float*
 // head_dim 128.  The cache is POSITION-MAJOR: a position's record holds every layer's K rows then V rows (n_kv each).
 // The mode: 0 FP16 (256 bytes a row); 1 INT8 codes + an FP16 scale per 32 values (136 bytes); 2 K8V4 - INT8 K and 4-bit
 // V (two codes a byte + a scale per 32: 72 bytes), the V rows Walsh-Hadamard rotated (glm_gqa.cu); 3..5 TurboQuant -
-// TQ4 (4-bit K and V), TQ6V4 (6-bit K, 4-bit V), TQ4V3 (4-bit K, 3-bit V): rotated rows, Lloyd-Max levels, a scale a
+// TQ4 (4-bit K and V), TQ6V4 (6-bit K, 4-bit V), TQ4V3 (4-bit K, 3-bit V), TQ6V3 (6-bit K, 3-bit V): rotated rows,
+// Lloyd-Max levels, a scale a
 // row (68 / 100 / 52 bytes for 4 / 6 / 3 bits).  Positions below p0 live in region a (record pos at a + pos * rec), the
 // rest in region b, downward (at b - (pos - p0) * rec).
-constexpr int kGqaFp16 = 0, kGqaInt8 = 1, kGqaK8V4 = 2, kGqaTq4 = 3, kGqaTq6V4 = 4, kGqaTq4V3 = 5;
+constexpr int kGqaFp16 = 0, kGqaInt8 = 1, kGqaK8V4 = 2, kGqaTq4 = 3, kGqaTq6V4 = 4, kGqaTq4V3 = 5, kGqaTq6V3 = 6;
 struct GqaKv {
     void* a = nullptr;
     void* b = nullptr;
@@ -329,7 +330,7 @@ void gqa_stream_resolve(const GqaStream& st, int slice, const GqaSelBufs& b, cud
 void gqa_stream_invalidate(const GqaStream& st, int page_lo, int page_hi, cudaStream_t s);
 /// nothing cached
 void gqa_stream_reset(const GqaStream& st, cudaStream_t s);
-/// a mode's name (STRATA_GLM_KV: fp16 int8 k8v4 tq4 tq6v4 tq4v3), and the mode of a name (-1: none)
+/// a mode's name (STRATA_GLM_KV: fp16 int8 k8v4 tq4 tq6v4 tq4v3 tq6v3), and the mode of a name (-1: none)
 const char* gqa_kv_mode_name(int mode);
 int gqa_kv_mode_parse(const char* s);
 /// One layer's part of a record (its K and V rows), and the view of a layer: a / b the regions' record 0, p0 the first

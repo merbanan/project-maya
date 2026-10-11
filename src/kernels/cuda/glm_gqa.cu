@@ -11,7 +11,8 @@
 // rows are rotated by the orthonormal 128-point Walsh-Hadamard transform H before they are quantized (outliers spread
 // over the row, as Strata's K8V4); attention is linear in V, so its output is rotated back by H (H H = I) per head.
 //
-// The TurboQuant modes (TQ4: 4-bit K and V; TQ6V4: 6-bit K, 4-bit V; TQ4V3: 4-bit K, 3-bit V; no QJL residual): a
+// The TurboQuant modes (TQ4: 4-bit K and V; TQ6V4: 6-bit K, 4-bit V; TQ4V3: 4-bit K, 3-bit V; TQ6V3: 6-bit K, 3-bit
+// V; no QJL residual): a
 // row is rotated by R = H D (D a fixed random sign per dimension), each rotated value - scaled to unit variance by the
 // row's norm - takes the nearest level of the Lloyd-Max codebook of a unit Gaussian (what a rotated coordinate is close
 // to), and the row keeps one F32 scale: the least-squares fit of its values to the levels.  K's rotation is undone on q
@@ -1003,19 +1004,19 @@ void check(const char* what) {
 namespace {
 // a mode's K and V kinds
 void mode_kinds(int mode, int& kk, int& vk) {
-    static const int K[] = {kF16, kI8, kI8, kT4, kT6, kT4}, V[] = {kF16, kI8, kL4, kT4, kT4, kT3};
-    if (mode < 0 || mode > kGqaTq4V3) mode = kGqaFp16;
+    static const int K[] = {kF16, kI8, kI8, kT4, kT6, kT4, kT6}, V[] = {kF16, kI8, kL4, kT4, kT4, kT3, kT3};
+    if (mode < 0 || mode > kGqaTq6V3) mode = kGqaFp16;
     kk = K[mode];
     vk = V[mode];
 }
-const char* const kModeNames[] = {"fp16", "int8", "k8v4", "tq4", "tq6v4", "tq4v3"};
+const char* const kModeNames[] = {"fp16", "int8", "k8v4", "tq4", "tq6v4", "tq4v3", "tq6v3"};
 }  // namespace
 
-const char* gqa_kv_mode_name(int mode) { return mode >= 0 && mode <= kGqaTq4V3 ? kModeNames[mode] : "?"; }
+const char* gqa_kv_mode_name(int mode) { return mode >= 0 && mode <= kGqaTq6V3 ? kModeNames[mode] : "?"; }
 
 int gqa_kv_mode_parse(const char* s) {
     if (s == nullptr) return -1;
-    for (int m = 0; m <= kGqaTq4V3; ++m)
+    for (int m = 0; m <= kGqaTq6V3; ++m)
         if (std::strcmp(s, kModeNames[m]) == 0) return m;
     return -1;
 }
