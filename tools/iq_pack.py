@@ -246,7 +246,11 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                     converted.append({"name": t.name, "source_type": t.type_name, "bytes": len(raw)})
                 else:
                     kind = {"BF16": "4", "F16": "5", "F32": "2"}[t.type_name]
-                if not convert and arch == "qwen4exp" and t.type_name == "F32" and t.name.endswith(ROUTERS):
+                # (hy_v3: llama.cpp writes the BF16 checkpoint's router as F32 - the same exact values in half the
+                # bytes, read every token; a router with other values stays F32, which the engine also takes)
+                exact16 = arch == "hy_v3" and t.type_name == "F32" and t.name.endswith(ROUTERS) and \
+                    not np.count_nonzero(np.frombuffer(raw, dtype=np.uint32) & 0xFFFF)
+                if not convert and (arch == "qwen4exp" or exact16) and t.type_name == "F32" and t.name.endswith(ROUTERS):
                     u = np.frombuffer(raw, dtype=np.uint32)
                     if np.count_nonzero(u & 0xFFFF):
                         print("router %s is F32 with values that are not BF16; the engine's router is BF16" % t.name)
