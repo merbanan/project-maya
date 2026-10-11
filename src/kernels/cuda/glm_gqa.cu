@@ -4,7 +4,10 @@
 // base^(-2i/n_dims), the pair (i, i + n_dims/2)), K and V in a cache, softmax(q.k / sqrt(head_dim)) . v.
 //
 // The cache (GqaKv): per layer K then V, rows [position][n_kv][128] - FP16, or INT8 codes with one FP16 scale per 32
-// values (symmetric, absmax / 127; the codes of every row first, then the scales: 136 bytes a row against 256).
+// values (symmetric, absmax / 127; the codes of every row first, then the scales: 136 bytes a row against 256), or
+// K8V4: INT8 K and 4-bit V (symmetric, absmax / 7, two codes a byte, an FP16 scale per 32: 72 bytes a row).  K8V4's V
+// rows are rotated by the orthonormal 128-point Walsh-Hadamard transform H before they are quantized (outliers spread
+// over the row, as Strata's K8V4); attention is linear in V, so its output is rotated back by H (H H = I) per head.
 #include "strata/kernels/glm_fast.hpp"
 
 #include <cuda_fp16.h>
@@ -43,10 +46,17 @@ __device__ __forceinline__ float wmax(float v) {
 // row r = pos * n_kv + head of one of the two caches
 struct Rows {
     uint8_t* base;
-    int q8;
-    size_t n_rows;   // max_ctx * n_kv (where an INT8 cache's scales start)
+    int q8, q4;
+    size_t n_rows;   // max_ctx * n_kv (where a quantized cache's scales start)
     __device__ __forceinline__ void load4(size_t r, int d, float& a, float& b, float& c, float& e) const {
-        if (q8) {
+        if (q4) {
+            const uint16_t qq = *(const uint16_t*) (base + r * (kD / 2) + d / 2);
+            const float sc = __half2float(((const __half*) (base + n_rows * (kD / 2)))[r * (kD / 32) + d / 32]);
+            a = (float) ((int) (qq & 15) - 8) * sc;
+            b = (float) ((int) ((qq >> 4) & 15) - 8) * sc;
+            c = (float) ((int) ((qq >> 8) & 15) - 8) * sc;
+            e = (float) ((int) ((qq >> 12) & 15) - 8) * sc;
+        } else if (q8) {
             const char4 q = *(const char4*) (base + r * kD + d);
             const float sc = __half2float(((const __half*) (base + n_rows * kD))[r * (kD / 32) + d / 32]);
             a = q.x * sc; b = q.y * sc; c = q.z * sc; e = q.w * sc;
@@ -58,15 +68,38 @@ struct Rows {
     }
 };
 __device__ __forceinline__ Rows k_rows(const GqaKv& kv) {
-    return {(uint8_t*) kv.k, kv.q8, (size_t) kv.max_ctx * kv.n_kv};
+    return {(uint8_t*) kv.k, kv.q8, 0, (size_t) kv.max_ctx * kv.n_kv};
 }
 __device__ __forceinline__ Rows v_rows(const GqaKv& kv) {
-    return {(uint8_t*) kv.v, kv.q8, (size_t) kv.max_ctx * kv.n_kv};
+    return {(uint8_t*) kv.v, kv.v4 ? 0 : kv.q8, kv.v4, (size_t) kv.max_ctx * kv.n_kv};
 }
 
-// one row of 128 values into the cache (kD threads, value t from each): FP16, or INT8 with a scale per 32 (a warp)
-__device__ __forceinline__ void store_row(const GqaKv& kv, uint8_t* base, size_t r, int t, float val) {
-    if (kv.q8) {
+// the orthonormal 128-point Walsh-Hadamard transform of s (shared, 128 values) by 128 threads, in place
+__device__ __forceinline__ void fwht128(float* s, int t) {
+#pragma unroll
+    for (int h = 1; h < kD; h <<= 1) {
+        __syncthreads();
+        const float a = s[t], b = s[t ^ h];
+        __syncthreads();
+        s[t] = (t & h) ? b - a : a + b;
+    }
+    __syncthreads();
+    s[t] *= 0.08838834764831845f;   // 1 / sqrt(128)
+    __syncthreads();
+}
+
+// one row of 128 values into the cache (kD threads, value t from each): FP16, INT8 with a scale per 32 (a warp), or
+// (q4) 4-bit codes, two a byte (the even thread writes the pair), with a scale per 32
+__device__ __forceinline__ void store_row(const GqaKv& kv, uint8_t* base, size_t r, int t, float val, bool q4 = false) {
+    if (q4) {
+        const float amax = wmax(fabsf(val));
+        const float sc = amax / 7.0f;
+        const int q = sc > 0.0f ? max(-7, min(7, __float2int_rn(val / sc))) : 0;
+        const int qn = __shfl_xor_sync(0xffffffffu, q, 1);
+        if ((t & 1) == 0) base[r * (kD / 2) + t / 2] = (uint8_t) ((q + 8) | ((qn + 8) << 4));
+        if ((t & 31) == 0)
+            ((__half*) (base + (size_t) kv.max_ctx * kv.n_kv * (kD / 2)))[r * (kD / 32) + t / 32] = __float2half(sc);
+    } else if (kv.q8) {
         const float amax = wmax(fabsf(val));
         const float sc = amax / 127.0f;
         const int q = sc > 0.0f ? __float2int_rn(val / sc) : 0;
@@ -90,7 +123,13 @@ __global__ void __launch_bounds__(kD) gqa_prep_kernel(float* __restrict__ q, con
     const int n_kv = kv.n_kv;
     if (b >= n_head + n_kv) {                                  // a v head
         const int h = b - n_head - n_kv;
-        store_row(kv, (uint8_t*) kv.v, (size_t) pos * n_kv + h, t, v[(size_t) row * kld + (size_t) h * kD + t]);
+        float val = v[(size_t) row * kld + (size_t) h * kD + t];
+        if (kv.v4) {   // K8V4: the row rotated by H before its 4-bit codes
+            sy[t] = val;
+            fwht128(sy, t);
+            val = sy[t];
+        }
+        store_row(kv, (uint8_t*) kv.v, (size_t) pos * n_kv + h, t, val, kv.v4 != 0);
         return;
     }
     const bool is_q = b < n_head;
@@ -182,7 +221,8 @@ __global__ void __launch_bounds__(256) gqa_attn_kernel(const float* __restrict__
 }
 
 __global__ void __launch_bounds__(kD) gqa_combine_kernel(const float* __restrict__ part, int n_split,
-                                                         float* __restrict__ out) {
+                                                         float* __restrict__ out, int v4) {
+    __shared__ float so[kD];
     const int h = blockIdx.x, t = threadIdx.x;
     const float* ph = part + (size_t) h * n_split * (kD + 2);
     float M = -INFINITY;
@@ -194,7 +234,23 @@ __global__ void __launch_bounds__(kD) gqa_combine_kernel(const float* __restrict
         acc += f * ps[t];
         den += f * ps[kD + 1];
     }
+    if (v4) {   // K8V4: the output was made of rotated V rows - rotate it back
+        so[t] = acc / den;
+        fwht128(so, t);
+        out[(size_t) h * kD + t] = so[t];
+        return;
+    }
     out[(size_t) h * kD + t] = acc / den;
+}
+
+// K8V4, the prompt path: each FP16 output row (T rows of n_head heads, old halves apart) rotated back by H
+__global__ void __launch_bounds__(kD) gqa_unrotate_rows_kernel(__half* __restrict__ out, int n_head, int old) {
+    __shared__ float so[kD];
+    const int row = blockIdx.x, h = blockIdx.y, t = threadIdx.x;
+    __half* o = out + (size_t) row * old + (size_t) h * kD;
+    so[t] = __half2float(o[t]);
+    fwht128(so, t);
+    o[t] = __float2half(so[t]);
 }
 
 // ---- a prompt chunk: causal attention of rows [0, T) (positions p0 + row) over the cache [0, p0 + row].  Block (32
@@ -452,16 +508,23 @@ void check(const char* what) {
 
 }  // namespace
 
-size_t gqa_kv_layer_bytes(int n_kv, int64_t max_ctx, bool q8) {
-    const size_t rows = (size_t) max_ctx * n_kv;
-    return 2 * rows * (q8 ? (size_t) kD + (kD / 32) * sizeof(__half) : (size_t) kD * sizeof(__half));
+// a cache row's bytes: FP16 256; INT8 128 codes + 4 scales; 4-bit 64 codes + 4 scales
+static size_t row_bytes_of(int kind) {   // 0 FP16, 1 INT8, 2 4-bit
+    return kind == 0 ? (size_t) kD * sizeof(__half) : (kind == 1 ? (size_t) kD : (size_t) kD / 2) + (kD / 32) * sizeof(__half);
+}
+size_t gqa_kv_k_bytes(int n_kv, int64_t max_ctx, int mode) {
+    return (size_t) max_ctx * n_kv * row_bytes_of(mode == 0 ? 0 : 1);
+}
+size_t gqa_kv_layer_bytes(int n_kv, int64_t max_ctx, int mode) {
+    return gqa_kv_k_bytes(n_kv, max_ctx, mode) + (size_t) max_ctx * n_kv * row_bytes_of(mode == 0 ? 0 : mode == 1 ? 1 : 2);
 }
 
-GqaKv gqa_kv_view(void* layer_base, int n_kv, int64_t max_ctx, bool q8) {
+GqaKv gqa_kv_view(void* layer_base, int n_kv, int64_t max_ctx, int mode) {
     GqaKv kv;
     kv.k = layer_base;
-    kv.v = (uint8_t*) layer_base + gqa_kv_layer_bytes(n_kv, max_ctx, q8) / 2;
-    kv.q8 = q8 ? 1 : 0;
+    kv.v = (uint8_t*) layer_base + gqa_kv_k_bytes(n_kv, max_ctx, mode);
+    kv.q8 = mode != 0 ? 1 : 0;
+    kv.v4 = mode == 2 ? 1 : 0;
     kv.n_kv = n_kv;
     kv.max_ctx = (int) max_ctx;
     return kv;
@@ -489,7 +552,7 @@ bool gqa_attn(const float* q, const GqaKv& kv, int n_pos, int n_head, float* scr
     float* out = scratch + (size_t) n_head * n_split * (kD + 2);
     gqa_attn_kernel<<<dim3(kv.n_kv, n_split), 256, 0, s>>>(q, kv, n_pos, n_head, 1.0f / sqrtf((float) kD), part);
     check("gqa_attn");
-    gqa_combine_kernel<<<n_head, kD, 0, s>>>(part, n_split, out);
+    gqa_combine_kernel<<<n_head, kD, 0, s>>>(part, n_split, out, kv.v4);
     check("gqa_combine");
     quantize_q8_1(out, out_q8_1, n_head * kD, s);
     return true;
@@ -513,12 +576,20 @@ bool gqa_attn_rows(const float* q, int qld, const GqaKv& kv, int p0, int T, int 
         gqa_attn_rows_tc_kernel<<<dim3((T + kTQ - 1) / kTQ, n_head), kTW * 32, kTcSmem, s>>>(
             q, qld, kv, p0, T, n_head, 1.0f / sqrtf((float) kD), (__half*) out16, old);
         check("gqa_attn_rows_tc");
+        if (kv.v4) {
+            gqa_unrotate_rows_kernel<<<dim3(T, n_head), kD, 0, s>>>((__half*) out16, n_head, old);
+            check("gqa_unrotate_rows");
+        }
         return true;
     }
 #endif
     gqa_attn_rows_kernel<<<dim3((T + kQT - 1) / kQT, n_head), 256, 0, s>>>(q, qld, kv, p0, T, n_head,
                                                                           1.0f / sqrtf((float) kD), (__half*) out16, old);
     check("gqa_attn_rows");
+    if (kv.v4) {
+        gqa_unrotate_rows_kernel<<<dim3(T, n_head), kD, 0, s>>>((__half*) out16, n_head, old);
+        check("gqa_unrotate_rows");
+    }
     return true;
 }
 

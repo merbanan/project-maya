@@ -3672,7 +3672,7 @@ bool Glm5Model::fast_gqa(int il, int64_t p, std::string& err) {
     j[2] = {Ly.v.q, F->xq, F->x, F->gv, nullptr, 1.0f, Ly.v.type, g.n_embd, KD};
     if (!gf::mv(j, 3, s)) { err = "glm fast: gqa projections"; return false; }
     if (F->prof_on) F->mark("gqa_qkv_mv");
-    const gf::GqaKv kv = gf::gqa_kv_view(state_ + gqa_kv_[(size_t) il], g.n_kv, max_ctx_, gqa_q8_);
+    const gf::GqaKv kv = gf::gqa_kv_view(state_ + gqa_kv_[(size_t) il], g.n_kv, max_ctx_, gqa_kvm_);
     gf::gqa_prep(F->gq, F->gk, F->gv, 1, QD, KD, Ly.q_norm, Ly.k_norm, g.norm_eps, (int) p, g.rope_base, g.n_head, kv, s);
     if (F->prof_on) F->mark("gqa_prep");
     if (!gf::gqa_attn(F->gq, kv, (int) p + 1, g.n_head, F->gscr, F->attn_q, s)) {
@@ -4644,15 +4644,18 @@ std::vector<std::pair<int64_t, int64_t>> Glm5Model::slot_gqa_runs(int64_t n) con
     std::vector<std::pair<int64_t, int64_t>> r;
     if (!g_.gqa()) return r;
     const int64_t rows = n * g_.n_kv, all = max_ctx_ * g_.n_kv, hd = g_.head_dim;
-    const int64_t half = (int64_t) gf::gqa_kv_layer_bytes(g_.n_kv, max_ctx_, gqa_q8_) / 2 / 4;   // floats to V
+    const int64_t kfl = (int64_t) gf::gqa_kv_k_bytes(g_.n_kv, max_ctx_, gqa_kvm_) / 4;   // floats to V
     const auto layer = [&](int il) {
         const int64_t b = gqa_kv_[(size_t) il];
-        for (const int64_t at : {b, b + half}) {
-            if (gqa_q8_) {
-                r.push_back({at, rows * hd / 4});                          // INT8 codes
-                r.push_back({at + all * hd / 4, rows * (hd / 32) / 2});    // FP16 scales, one per 32 values
-            } else {
+        for (int part = 0; part < 2; ++part) {
+            const int64_t at = part == 0 ? b : b + kfl;
+            const int kind = gqa_kvm_ == 0 ? 0 : (part == 1 && gqa_kvm_ == 2) ? 2 : 1;   // FP16, INT8, 4-bit
+            if (kind == 0) {
                 r.push_back({at, rows * hd / 2});                          // FP16 rows
+            } else {
+                const int64_t code = kind == 1 ? hd : hd / 2;              // code bytes a row
+                r.push_back({at, rows * code / 4});                        // the codes
+                r.push_back({at + all * code / 4, rows * (hd / 32) / 2});  // FP16 scales, one per 32 values
             }
         }
     };
