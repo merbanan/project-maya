@@ -293,11 +293,11 @@ __global__ void __launch_bounds__(256) gqa_attn_rows_kernel(const float* __restr
 }
 
 #if !defined(STRATA_USE_HIP)
-// ---- the same on the tensor cores (sm_70+, FP16 in, F32 accumulate) in two passes: the first walks the keys for each
-// row's softmax max and sum, the second recomputes S = Q K^T and accumulates P V with the final max and sum - the
-// output stays in WMMA accumulators (registers) and is never rescaled.  Block (128 query rows, one query head), 8 warps
+// ---- the same on the tensor cores (sm_70+, FP16 in, F32 accumulate) in one pass with a lazily rescaled output (see
+// below): S = Q K^T and O += P V per 32-key tile, the output in WMMA accumulators (registers).  Block (128 query rows, one query head), 8 warps
 // of 16 rows, each with its Q in 8 fragments; 32-key tiles of K and V through shared memory, S and P per warp.
 constexpr int kTQ = 128, kTK = 32, kTW = 8;
+constexpr int kKH = kTK / 2;   // a lane pair's keys of a tile
 constexpr int kLdQ = kD + 8, kLdS = kTK + 4, kLdP = kTK + 8;   // (wmma: ldm % 8 halves / 4 floats)
 constexpr size_t kTcTile = 2 * (size_t) kTK * kLdQ * 2 + (size_t) kTW * 16 * kLdS * 4 + (size_t) kTW * 16 * kLdP * 2;
 constexpr size_t kTcSmem = kTcTile > (size_t) kTQ * kLdQ * 2 ? kTcTile : (size_t) kTQ * kLdQ * 2;   // (Q staging)
@@ -325,7 +325,7 @@ __global__ void __launch_bounds__(kTW * 32) gqa_attn_rows_tc_kernel(const float*
     for (int k = 0; k < kD / 16; ++k) wmma::load_matrix_sync(fq[k], sQ + (w * 16) * kLdQ + k * 16, kLdQ);
     float* Sw = sS + w * 16 * kLdS;
     __half* Pw = sP + w * 16 * kLdP;
-    // the lane pair (2 ri, 2 ri + 1) owns row ri of the warp's 16: keys 16 (lane & 1) .. + 15 of a tile
+    // the lane pair (2 ri, 2 ri + 1) owns row ri of the warp's 16: keys kKH (lane & 1) .. + kKH - 1 of a tile
     const int ri = lane >> 1, half_i = lane & 1;
     const int row = r0 + w * 16 + ri, pos = p0 + row;
     const bool row_ok = row < T;
@@ -362,33 +362,12 @@ __global__ void __launch_bounds__(kTW * 32) gqa_attn_rows_tc_kernel(const float*
         }
         __syncwarp();
     };
-    // ---- pass 1: each row's max and sum
+    // ---- one pass: P = e^(s - m_ref) with a per-row reference max that moves only when a tile's max passes it by
+    // more than kLazy (P <= e^kLazy fits FP16); then the accumulated output's rows are rescaled by e^(m_old - m_new),
+    // a 16x16 fragment at a time through the warp's S area - a few times a row (its first tiles), so the output stays
+    // in the WMMA accumulators and K / V are read once
+    constexpr float kLazy = 8.0f;
     float m = -INFINITY, l = 0.0f;
-    for (int k0 = 0; k0 <= last; k0 += kTK) {
-        __syncthreads();
-        load_tile(k0, false);
-        __syncthreads();
-        if (k0 > wlast) continue;   // (the warp's rows see none of these keys)
-        scores();
-        float sv[16], mt = -INFINITY;
-#pragma unroll
-        for (int j = 0; j < 16; ++j) {
-            const int c = half_i * 16 + j;
-            sv[j] = row_ok && k0 + c <= pos ? Sw[ri * kLdS + c] : -INFINITY;
-            mt = fmaxf(mt, sv[j]);
-        }
-        mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, 1));
-        const float mn = fmaxf(m, mt);
-        float ps = 0.0f;
-#pragma unroll
-        for (int j = 0; j < 16; ++j) ps += sv[j] == -INFINITY ? 0.0f : __expf(sv[j] - mn);
-        ps += __shfl_xor_sync(0xffffffffu, ps, 1);
-        l = (m == -INFINITY ? 0.0f : l * __expf(m - mn)) + ps;
-        m = mn;
-        __syncwarp();
-    }
-    const float inv_l = l > 0.0f ? 1.0f / l : 0.0f;
-    // ---- pass 2: O = sum over tiles of P V, P = e^(s - m) / l
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> fo[kD / 16];
 #pragma unroll
     for (int n = 0; n < kD / 16; ++n) wmma::fill_fragment(fo[n], 0.0f);
@@ -396,15 +375,44 @@ __global__ void __launch_bounds__(kTW * 32) gqa_attn_rows_tc_kernel(const float*
         __syncthreads();
         load_tile(k0, true);
         __syncthreads();
-        if (k0 > wlast) continue;
+        if (k0 > wlast) continue;   // (the warp's rows see none of these keys)
         scores();
+        float sv[kKH], mt = -INFINITY;
 #pragma unroll
-        for (int j = 0; j < 16; ++j) {
-            const int c = half_i * 16 + j;
-            const bool ok = row_ok && k0 + c <= pos;
-            Pw[ri * kLdP + c] = __float2half(ok ? __expf(Sw[ri * kLdS + c] - m) * inv_l : 0.0f);
+        for (int j = 0; j < kKH; ++j) {
+            const int c = half_i * kKH + j;
+            sv[j] = row_ok && k0 + c <= pos ? Sw[ri * kLdS + c] : -INFINITY;
+            mt = fmaxf(mt, sv[j]);
         }
+        mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, 1));
+        const bool need = mt > m + kLazy;   // (the first tile with keys: m = -inf)
+        float corr = 1.0f;
+        if (need) {
+            corr = m == -INFINITY ? 0.0f : __expf(m - mt);
+            l *= corr;
+            m = mt;
+        }
+        float ps = 0.0f;
+#pragma unroll
+        for (int j = 0; j < kKH; ++j) {
+            const float pj = sv[j] == -INFINITY ? 0.0f : __expf(sv[j] - m);
+            ps += pj;
+            Pw[ri * kLdP + half_i * kKH + j] = __float2half(pj);
+        }
+        l += ps + __shfl_xor_sync(0xffffffffu, ps, 1);
         __syncwarp();
+        if (__any_sync(0xffffffffu, need)) {   // (S is spent: its area holds one fragment at a time)
+#pragma unroll
+            for (int n = 0; n < kD / 16; ++n) {
+                wmma::store_matrix_sync(Sw, fo[n], kLdS, wmma::mem_row_major);
+                __syncwarp();
+#pragma unroll
+                for (int j = 0; j < 8; ++j) Sw[ri * kLdS + half_i * 8 + j] *= corr;
+                __syncwarp();
+                wmma::load_matrix_sync(fo[n], Sw, kLdS, wmma::mem_row_major);
+                __syncwarp();
+            }
+        }
 #pragma unroll
         for (int k = 0; k < kTK / 16; ++k) {
             wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fp;
@@ -418,6 +426,7 @@ __global__ void __launch_bounds__(kTW * 32) gqa_attn_rows_tc_kernel(const float*
         }
         __syncwarp();
     }
+    const float inv_l = l > 0.0f ? 1.0f / l : 0.0f;
     // the output, 16 dims at a time through the warp's S area
 #pragma unroll
     for (int n = 0; n < kD / 16; ++n) {
@@ -426,7 +435,7 @@ __global__ void __launch_bounds__(kTW * 32) gqa_attn_rows_tc_kernel(const float*
         if (row_ok) {
             __half* o = out + (size_t) row * old + (size_t) h * kD + n * 16 + half_i * 8;
 #pragma unroll
-            for (int j = 0; j < 8; ++j) o[j] = __float2half(Sw[ri * kLdS + half_i * 8 + j]);
+            for (int j = 0; j < 8; ++j) o[j] = __float2half(Sw[ri * kLdS + half_i * 8 + j] * inv_l);
         }
         __syncwarp();
     }
