@@ -95,7 +95,11 @@ struct Rows {
     long long p0, rec;
     int off, rb, kind;   // kind: kF16 .. kT6
     const float* cb;     // a TurboQuant kind's levels (shared memory)
+    const int* ptab;     // KV streaming: the rows of the cached pages (page table -> slots, rec bytes a position)
+    const uint8_t* slots;
     __device__ __forceinline__ const uint8_t* row(long long pos, int h) const {
+        if (ptab != nullptr)
+            return slots + ((size_t) ptab[pos / kGqaPage] * kGqaPage + (size_t) (pos % kGqaPage)) * rec + off + h * rb;
         return (pos < p0 ? a + pos * rec : b - (pos - p0) * rec) + off + h * rb;   // (region b grows down)
     }
     __device__ __forceinline__ void load4(long long pos, int h, int d, float& x0, float& x1, float& x2, float& x3) const {
@@ -134,12 +138,27 @@ struct Rows {
         }
     }
 };
-__device__ __forceinline__ Rows k_rows(const GqaKv& kv, const float* cb = nullptr) {
-    return {(const uint8_t*) kv.a, (const uint8_t*) kv.b, kv.p0, kv.rec, kv.k_off, row_bytes(kv.kk), kv.kk, cb};
+// (cached: the rows of the cached pages - a streamed view's selection; else the view's own records)
+__device__ __forceinline__ Rows k_rows(const GqaKv& kv, const float* cb = nullptr, bool cached = false) {
+    return {(const uint8_t*) kv.a, (const uint8_t*) kv.b, kv.p0, kv.rec, kv.k_off, row_bytes(kv.kk), kv.kk, cb,
+            cached ? kv.ptab : nullptr, kv.slots};
 }
-__device__ __forceinline__ Rows v_rows(const GqaKv& kv, const float* cb = nullptr) {
+__device__ __forceinline__ Rows v_rows(const GqaKv& kv, const float* cb = nullptr, bool cached = false) {
     return {(const uint8_t*) kv.a, (const uint8_t*) kv.b, kv.p0, kv.rec, kv.k_off + kv.n_kv * row_bytes(kv.kk),
-            row_bytes(kv.vk), kv.vk, cb};
+            row_bytes(kv.vk), kv.vk, cb, cached ? kv.ptab : nullptr, kv.slots};
+}
+// the decode's key index i: position i, or (a streamed view's selection) position j of the (i / kGqaPage)-th selected
+// page; n_idx keys in all, those at n_pos or past it (the last page's tail) masked
+struct Keys {
+    const int* sel;
+    int n_idx, n_pos;
+    __device__ __forceinline__ long long pos(int i) const {
+        return sel != nullptr ? (long long) sel[i / kGqaPage] * kGqaPage + i % kGqaPage : i;
+    }
+    __device__ __forceinline__ bool ok(int i) const { return i < n_idx && pos(i) < n_pos; }
+};
+__device__ __forceinline__ Keys keys_of(const GqaKv& kv, int n_pos) {
+    return {kv.sel, kv.sel != nullptr ? *kv.nsel * kGqaPage : n_pos, n_pos};
 }
 // the rotations: K by R = H D (TurboQuant kinds); V by H (K8V4's 4-bit: 1) or R (2)
 __host__ __device__ __forceinline__ bool k_rot(const GqaKv& kv) { return kv.kk >= kT3; }
@@ -233,6 +252,7 @@ __global__ void __launch_bounds__(kD) gqa_prep_kernel(float* __restrict__ q, con
             val = sy[t];
         }
         store_row(v_rows(kv), pos, h, t, val);
+        if (kv.ptab != nullptr && kv.ptab[pos / kGqaPage] >= 0) store_row(v_rows(kv, nullptr, true), pos, h, t, val);
         return;
     }
     const bool is_q = b < n_head;
@@ -259,8 +279,13 @@ __global__ void __launch_bounds__(kD) gqa_prep_kernel(float* __restrict__ q, con
         fwht128(sy, t);
         o = sy[t];
     }
-    if (is_q) q[(size_t) row * qld + (size_t) h * kD + t] = o;
-    else store_row(k_rows(kv), pos, h, t, o);
+    if (is_q) {
+        q[(size_t) row * qld + (size_t) h * kD + t] = o;
+    } else {
+        store_row(k_rows(kv), pos, h, t, o);
+        // (a streamed view: the host record always, the cached page's copy as well when it is cached)
+        if (kv.ptab != nullptr && kv.ptab[pos / kGqaPage] >= 0) store_row(k_rows(kv, nullptr, true), pos, h, t, o);
+    }
 }
 
 // ---- decode: split-K over [0, n_pos) for the G query heads of one K/V head; per (head, split) the running max m,
@@ -272,15 +297,22 @@ __global__ void __launch_bounds__(256) gqa_attn_kernel(const float* __restrict__
     __shared__ float sm[kMaxGroup], sl[kMaxGroup];
     const int n_kv = kv.n_kv, kvh = blockIdx.x, split = blockIdx.y, G = n_head / n_kv;
     const int t = threadIdx.x, lane = t & 31, w = t >> 5;
-    const int p0 = split * kChunk, np = min(kChunk, n_pos - p0);
+    const Keys ks = keys_of(kv, n_pos);
+    const int p0 = split * kChunk, np = min(kChunk, ks.n_idx - p0);
     __shared__ float scb[2][64];
     load_cbs(scb, kv.kk, kv.vk, t, blockDim.x);
-    const Rows K = k_rows(kv, scb[0]), V = v_rows(kv, scb[1]);
+    const bool cached = kv.sel != nullptr;
+    const Rows K = k_rows(kv, scb[0], cached), V = v_rows(kv, scb[1], cached);
     for (int i = t; i < G * kD; i += blockDim.x) sq[i] = q[(size_t) (kvh * G) * kD + i] * scale;
     __syncthreads();
     for (int j = w; j < np; j += 8) {
+        if (!ks.ok(p0 + j)) {   // (a page's tail past n_pos)
+            if (lane == 0)
+                for (int g = 0; g < G; ++g) sp[g * kChunk + j] = -INFINITY;
+            continue;
+        }
         float k0, k1, k2, k3;
-        K.load4(p0 + j, kvh, 4 * lane, k0, k1, k2, k3);
+        K.load4(ks.pos(p0 + j), kvh, 4 * lane, k0, k1, k2, k3);
         for (int g = 0; g < G; ++g) {
             const float* qg = sq + g * kD + 4 * lane;
             float d = qg[0] * k0 + qg[1] * k1 + qg[2] * k2 + qg[3] * k3;
@@ -295,7 +327,7 @@ __global__ void __launch_bounds__(256) gqa_attn_kernel(const float* __restrict__
         m = wmax(m);
         float l = 0.0f;
         for (int j = lane; j < np; j += 32) {
-            const float e = __expf(sp[g * kChunk + j] - m);
+            const float e = sp[g * kChunk + j] == -INFINITY ? 0.0f : __expf(sp[g * kChunk + j] - m);
             sp[g * kChunk + j] = e;
             l += e;
         }
@@ -310,9 +342,10 @@ __global__ void __launch_bounds__(256) gqa_attn_kernel(const float* __restrict__
     for (int g = w; g < G; g += 8) {
         float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
         for (int j = 0; j < np; ++j) {
-            float v0, v1, v2, v3;
-            V.load4(p0 + j, kvh, d4, v0, v1, v2, v3);
             const float pj = sp[g * kChunk + j];
+            if (pj == 0.0f) continue;   // (masked keys: their rows may be stale)
+            float v0, v1, v2, v3;
+            V.load4(ks.pos(p0 + j), kvh, d4, v0, v1, v2, v3);
             a0 += pj * v0;
             a1 += pj * v1;
             a2 += pj * v2;
@@ -635,7 +668,9 @@ __global__ void __launch_bounds__(kDW * 32) gqa_attn_tc_kernel(const float* __re
     const int t = threadIdx.x, lane = t & 31, w = t >> 5;
     __shared__ float scb[2][64];
     load_cbs(scb, kv.kk, kv.vk, t, kDW * 32);
-    const Rows K = k_rows(kv, scb[0]), V = v_rows(kv, scb[1]);
+    const Keys ks = keys_of(kv, n_pos);
+    const bool cached = kv.sel != nullptr;
+    const Rows K = k_rows(kv, scb[0], cached), V = v_rows(kv, scb[1], cached);
     for (int i = t; i < 16 * kD; i += kDW * 32) {
         const int r = i / kD, d = i % kD;
         sQ[r * kLdQ + d] = __float2half(r < G ? q[(size_t) (kvh * G + r) * kD + d] * scale : 0.0f);
@@ -650,7 +685,7 @@ __global__ void __launch_bounds__(kDW * 32) gqa_attn_tc_kernel(const float* __re
     __half* Pw = sP[w];
     const int ri = lane >> 1, half_i = lane & 1;                  // the lane pair of row (head) ri: keys 8 half_i ..
     const bool row_ok = ri < G;
-    const int k_lo = split * kChunk + w * (kChunk / kDW), k_hi = min(k_lo + kChunk / kDW, n_pos);
+    const int k_lo = split * kChunk + w * (kChunk / kDW), k_hi = min(k_lo + kChunk / kDW, ks.n_idx);
     constexpr float kLazy = 8.0f;
     float m = -INFINITY, l = 0.0f;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> fo[kD / 16];
@@ -662,9 +697,10 @@ __global__ void __launch_bounds__(kDW * 32) gqa_attn_tc_kernel(const float* __re
         for (int i = lane; i < kDT * (kD / 4); i += 32) {
             const int r = i / (kD / 4), d = (i % (kD / 4)) * 4;
             float a = 0.f, b = 0.f, c = 0.f, e = 0.f, va = 0.f, vb = 0.f, vc = 0.f, ve = 0.f;
-            if (k0 + r < k_hi) {
-                K.load4(k0 + r, kvh, d, a, b, c, e);
-                V.load4(k0 + r, kvh, d, va, vb, vc, ve);
+            if (k0 + r < k_hi && ks.ok(k0 + r)) {
+                const long long pos = ks.pos(k0 + r);
+                K.load4(pos, kvh, d, a, b, c, e);
+                V.load4(pos, kvh, d, va, vb, vc, ve);
             }
             __half2* kr = (__half2*) (Kw + r * kLdQ + d);
             __half2* vr = (__half2*) (Vw + r * kLdQ + d);
@@ -690,7 +726,7 @@ __global__ void __launch_bounds__(kDW * 32) gqa_attn_tc_kernel(const float* __re
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             const int c = half_i * 8 + j;
-            sv[j] = row_ok && k0 + c < k_hi ? Sw[ri * kDLdS + c] : -INFINITY;
+            sv[j] = row_ok && k0 + c < k_hi && ks.ok(k0 + c) ? Sw[ri * kDLdS + c] : -INFINITY;
             mt = fmaxf(mt, sv[j]);
         }
         mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, 1));
@@ -765,6 +801,198 @@ __global__ void __launch_bounds__(kDW * 32) gqa_attn_tc_kernel(const float* __re
 }
 #endif
 
+// ---- KV streaming (glm_fast.hpp GqaStream)
+
+// a page's summary: grid (pages, n_kv), kD threads (thread = dimension): the min and max of the K rows of positions
+// [page * kGqaPage, min(page end, pos_hi)) from src (a plain view)
+__global__ void __launch_bounds__(kD) gqa_summ_kernel(GqaKv src, GqaStream st, int page_lo, int pos_hi) {
+    __shared__ float scb[2][64];
+    const int page = page_lo + blockIdx.x, kvh = blockIdx.y, t = threadIdx.x;
+    load_cbs(scb, src.kk, src.vk, t, kD);
+    __syncthreads();
+    const Rows K = k_rows(src, scb[0]);
+    const int lo = page * kGqaPage, hi = min(lo + kGqaPage, pos_hi);
+    float mn = INFINITY, mx = -INFINITY;
+    for (int pos = lo; pos < hi; ++pos) {
+        float x[4];
+        K.load4(pos, kvh, t & ~3, x[0], x[1], x[2], x[3]);
+        mn = fminf(mn, x[t & 3]);
+        mx = fmaxf(mx, x[t & 3]);
+    }
+    __half* o = (__half*) st.summ + ((size_t) page * src.n_kv + kvh) * 2 * kD;
+    o[t] = __float2half(hi > lo ? mn : 0.0f);
+    o[kD + t] = __float2half(hi > lo ? mx : 0.0f);
+}
+
+// every query head's bound per page: grid (n_kv, pages / 128), 128 threads (thread = page) -> ub[head][page]
+__global__ void __launch_bounds__(128) gqa_sel_ub_kernel(const float* __restrict__ q, int n_head, int n_kv,
+                                                         GqaStream st, int np, float* __restrict__ ub) {
+    __shared__ float sq[kMaxGroup][kD];
+    const int kvh = blockIdx.x, G = n_head / n_kv, t = threadIdx.x, page = blockIdx.y * 128 + t;
+    for (int i = t; i < G * kD; i += 128) sq[i / kD][i % kD] = q[(size_t) kvh * G * kD + i];
+    __syncthreads();
+    if (page >= np) return;
+    const __half2* sm = (const __half2*) ((const __half*) st.summ + ((size_t) page * n_kv + kvh) * 2 * kD);
+    float acc[kMaxGroup];
+#pragma unroll
+    for (int g = 0; g < kMaxGroup; ++g) acc[g] = 0.0f;
+    for (int d2 = 0; d2 < kD / 2; ++d2) {
+        const float2 mn = __half22float2(sm[d2]), mx = __half22float2(sm[kD / 2 + d2]);
+#pragma unroll
+        for (int g = 0; g < kMaxGroup; ++g) {
+            if (g >= G) break;
+            const float q0 = sq[g][2 * d2], q1 = sq[g][2 * d2 + 1];
+            acc[g] += fmaxf(q0 * mn.x, q0 * mx.x) + fmaxf(q1 * mn.y, q1 * mx.y);
+        }
+    }
+#pragma unroll
+    for (int g = 0; g < kMaxGroup; ++g)
+        if (g < G) ub[(size_t) (kvh * G + g) * np + page] = acc[g];
+}
+
+// one block of 1024: a page's score = the max over the heads of (its bound - the head's best bound); the first sink and
+// the last recent pages first, then the budget best (a bisection for the threshold) -> sel / nsel
+constexpr int kSelT = 1024;
+__global__ void __launch_bounds__(kSelT) gqa_sel_pick_kernel(const float* __restrict__ ub, int n_head, int np,
+                                                             int budget, int sink, int recent, int* __restrict__ sel,
+                                                             int* __restrict__ nsel, int max_sel) {
+    extern __shared__ float sc[];   // [np]
+    __shared__ float hm[64];
+    __shared__ int cnt;
+    const int t = threadIdx.x, lane = t & 31, w = t >> 5;
+    const int total = min(np, sink + recent + budget);
+    if (total >= np) {   // every page
+        for (int p = t; p < np; p += kSelT) sel[p] = p;
+        if (t == 0) *nsel = np;
+        return;
+    }
+    for (int h = w; h < n_head; h += kSelT / 32) {
+        float m = -INFINITY;
+        for (int p = lane; p < np; p += 32) m = fmaxf(m, ub[(size_t) h * np + p]);
+        m = wmax(m);
+        if (lane == 0) hm[h & 63] = m;
+    }
+    __syncthreads();
+    float lo = 0.0f;
+    for (int p = t; p < np; p += kSelT) {
+        float v;
+        if (p < sink || p >= np - recent) {
+            v = 3.0e38f;
+        } else {
+            v = -INFINITY;
+            for (int h = 0; h < n_head; ++h) v = fmaxf(v, ub[(size_t) h * np + p] - hm[h & 63]);
+        }
+        sc[p] = v;
+        lo = fminf(lo, v);
+    }
+    // the threshold: the largest x with count(score >= x) >= total (scores of unforced pages are <= 0)
+    __shared__ float red[kSelT / 32];
+    lo = wmax(-lo);
+    if (lane == 0) red[w] = lo;
+    __syncthreads();
+    if (t < 32) {
+        float v = t < kSelT / 32 ? red[t] : 0.0f;
+        v = wmax(v);
+        if (t == 0) red[0] = v;
+    }
+    __syncthreads();
+    float a = -red[0] - 1.0f, b = 0.0f;   // count(>= a) = np >= total; count(>= b) may be < total
+    for (int it = 0; it < 40; ++it) {
+        const float mid = 0.5f * (a + b);
+        int c = 0;
+        for (int p = t; p < np; p += kSelT) c += sc[p] >= mid;
+        if (t == 0) cnt = 0;
+        __syncthreads();
+        atomicAdd(&cnt, c);
+        __syncthreads();
+        if (cnt >= total) a = mid; else b = mid;
+        __syncthreads();
+    }
+    if (t == 0) cnt = 0;
+    __syncthreads();
+    for (int p = t; p < np; p += kSelT)
+        if (sc[p] >= a) {
+            const int k = atomicAdd(&cnt, 1);
+            if (k < max_sel) sel[k] = p;
+        }
+    __syncthreads();
+    if (t == 0) *nsel = min(cnt, max_sel);
+}
+
+// one block of 1024: the selected pages already cached are marked used by this step (and referenced); the others are
+// claimed CLOCK's victims (never a slot this step uses) -> miss / mslot / nmiss for the copy below
+__global__ void __launch_bounds__(1024) gqa_resolve_kernel(GqaStream st, GqaSelBufs b) {
+    __shared__ int s_ep, s_nm;
+    const int t = threadIdx.x;
+    if (t == 0) {
+        s_ep = ++st.ctl[1];
+        s_nm = 0;
+    }
+    __syncthreads();
+    const int ep = s_ep, ns = *b.nsel;
+    for (int i = t; i < ns; i += 1024) {
+        const int p = b.sel[i], sl = st.ptab[p];
+        if (sl >= 0) {
+            st.sepoch[sl] = ep;
+            st.sref[sl] = 1;
+        } else {
+            b.miss[atomicAdd(&s_nm, 1)] = p;
+        }
+    }
+    __syncthreads();
+    if (t != 0) return;
+    int hand = st.ctl[0];
+    for (int k = 0; k < s_nm; ++k) {
+        int sl = -1;
+        for (int step = 0; step < 4 * st.R; ++step) {
+            const int c = hand;
+            hand = hand + 1 == st.R ? 0 : hand + 1;
+            if (st.sepoch[c] == ep) continue;
+            if (st.sref[c]) {
+                st.sref[c] = 0;
+                continue;
+            }
+            sl = c;
+            break;
+        }
+        if (sl < 0) {   // (cannot happen: R exceeds the largest selection)
+            *b.nmiss = k;
+            st.ctl[0] = hand;
+            return;
+        }
+        const int old = st.spage[sl];
+        if (old >= 0) st.ptab[old] = -1;
+        const int p = b.miss[k];
+        st.spage[sl] = p;
+        st.ptab[p] = sl;
+        st.sepoch[sl] = ep;
+        st.sref[sl] = 1;
+        b.mslot[k] = sl;
+    }
+    st.ctl[0] = hand;
+    *b.nmiss = s_nm;
+}
+
+// grid max_sel, 256 threads: block k copies miss k's page (kGqaPage records of slice bytes) from host memory
+__global__ void __launch_bounds__(256) gqa_page_copy_kernel(GqaStream st, GqaSelBufs b, int slice) {
+    const int k = blockIdx.x;
+    if (k >= *b.nmiss) return;
+    const size_t bytes = (size_t) kGqaPage * slice;
+    const uint4* src = (const uint4*) (st.host + (size_t) b.miss[k] * bytes);
+    uint4* dst = (uint4*) (st.slots + (size_t) b.mslot[k] * bytes);
+    for (size_t i = threadIdx.x; i < bytes / 16; i += 256) dst[i] = src[i];
+}
+
+__global__ void gqa_invalidate_kernel(GqaStream st, int page_lo, int page_hi) {
+    const int p = page_lo + blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= page_hi) return;
+    const int sl = st.ptab[p];
+    if (sl >= 0) {
+        st.spage[sl] = -1;
+        st.ptab[p] = -1;
+    }
+}
+
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) std::fprintf(stderr, "glm_gqa %s: %s\n", what, cudaGetErrorString(e));
@@ -828,7 +1056,9 @@ void gqa_prep(float* q, const float* k, const float* v, int T, int qld, int kld,
 bool gqa_attn(const float* q, const GqaKv& kv, int n_pos, int n_head, float* scratch, void* out_q8_1,
               cudaStream_t s) {
     if (n_head % kv.n_kv != 0 || n_head / kv.n_kv > kMaxGroup || n_pos < 1) return false;
-    const int n_split = (n_pos + kChunk - 1) / kChunk;
+    // (a streamed view: the splits of its largest selection - those past the step's own selection are empty)
+    const int n_keys = kv.sel != nullptr ? kv.max_sel * kGqaPage : n_pos;
+    const int n_split = (n_keys + kChunk - 1) / kChunk;
     float* part = scratch;
     float* out = scratch + (size_t) n_head * n_split * (kD + 2);
 #if !defined(STRATA_USE_HIP)
@@ -841,7 +1071,7 @@ bool gqa_attn(const float* q, const GqaKv& kv, int n_pos, int n_head, float* scr
         return major >= 7 && !(v != nullptr && v[0] == '0');
     }();
     // (below 128 positions the warp kernel is faster: 6 against 10 us a layer at 1 position, 21 against 31 at 37)
-    if (tc && n_pos >= 128)
+    if (tc && std::min(n_keys, n_pos) >= 128)
         gqa_attn_tc_kernel<<<dim3(kv.n_kv, n_split), kDW * 32, 0, s>>>(q, kv, n_pos, n_head, 1.0f / sqrtf((float) kD), part);
     else
 #endif
@@ -886,6 +1116,46 @@ bool gqa_attn_rows(const float* q, int qld, const GqaKv& kv, int p0, int T, int 
         check("gqa_unrotate_rows");
     }
     return true;
+}
+
+void gqa_stream_summarize(const GqaKv& src, const GqaStream& st, int pos_lo, int pos_hi, cudaStream_t s) {
+    if (pos_hi <= pos_lo) return;
+    const int p0 = pos_lo / kGqaPage, p1 = (pos_hi + kGqaPage - 1) / kGqaPage;
+    GqaKv v = src;
+    v.ptab = nullptr;
+    v.sel = nullptr;
+    gqa_summ_kernel<<<dim3(p1 - p0, src.n_kv), kD, 0, s>>>(v, st, p0, pos_hi);
+    check("gqa_stream_summarize");
+}
+
+void gqa_stream_select(const float* q, int n_head, int n_kv, const GqaStream& st, int n_pos, int budget_pages,
+                       int sink_pages, int recent_pages, const GqaSelBufs& b, cudaStream_t s) {
+    const int np = (n_pos + kGqaPage - 1) / kGqaPage;
+    if (np > sink_pages + recent_pages + budget_pages)
+        gqa_sel_ub_kernel<<<dim3(n_kv, (np + 127) / 128), 128, 0, s>>>(q, n_head, n_kv, st, np, b.ub);
+    gqa_sel_pick_kernel<<<1, kSelT, (size_t) np * sizeof(float), s>>>(b.ub, n_head, np, budget_pages, sink_pages,
+                                                                     recent_pages, b.sel, b.nsel, b.max_sel);
+    check("gqa_stream_select");
+}
+
+void gqa_stream_resolve(const GqaStream& st, int slice, const GqaSelBufs& b, cudaStream_t s) {
+    gqa_resolve_kernel<<<1, 1024, 0, s>>>(st, b);
+    gqa_page_copy_kernel<<<b.max_sel, 256, 0, s>>>(st, b, slice);
+    check("gqa_stream_resolve");
+}
+
+void gqa_stream_invalidate(const GqaStream& st, int page_lo, int page_hi, cudaStream_t s) {
+    if (page_hi <= page_lo) return;
+    gqa_invalidate_kernel<<<(page_hi - page_lo + 255) / 256, 256, 0, s>>>(st, page_lo, page_hi);
+    check("gqa_stream_invalidate");
+}
+
+void gqa_stream_reset(const GqaStream& st, cudaStream_t s) {
+    cudaMemsetAsync(st.ptab, 0xff, (size_t) st.max_pages * sizeof(int), s);
+    cudaMemsetAsync(st.spage, 0xff, (size_t) st.R * sizeof(int), s);
+    cudaMemsetAsync(st.sepoch, 0, (size_t) st.R * sizeof(int), s);
+    cudaMemsetAsync(st.sref, 0, (size_t) st.R * sizeof(int), s);
+    cudaMemsetAsync(st.ctl, 0, 2 * sizeof(int), s);
 }
 
 }  // namespace strata::kernels::glmf

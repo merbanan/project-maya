@@ -16,6 +16,7 @@
 // The DSA caches are append-only (latent column per token; a pool's key when its last member
 // lands), so a batched call is literally the same per-token steps as single-token calls - which
 // is what glm_model_test's batched-vs-streamed equivalence pins.
+#include "glm_kv_stream.hpp"
 #include "glm_fast_state.hpp"
 
 #include "strata/kernels/glm_dsa.hpp"
@@ -795,6 +796,7 @@ Glm5Model::~Glm5Model() {
     if (mtp_arena_) cudaFree(mtp_arena_);
     kv_stream_free(kv_);
     if (state_) cudaFree(state_);
+    kv_stream_free();
     if (sc_) cudaFree(sc_);
     if (d_pos_) cudaFree(d_pos_);
     if (pool_) cudaFree(pool_);
@@ -3542,6 +3544,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     kv_loff_.assign((size_t) g_.n_layers + 1, 0);
     kv_b_ = nullptr;
     kv_b_bytes_ = 0;
+    int64_t kv_stream_res = 0;   // STRATA_GLM_KV_STREAM: the positions a layer keeps cached in VRAM (0: no streaming)
     if (g_.gqa()) {
         // hy_v3's K / V records: per position every layer's rows (the draft block's first), region a in this arena for
         // positions [0, p0), region b - positions [p0, max_ctx) - in the expert pool's lendable tail (fast_setup), lent to
@@ -3558,8 +3561,13 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         const char* from = getenv("STRATA_GLM_KV_LEND_FROM");
         const bool seqs = getenv("STRATA_GLM_SEQS") != nullptr && std::atoi(getenv("STRATA_GLM_SEQS")) > 1;
         const int64_t want = from != nullptr ? std::max<int64_t>(0, std::atoll(from)) : 4096;
-        kv_p0_ = fast_mode_ && !seqs && !(lend != nullptr && lend[0] == '0') && want < max_ctx ? want : max_ctx;
-        kv_b_bytes_ = (size_t) ((max_ctx - kv_p0_) * kv_rec_ + 255) / 256 * 256;
+        if (const char* sv = getenv("STRATA_GLM_KV_STREAM"); sv != nullptr && fast_mode_ && !seqs)
+            kv_stream_res = std::max<int64_t>(0, std::atoll(sv));
+        if (kv_stream_res >= max_ctx) kv_stream_res = 0;   // (the whole context fits the cache: no streaming)
+        // (streamed: nothing here - the records are in host memory)
+        kv_p0_ = kv_stream_res > 0 ? 0
+               : fast_mode_ && !seqs && !(lend != nullptr && lend[0] == '0') && want < max_ctx ? want : max_ctx;
+        kv_b_bytes_ = kv_stream_res > 0 ? 0 : (size_t) ((max_ctx - kv_p0_) * kv_rec_ + 255) / 256 * 256;
         for (auto& v : gqa_kv_) v = floats;
         if (mtp_il_ < 0) gqa_kv_[(size_t) g_.n_layers] = -1;
         floats += (kv_p0_ * kv_rec_ + 255) / 256 * 64;
@@ -3604,6 +3612,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     { cudaError_t e_ = cudaMalloc(&state_, state_bytes_); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
     if (kv_cells > 0 && !kv_stream_setup(kv_cells, err)) return false;
     if (fast_mode_ && !seq_alloc_arenas(err)) return false;   // STRATA_GLM_SEQS: before the expert pool takes the rest
+    if (kv_stream_res > 0 && !kv_stream_init(kv_stream_res, err)) return false;   // (before the pool, too)
 
     const int64_t ff_max = std::max<long long>({g_.n_ff_dense, (int64_t) g_.n_ff_exp * g_.n_shared});
     int64_t s = 0;
