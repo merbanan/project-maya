@@ -1608,7 +1608,12 @@ class Service:
                 raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
                                  f"({self.engine.max_context}); requests are never truncated")
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
-        return ids, kwargs.get("enable_thinking", True) is not False, max_new
+        thinking = kwargs.get("enable_thinking", True) is not False
+        if getattr(self.template, "hy3", False):
+            # Hy3: thinking is on exactly when the prompt leaves the think block open (its template closes it for
+            # no_think, its default - also when the client names no level)
+            thinking = prompt.endswith("<think:opensource>")
+        return ids, thinking, max_new
 
     def count_tokens(self, req: dict) -> dict:
         """POST /api/tokens: how many tokens this chat request's prompt takes - the same template, thinking level,

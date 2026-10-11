@@ -192,6 +192,21 @@ DsaBufs carve_dsa(Carve& c, size_t T, const Glm5Geometry& g, int max_pools) {
     return b;
 }
 
+// hy_v3's attention for a sub-batch: q (n_head x 128), k and v (n_kv x 128) rows, the FP16 output rows
+struct GqaBufs {
+    float *q, *k, *v;
+    uint16_t* out16;
+};
+GqaBufs carve_gqa(Carve& c, size_t T, const Glm5Geometry& g) {
+    GqaBufs b{};
+    const size_t QD = (size_t) g.n_head * g.head_dim, KD = (size_t) g.n_kv * g.head_dim;
+    b.q = c.take<float>(T * QD);
+    b.k = c.take<float>(T * KD);
+    b.v = c.take<float>(T * KD);
+    b.out16 = c.take<uint16_t>(T * QD);
+    return b;
+}
+
 struct DenseBufs {
     float *dg, *du;
     uint16_t* dh16;
@@ -271,6 +286,7 @@ int mixer_sub(size_t T, const Glm5Geometry& g, bool kda, bool dsa, bool dense, b
         if (kda) { Carve k; carve_kda(k, (size_t) t2, g); need = std::max(need, k.off); }
         if (dsa) { Carve d; carve_dsa(d, (size_t) t2, g, max_pools); need = std::max(need, d.off); }
         if (dense) { Carve d; carve_dense(d, (size_t) t2, g); need = std::max(need, d.off); }
+        if (g.gqa()) { Carve q; carve_gqa(q, (size_t) t2, g); need = std::max(need, q.off); }
         if (need > room) break;
         ts = t2;
     }
@@ -498,10 +514,6 @@ static constexpr size_t kPfWorkspace = (size_t) 16 << 20;   // cuBLAS
 bool Glm5Model::prefill_setup(std::string& err) {
     (void) err;
     if (getenv("STRATA_GLM_NO_PREFILL") != nullptr) return true;
-    if (g_.gqa()) {
-        std::fprintf(stderr, "glm prefill: hy_v3 has no batched prompt path yet - the prompt runs token by token\n");
-        return true;
-    }
     if (prefill_mode() != "auto" && std::atoll(prefill_mode().c_str()) <= 0) {
         std::fprintf(stderr, "glm prefill: --prefill %s: the prompt runs token by token\n", prefill_mode().c_str());
         return true;
@@ -521,7 +533,11 @@ bool Glm5Model::prefill_setup(std::string& err) {
     };
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
-        if (Ly.recr) {
+        if (Ly.gqa) {
+            deq_ok(Ly.q, "attn_q", il);
+            deq_ok(Ly.k, "attn_k", il);
+            deq_ok(Ly.v, "attn_v", il);
+        } else if (Ly.recr) {
             has_kda = true;
             deq_ok(Ly.q, "attn_q", il);
             deq_ok(Ly.k, "attn_k", il);
@@ -848,9 +864,11 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     if (has_kda) { Carve k; carve_kda(k, ts, g); uni = std::max(uni, k.off); }
     if (has_dsa) { Carve d; carve_dsa(d, ts, g, max_pools); uni = std::max(uni, d.off); }
     if (has_dense) { Carve d; carve_dense(d, ts, g); uni = std::max(uni, d.off); }
+    if (g.gqa()) { Carve q; carve_gqa(q, ts, g); uni = std::max(uni, q.off); }
     if (has_moe) { Carve m; carve_moe(m, T, (size_t) (sub_env > 0 ? sub_env : kSub), g); uni = std::max(uni, m.off); }
     // the NextN block's cache fill (the last half) carves 4 n_embd + 1.5 n_embd rows of its own
-    if (mtp) uni = std::max(uni, T * (size_t) (6 * g.n_embd + g.kv_lora + 2 * g.idx_key) * 4 + 8 * 256);
+    if (mtp) uni = std::max(uni, T * (size_t) (6 * g.n_embd + (g.gqa() ? 2 * g.n_kv * g.head_dim : g.kv_lora) +
+                                               2 * g.idx_key) * 4 + 8 * 256);
     return {a.off, uni};
 }
 
@@ -1309,6 +1327,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         gb::hc_finish(h, s);
     };
 
+    // hy_v3: R (one stream a row) += block_out, then x / x16 = rms(R) * norm - the plain pre-norm residual
+    const auto res_read = [&](const float* block_out, const float* norm) {
+        if (block_out != nullptr)
+            blas_ck(cublasSaxpy(S->blas, T * E, &one, block_out, 1, S->R, 1), "residual add");
+        gb::rms_rows(S->R, norm, g.norm_eps, T, E, S->x, S->x16, s);
+    };
+
     // GLM_CB_DIR seam dumps of the chunk's LAST row, under the token path's names (debug only, synchronous)
     static const char* cb_dir = getenv("GLM_CB_DIR");
     // A single-device prompt chunk only conditions later tokens; decode computes the last prompt token and its
@@ -1545,7 +1570,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const auto& Ly = F->L[(size_t) il];
         const bool skip_output = tail_skip && il == g.n_layers - 1;
         if (S->trace) cudaEventRecord(S->tr[(size_t) il].start, s);
-        hc_read(il == l0_ ? nullptr : S->ffn, Ly.hc_attn_fn, Ly.hc_attn_scale, Ly.hc_attn_base, Ly.attn_norm);
+        if (Ly.gqa) res_read(il == l0_ ? nullptr : S->ffn, Ly.attn_norm);
+        else hc_read(il == l0_ ? nullptr : S->ffn, Ly.hc_attn_fn, Ly.hc_attn_scale, Ly.hc_attn_base, Ly.attn_norm);
         S->mark("hc", s);
         dump_row("attn_norm-" + std::to_string(il), S->x, E);
 
@@ -1555,7 +1581,25 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             const float* xs = S->x + (size_t) t0 * E;
             const uint16_t* x16 = S->x16 + (size_t) t0 * E;
             float* mixer = S->mixer + (size_t) t0 * E;
-            if (Ly.recr) {
+            if (Ly.gqa) {
+                // hy_v3: q / k / v GEMMs, the norms + rope with every row's K / V into the cache, then each row's causal
+                // attention over the cache (the rows before it in this sub-batch included), the output GEMM
+                Carve c{S->uni};
+                GqaBufs B = carve_gqa(c, (size_t) tn, g);
+                const int QD = g.n_head * g.head_dim, KD = g.n_kv * g.head_dim, pt = (int) (p0 + t0);
+                hgemm_q(Ly.q, QD, E, x16, E, B.q, QD, tn, 0.0f);
+                hgemm_q(Ly.k, KD, E, x16, E, B.k, KD, tn, 0.0f);
+                hgemm_q(Ly.v, KD, E, x16, E, B.v, KD, tn, 0.0f);
+                S->mark("gqa_proj", s);
+                const gf::GqaKv kv = gf::gqa_kv_view(state_ + gqa_kv_[(size_t) il], g.n_kv, max_ctx_, gqa_q8_);
+                gf::gqa_prep(B.q, B.k, B.v, tn, QD, KD, Ly.q_norm, Ly.k_norm, g.norm_eps, pt, g.rope_base, g.n_head, kv, s);
+                if (!gf::gqa_attn_rows(B.q, QD, kv, pt, tn, g.n_head, B.out16, QD, s)) {
+                    err = "glm prefill: gqa attention";
+                    return false;
+                }
+                S->mark("gqa_attn", s);
+                if (!skip_output) hgemm_q(Ly.out, E, QD, B.out16, QD, mixer, E, tn, 0.0f);
+            } else if (Ly.recr) {
                 Carve c{S->uni};
                 KdaBufs B = carve_kda(c, (size_t) tn, g);
                 hgemm_q(Ly.q, DI, E, x16, E, B.proj[0], DI, tn, 0.0f);
@@ -1709,10 +1753,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             }
         }
 
-        S->mark(Ly.recr ? "kda" : "dsa", s);
+        S->mark(Ly.gqa ? "gqa" : Ly.recr ? "kda" : "dsa", s);
         if (skip_output) continue;   // every KDA/DSA cache update above still ran; these output rows feed nothing
         dump_row("mixer-" + std::to_string(il), S->mixer, E);
-        hc_read(S->mixer, Ly.hc_ffn_fn, Ly.hc_ffn_scale, Ly.hc_ffn_base, Ly.ffn_norm);
+        if (Ly.gqa) res_read(S->mixer, Ly.ffn_norm);
+        else hc_read(S->mixer, Ly.hc_ffn_fn, Ly.hc_ffn_scale, Ly.hc_ffn_base, Ly.ffn_norm);
         S->mark("hc", s);
         dump_row("ffn_norm-" + std::to_string(il), S->x, E);
         // the CPU lane's x (this layer's FFN input) goes down now, under the shared expert and the routing - not
@@ -1758,7 +1803,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             hgemm_q(Ly.sh_down, E, FF, M.sh16, FF, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
         }
         S->mark("shexp", s);
-        sgemm_bf16(Ly.router, NE, E, S->x, E, M.logits, NE, T, 1.0f);
+        if (Ly.router32 != nullptr)   // hy_v3: the router in F32
+            blas_ck(cublasSgemm(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, NE, T, E, &one, Ly.router32, E, S->x, E, &zero,
+                                M.logits, NE),
+                    "router");
+        else
+            sgemm_bf16(Ly.router, NE, E, S->x, E, M.logits, NE, T, 1.0f);
         gb::route(M.logits, Ly.router_bias, NE, K, g.w_scale, g.norm_w != 0, T, M.ids, M.rw, s);
         gb::expert_count(M.ids, T * K, NE, M.counts, M.rank, s);
         gb::copy_i32(M.counts, S->h_counts, NE, s);   // (not a copy: the engine may be busy with x, x_down)
@@ -2047,7 +2097,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     mmq::quantize(S->x, M.row_tok + r0 + a, M.Xq, Ly.gu_type, E, E, nrows, s);
                     // the part's bounds are the set's (from a): the activations and the destination are addressed a
                     // rows back so that bound a is the part's first row
-                    float* GU = M.OUTP + (size_t) o * E;   // 2 * n_ff == n_embd: the set's own OUTP rows hold its gate/up
+                    float* GU = M.OUTP + (size_t) o * E;   // 2 * n_ff <= n_embd: the set's own OUTP rows hold its gate/up
                     mmq::Product gu;
                     gu.w = wbase + (size_t) i0 * stride;
                     gu.type = Ly.gu_type;
@@ -2084,8 +2134,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 i0 = i1;
             }
         };
-        if (2 * nff != E) {
-            err = "glm prefill: 2 * n_ff_exp != n_embd (the gate/up rows would not fit the set's output rows)";
+        // (GLM: 2 x 2048 = 4096; Hy3's 2 x 1536 fits with room to spare - packed at 2 * n_ff, the down rows at n_embd)
+        if (2 * nff > E) {
+            err = "glm prefill: 2 * n_ff_exp > n_embd (the gate/up rows would not fit the set's output rows)";
             return false;
         }
         // the disk-only experts (staged last, ascending): their indices in the reader's order - inside the segment
@@ -2441,7 +2492,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     }
     // the last layer's write half: R = post x ffn + comb . R
     if (!tail_skip) {
-        gb::hc_update(S->ffn, S->R, S->post, S->comb, nullptr, T, E, s);
+        if (g.gqa()) blas_ck(cublasSaxpy(S->blas, T * E, &one, S->ffn, 1, S->R, 1), "residual add");
+        else gb::hc_update(S->ffn, S->R, S->post, S->comb, nullptr, T, E, s);
         S->mark("hc", s);
     }
     // ---- the NextN block's caches for these positions (the half that carries it): position p reads h_p and the
@@ -2466,14 +2518,28 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             float* emb = c.take<float>((size_t) Tv * E);
             uint16_t* cat16 = c.take<uint16_t>((size_t) Tv * 2 * E);
             float* hid = c.take<float>((size_t) Tv * E);
-            float* kv = c.take<float>((size_t) Tv * g.kv_lora);
+            float* kv = c.take<float>((size_t) Tv * (g.gqa() ? 2 * g.n_kv * g.head_dim : g.kv_lora));
             float* ik = c.take<float>((size_t) Tv * g.idx_key);
             float* ig = c.take<float>((size_t) Tv * g.idx_key);
             cudaMemcpyAsync(emb, S->emb_h, (size_t) Tv * E * sizeof(float), cudaMemcpyHostToDevice, s);
-            gb::head_rows(S->R, w_.at("output_norm.weight"), g.norm_eps, Tv, E, h, s);
+            if (g.gqa()) gb::rms_rows(S->R, w_.at("output_norm.weight"), g.norm_eps, Tv, E, h, S->x16, s);   // (x16: scratch)
+            else gb::head_rows(S->R, w_.at("output_norm.weight"), g.norm_eps, Tv, E, h, s);
             gb::mtp_in_rows(emb, h, Ly.enorm, Ly.hnorm, g.norm_eps, Tv, E, cat16, s);
             hgemm_q(Ly.eh, E, 2 * E, cat16, 2 * E, hid, E, Tv, 0.0f);
             gb::rms_rows(hid, Ly.attn_norm, g.norm_eps, Tv, E, S->x, S->x16, s);
+            if (g.gqa()) {
+                // hy_v3: the block's K / V for these positions (k / v projections, the k norm + rope) - no queries
+                const int KD = g.n_kv * g.head_dim;
+                float* kk = kv;                              // (Tv x KD each: kv's and ik's room, re-carved)
+                Carve c2{(uint8_t*) kv};
+                kk = c2.take<float>((size_t) Tv * KD);
+                float* vv = c2.take<float>((size_t) Tv * KD);
+                hgemm_q(Ly.k, KD, E, S->x16, E, kk, KD, Tv, 0.0f);
+                hgemm_q(Ly.v, KD, E, S->x16, E, vv, KD, Tv, 0.0f);
+                const gf::GqaKv gkv = gf::gqa_kv_view(state_ + gqa_kv_[(size_t) mtp_il_], g.n_kv, max_ctx_, gqa_q8_);
+                gf::gqa_prep(nullptr, kk, vv, Tv, 0, KD, nullptr, Ly.k_norm, g.norm_eps, (int) p0, g.rope_base, 0, gkv, s);
+                S->mark("mtp_cache", s);
+            } else {   // GLM: the latent and the indexer's key / gate
             hgemm_q(Ly.kv_a, g.kv_lora, E, S->x16, E, kv, g.kv_lora, Tv, 0.0f);
             sgemm_bf16(Ly.idx_k, g.idx_key, E, S->x, E, ik, g.idx_key, Tv, 1.0f);
             sgemm_bf16(Ly.idx_gate, g.idx_key, E, S->x, E, ig, g.idx_key, Tv, 1.0f);
@@ -2511,6 +2577,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                  ik_ring_);
             }
             S->mark("mtp_cache", s);
+            }
         }
     }
     S->collect();
@@ -2661,7 +2728,10 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         }
         // the embedding lands in x (free until the first layer's gates write it) and fans out to the 4 streams
         cudaMemcpyAsync(S->x, S->emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, fast_->cs);
-        gb::embed_rows(S->x, S->R, T, E, fast_->cs);
+        if (g.gqa())   // one residual stream
+            cudaMemcpyAsync(S->R, S->x, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToDevice, fast_->cs);
+        else
+            gb::embed_rows(S->x, S->R, T, E, fast_->cs);
         return true;
     };
     std::vector<Glm5Model*> parts;

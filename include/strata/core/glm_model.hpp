@@ -160,6 +160,7 @@ public:
     /// while others ran continues where it was.  The bytes written, or 0 + err.
     uint64_t slot_save(const std::string& path, std::string& err);
     bool slot_load(const std::string& path, int64_t n_pos, std::string& err);
+    std::vector<std::pair<int64_t, int64_t>> slot_gqa_runs(int64_t n) const;   // hy_v3: the K / V rows of n positions
     /// Runs the engine's sampler on the last forward's logits and returns the picked token id
     /// (-1 + err on failure).  Handles the device bookkeeping: with a split the logits (and the
     /// sampler buffer) live on the tail half's device, where peer reads are not available.
@@ -212,7 +213,8 @@ private:
 
     // per-layer state offsets, in floats into state_ (-1: the layer has no such state)
     std::vector<int64_t> kda_S_, kda_conv_, dsa_lat_, dsa_ik_, dsa_ig_, dsa_pool_;
-    std::vector<int64_t> gqa_kv_;                 // hy_v3: per layer the K then V cache (FP16), -1 none
+    std::vector<int64_t> gqa_kv_;                 // hy_v3: per layer the K then V cache (floats into state_), -1 none
+    bool gqa_q8_ = false;                         // ... INT8 + scales (STRATA_GLM_KV_INT8) instead of FP16
 
 public:
     // ---- per-weight serving slots (strata::core::WSlot below): F32 pointers for the
@@ -425,7 +427,7 @@ public:
     /// returns the block's greedy proposal for p + 2 (-1: no draft block).  Fills the block's caches at p.
     int mtp_draft(int32_t next_tok, std::string& err);
     bool has_mtp() const;
-    bool kv_int8() const { return lat_q8_; }   // the latent cache in INT8 (STRATA_GLM_KV_INT8=1)
+    bool kv_int8() const { return lat_q8_ || gqa_q8_; }   // the KV / latent cache in INT8 (STRATA_GLM_KV_INT8=1)
     /// Images (the vision path): rows of n_embd floats that stand in for the token embeddings at these absolute
     /// positions - the prompt's <|image|> tokens, in order; an empty call clears them.  Read wherever a token is
     /// embedded (the prompt path and the token path); the draft block keeps the token embedding (drafts only).
@@ -482,7 +484,7 @@ public:
         int64_t max_ctx = 0;
         uint64_t bytes = 0;
         int ik_ring = 0;
-        std::vector<int64_t> kda_S, kda_conv, dsa_lat, dsa_ik, dsa_ig, dsa_pool;
+        std::vector<int64_t> kda_S, kda_conv, dsa_lat, dsa_ik, dsa_ig, dsa_pool, gqa_kv;
         float *snap = nullptr, *snap_pool = nullptr, *kda_bak = nullptr;
         int last_tok = -1;
         std::vector<int64_t> img_pos;
