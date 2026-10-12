@@ -120,8 +120,15 @@ struct Rows {
     // values d .. d + 3 of head h's row in the record at bp
     __device__ __forceinline__ void load4_b(const uint8_t* bp, int h, int d, float& x0, float& x1, float& x2,
                                             float& x3) const {
-        const uint8_t* rp = codes(bp, h);
-        const uint8_t* sp = scales(bp, h);
+        load4_cs(codes(bp, h), scales(bp, h), d, x0, x1, x2, x3);
+    }
+    // ... of a row staged in shared memory: its codes, then its scales
+    __device__ __forceinline__ void load4_s(const uint8_t* srow, int d, float& x0, float& x1, float& x2, float& x3) const {
+        load4_cs(srow, srow + cb, d, x0, x1, x2, x3);
+    }
+    // ... from the row's codes rp and scales sp
+    __device__ __forceinline__ void load4_cs(const uint8_t* rp, const uint8_t* sp, int d, float& x0, float& x1, float& x2,
+                                             float& x3) const {
         if (kind >= kT3) {
             const float sc = *(const float*) sp;
             unsigned c0, c1, c2, c3;
@@ -1106,9 +1113,11 @@ __device__ __forceinline__ void dot_row(const Rows& K, const uint8_t* bp, int h,
         }
     }
 }
-template <int G>
+template <int G, bool STAGE>
 __global__ void __launch_bounds__(kST) gqa_attn_wide_kernel(const float* __restrict__ q, GqaKv kv, int n_pos,
-                                                            float scale, int chunk, float* __restrict__ part) {
+                                                            float scale, int chunk, int vstride,
+                                                            float* __restrict__ part) {
+    extern __shared__ __align__(16) uint8_t sv[];   // vstride > 0: the tile's V rows (codes, scales) a key a row
     constexpr int NW = kST / 32, HW = (G + NW - 1) / NW;   // warps, heads a warp
     __shared__ __align__(16) float sq[G][kD];
     __shared__ float sp[G][kST + 1];
@@ -1176,7 +1185,41 @@ __global__ void __launch_bounds__(kST) gqa_attn_wide_kernel(const float* __restr
                 acc[g][0] *= c; acc[g][1] *= c; acc[g][2] *= c; acc[g][3] *= c;
             }
             const int d4 = 4 * lane;
-            // (a no-test loop over the valid prefix where the view is not streamed: 143 registers, 25% slower)
+            if (STAGE) {
+                // the tile's V rows staged: thread t copies key t's codes and scales (a few 16-byte loads each, all
+                // the block's in flight at once - a lane's 2-8 bytes a key, one key after another, was latency bound);
+                // a masked key's row is zeros (its probability is 0, its row may be stale)
+                {
+                    const int i = k0 + t;
+                    uint4* dst = (uint4*) (sv + (size_t) t * vstride);
+                    const int nc = V.cb / 16;
+                    if (i < k_hi && ks.ok(i)) {
+                        const uint8_t* bp = V.base(ks.pos(i));
+                        const uint4* src = (const uint4*) V.codes(bp, kvh);
+                        for (int c = 0; c < nc; ++c) dst[c] = src[c];
+                        const uint8_t* ss = V.scales(bp, kvh);
+                        if (V.sb == 8) *(uint2*) (sv + (size_t) t * vstride + V.cb) = *(const uint2*) ss;
+                        else *(unsigned*) (sv + (size_t) t * vstride + V.cb) = *(const unsigned*) ss;
+                    } else {
+                        for (int c = 0; c < nc; ++c) dst[c] = make_uint4(0, 0, 0, 0);
+                        *(uint2*) (sv + (size_t) t * vstride + V.cb) = make_uint2(0, 0);
+                    }
+                }
+                __syncthreads();
+#pragma unroll 8
+                for (int x = 0; x < 32; ++x) {
+                    const int kk = w * 32 + x;
+                    float v0, v1, v2, v3;
+                    V.load4_s(sv + (size_t) kk * vstride, d4, v0, v1, v2, v3);
+#pragma unroll
+                    for (int g = 0; g < G; ++g) {
+                        const float pv = sp[g][kk];
+                        acc[g][0] += pv * v0; acc[g][1] += pv * v1; acc[g][2] += pv * v2; acc[g][3] += pv * v3;
+                    }
+                }
+            } else
+            // (FP16 V, whose rows are too large to stage: a lane its 4 values, a key at a time.  A no-test loop over the
+            // valid prefix where the view is not streamed: 143 registers, 25% slower)
 #pragma unroll 8
             for (int x = 0; x < 32; ++x) {
                 const int kk = w * 32 + x, i = k0 + kk;
@@ -1243,6 +1286,12 @@ void mode_kinds(int mode, int& kk, int& vk) {
 const char* const kModeNames[] = {"fp16", "int8", "k8v4", "tq4", "tq6v4", "tq4v3", "tq6v3"};
 }  // namespace
 
+// a view's V row: its code and scale bytes
+void mode_bytes(const GqaKv& kv, int& cb, int& sb) {
+    cb = code_bytes(kv.vk);
+    sb = scale_bytes(kv.vk);
+}
+
 const char* gqa_kv_mode_name(int mode) { return mode >= 0 && mode <= kGqaTq6V3 ? kModeNames[mode] : "?"; }
 
 int gqa_kv_mode_parse(const char* s) {
@@ -1304,7 +1353,16 @@ bool gqa_attn(const float* q, const GqaKv& kv, int n_pos, int n_head, float* scr
         const int n_split = (n_keys + chunk - 1) / chunk;
         float* part = scratch;
         float* out = scratch + (size_t) n_head * n_split * (kD + 2);
-        gqa_attn_wide_kernel<8><<<dim3(kv.n_kv, n_split), kST, 0, s>>>(q, kv, n_pos, 1.0f / sqrtf((float) kD), chunk, part);
+        // (the V rows staged, codes then scales, 16-byte rows; FP16 V reads its rows directly)
+        int vk_cb = 0, vk_sb = 0;
+        mode_bytes(kv, vk_cb, vk_sb);
+        const int vstride = vk_cb >= 256 ? 0 : (vk_cb + std::max(vk_sb, 8) + 15) / 16 * 16;
+        if (vstride > 0)
+            gqa_attn_wide_kernel<8, true><<<dim3(kv.n_kv, n_split), kST, (size_t) kST * vstride, s>>>(
+                q, kv, n_pos, 1.0f / sqrtf((float) kD), chunk, vstride, part);
+        else
+            gqa_attn_wide_kernel<8, false><<<dim3(kv.n_kv, n_split), kST, 0, s>>>(
+                q, kv, n_pos, 1.0f / sqrtf((float) kD), chunk, 0, part);
         check("gqa_attn_wide");
         gqa_combine_kernel<<<n_head, kD, 0, s>>>(part, n_split, out, v_rot(kv));
         check("gqa_combine");
