@@ -402,10 +402,14 @@ __global__ void __launch_bounds__(256) gqa_attn_kernel(const float* __restrict__
     }
 }
 
-__global__ void __launch_bounds__(kD) gqa_combine_kernel(const float* __restrict__ part, int n_split,
-                                                         float* __restrict__ out, int vrot) {
-    __shared__ float so[kD];
-    const int h = blockIdx.x, t = threadIdx.x;
+struct Q8_1 {   // ggml's block_q8_1: the scale and the sum (FP16), 32 int8
+    __half2 ds;
+    int8_t qs[32];
+};
+// head h's output from its n_split parts (merged over the splits' maxima), by kD threads: out (F32) and, when q8 is
+// given, its q8_1 (quantize_q8_1's arithmetic: a warp a block of 32).  so: kD floats of shared memory
+__device__ __forceinline__ void combine_head(const float* __restrict__ part, int n_split, int h, int t, int vrot,
+                                             float* so, float* __restrict__ out, Q8_1* __restrict__ q8) {
     const float* ph = part + (size_t) h * n_split * (kD + 2);
     float M = -INFINITY;
     for (int s = 0; s < n_split; ++s) M = fmaxf(M, ph[(size_t) s * (kD + 2) + kD]);
@@ -416,13 +420,29 @@ __global__ void __launch_bounds__(kD) gqa_combine_kernel(const float* __restrict
         acc += f * ps[t];
         den += f * ps[kD + 1];
     }
+    float v = acc / den;
     if (vrot) {   // the output was made of rotated V rows - rotate it back (H, or D H)
-        so[t] = acc / den;
+        so[t] = v;
         fwht128(so, t);
-        out[(size_t) h * kD + t] = vrot == 2 ? so[t] * rsign(t) : so[t];
-        return;
+        v = vrot == 2 ? so[t] * rsign(t) : so[t];
+        __syncthreads();   // (so: the next head's)
     }
-    out[(size_t) h * kD + t] = acc / den;
+    out[(size_t) h * kD + t] = v;
+    if (q8 != nullptr) {
+        const int lane = t & 31;
+        const float amax = wmax(fabsf(v)), sum = wsum(v);
+        const float d = fminf(amax / 127.0f, 65504.0f);
+        Q8_1* dst = q8 + (size_t) h * (kD / 32) + t / 32;
+        dst->qs[lane] = amax == 0.0f ? 0 : (int8_t) fmaxf(-127.0f, fminf(127.0f, roundf(v / d)));
+        if (lane == 0) dst->ds = make_half2(d, fmaxf(-65504.0f, fminf(65504.0f, sum)));
+    }
+}
+
+// one head a block: its output merged from the splits' parts, F32 and its q8_1 (the out-projection's input)
+__global__ void __launch_bounds__(kD) gqa_combine_kernel(const float* __restrict__ part, int n_split,
+                                                         float* __restrict__ out, Q8_1* __restrict__ q8, int vrot) {
+    __shared__ float so[kD];
+    combine_head(part, n_split, blockIdx.x, threadIdx.x, vrot, so, out, q8);
 }
 
 // K8V4, the prompt path: each FP16 output row (T rows of n_head heads, old halves apart) rotated back by H
@@ -1043,8 +1063,10 @@ __global__ void gqa_invalidate_kernel(GqaStream st, int page_lo, int page_hi) {
 constexpr int kST = 128;
 // q (G heads, shared memory) . head h's K row in the record at bp -> sc[G], the row read in 16-byte loads and decoded in
 // registers (a thread a key: dims at a time from one load, nothing for L1 to keep between them)
-template <int G>
-__device__ __forceinline__ void dot_row(const Rows& K, const uint8_t* bp, int h, const float (*sq)[kD], float* sc) {
+// - TPK threads a key: this one's part (0 .. TPK - 1) of the dims, its partial sums
+template <int G, int TPK>
+__device__ __forceinline__ void dot_row(const Rows& K, const uint8_t* bp, int h, const float (*sq)[kD], float* sc,
+                                        int part) {
     const uint8_t* cp = K.codes(bp, h);
     const uint8_t* spp = K.scales(bp, h);
     const auto fma8 = [&](int d, const float* x) {
@@ -1057,7 +1079,7 @@ __device__ __forceinline__ void dot_row(const Rows& K, const uint8_t* bp, int h,
     float x[8];
     if (K.kind == kF16) {
 #pragma unroll 4
-        for (int c = 0; c < kD / 8; ++c) {
+        for (int c = part * (kD / 8 / TPK); c < (part + 1) * (kD / 8 / TPK); ++c) {
             const uint4 u = ((const uint4*) cp)[c];
             const __half2* hh = (const __half2*) &u;
 #pragma unroll
@@ -1072,7 +1094,7 @@ __device__ __forceinline__ void dot_row(const Rows& K, const uint8_t* bp, int h,
         const uint2 s4 = *(const uint2*) spp;   // (4 FP16 scales, one a 32)
         const __half* hs = (const __half*) &s4;
 #pragma unroll
-        for (int c = 0; c < kD / 16; ++c) {
+        for (int c = part * (kD / 16 / TPK); c < (part + 1) * (kD / 16 / TPK); ++c) {
             const uint4 u = ((const uint4*) cp)[c];
             const float scb = __half2float(hs[c / 2]);
             const int8_t* qb = (const int8_t*) &u;
@@ -1086,7 +1108,7 @@ __device__ __forceinline__ void dot_row(const Rows& K, const uint8_t* bp, int h,
     } else if (K.kind == kT4 || K.kind == kT6) {
         const float rs = *(const float*) spp;
 #pragma unroll
-        for (int c = 0; c < kD / 32; ++c) {
+        for (int c = part * (kD / 32 / TPK); c < (part + 1) * (kD / 32 / TPK); ++c) {
             const uint4 lo = ((const uint4*) cp)[c];   // 32 nibbles: dims 32 c ..
             uint2 hi = make_uint2(0, 0);
             if (K.kind == kT6) hi = ((const uint2*) (cp + kD / 2))[c];   // their high 2 bits
@@ -1103,7 +1125,7 @@ __device__ __forceinline__ void dot_row(const Rows& K, const uint8_t* bp, int h,
         for (int g = 0; g < G; ++g) sc[g] *= rs;
     } else {   // (3-bit and 4-bit linear K: no packing of their own here)
 #pragma unroll 4
-        for (int d = 0; d < kD; d += 4) {
+        for (int d = part * (kD / TPK); d < (part + 1) * (kD / TPK); d += 4) {
             K.load4_b(bp, h, d, x[0], x[1], x[2], x[3]);
 #pragma unroll
             for (int g = 0; g < G; ++g) {
@@ -1113,14 +1135,16 @@ __device__ __forceinline__ void dot_row(const Rows& K, const uint8_t* bp, int h,
         }
     }
 }
-template <int G, bool STAGE>
+template <int G, int TK, bool STAGE>
 __global__ void __launch_bounds__(kST) gqa_attn_wide_kernel(const float* __restrict__ q, GqaKv kv, int n_pos,
                                                             float scale, int chunk, int vstride,
                                                             float* __restrict__ part) {
     extern __shared__ __align__(16) uint8_t sv[];   // vstride > 0: the tile's V rows (codes, scales) a key a row
     constexpr int NW = kST / 32, HW = (G + NW - 1) / NW;   // warps, heads a warp
+    constexpr int TPK = kST / TK, KW = TK / NW;            // threads a key (phase 1), keys a warp (phase 3)
+    constexpr int SP = TK + 1, SPN = G * SP > G * kD ? G * SP : G * kD;
     __shared__ __align__(16) float sq[G][kD];
-    __shared__ float sp[G][kST + 1];
+    __shared__ float spm[SPN];   // the tile's scores / probabilities [G][TK + 1]; at the end the warps' sum [G][kD]
     __shared__ float scorr[G], smx[G], sls[G];
     __shared__ float scb[2][64];
     const int kvh = blockIdx.x, split = blockIdx.y, t = threadIdx.x, lane = t & 31, w = t >> 5;
@@ -1140,36 +1164,58 @@ __global__ void __launch_bounds__(kST) gqa_attn_wide_kernel(const float* __restr
     float acc[G][4];
 #pragma unroll
     for (int g = 0; g < G; ++g) acc[g][0] = acc[g][1] = acc[g][2] = acc[g][3] = 0.0f;
-    for (int k0 = k_lo; k0 < k_hi; k0 += kST) {
-        {   // (1) key k0 + t
-            const int i = k0 + t;
+    for (int k0 = k_lo; k0 < k_hi; k0 += TK) {
+        {   // (1) key k0 + t / TPK, its part t % TPK of the dims (the parts' sums: neighbouring lanes)
+            const int kt = t / TPK, i = k0 + kt;
             float sc[G];
+            const bool ok = i < k_hi && ks.ok(i);
+#pragma unroll
+            for (int g = 0; g < G; ++g) sc[g] = 0.0f;
+            if (ok) dot_row<G, TPK>(K, K.base(ks.pos(i)), kvh, sq, sc, t % TPK);
+#pragma unroll
+            for (int o = 1; o < TPK; o *= 2)
+#pragma unroll
+                for (int g = 0; g < G; ++g) sc[g] += __shfl_xor_sync(0xffffffffu, sc[g], o);
+            if (t % TPK == 0)
+#pragma unroll
+                for (int g = 0; g < G; ++g) spm[g * SP + kt] = ok ? sc[g] : -INFINITY;
+        }
+        if (STAGE) {
+            // the tile's V rows staged: key kt's codes and scales copied by its TPK threads (16-byte loads, all the
+            // block's in flight at once - a lane's 2-8 bytes a key, one key after another, was latency bound); a masked
+            // key's row is zeros (its probability is 0, its row may be stale)
+            const int kt = t / TPK, i = k0 + kt, nc = V.cb / 16;
+            uint4* dst = (uint4*) (sv + (size_t) kt * vstride);
             if (i < k_hi && ks.ok(i)) {
-#pragma unroll
-                for (int g = 0; g < G; ++g) sc[g] = 0.0f;
-                dot_row<G>(K, K.base(ks.pos(i)), kvh, sq, sc);
+                const uint8_t* bp = V.base(ks.pos(i));
+                const uint4* src = (const uint4*) V.codes(bp, kvh);
+                for (int c = t % TPK; c < nc; c += TPK) dst[c] = src[c];
+                if (t % TPK == 0) {
+                    const uint8_t* ss = V.scales(bp, kvh);
+                    if (V.sb == 8) *(uint2*) (sv + (size_t) kt * vstride + V.cb) = *(const uint2*) ss;
+                    else *(unsigned*) (sv + (size_t) kt * vstride + V.cb) = *(const unsigned*) ss;
+                }
             } else {
-#pragma unroll
-                for (int g = 0; g < G; ++g) sc[g] = -INFINITY;
+                for (int c = t % TPK; c < nc; c += TPK) dst[c] = make_uint4(0, 0, 0, 0);
+                if (t % TPK == 0) *(uint2*) (sv + (size_t) kt * vstride + V.cb) = make_uint2(0, 0);
             }
-#pragma unroll
-            for (int g = 0; g < G; ++g) sp[g][t] = sc[g];
         }
         __syncthreads();
 #pragma unroll
         for (int j = 0; j < HW; ++j) {   // (2)
             const int g = w + NW * j;
             if (g >= G) break;
+            float* sp = spm + g * SP;
             float mt = -INFINITY;
-            for (int x = lane; x < kST; x += 32) mt = fmaxf(mt, sp[g][x]);
+            for (int x = lane; x < TK; x += 32) mt = fmaxf(mt, sp[x]);
             mt = wmax(mt);
             const float mn = fmaxf(m_r[j], mt);
             const float corr = m_r[j] == -INFINITY ? 0.0f : __expf(m_r[j] - mn);
             float ls = 0.0f;
-            for (int x = lane; x < kST; x += 32) {
-                const float v = sp[g][x];
+            for (int x = lane; x < TK; x += 32) {
+                const float v = sp[x];
                 const float pv = v == -INFINITY ? 0.0f : __expf(v - mn);
-                sp[g][x] = pv;
+                sp[x] = pv;
                 ls += pv;
             }
             ls = wsum(ls);
@@ -1178,7 +1224,7 @@ __global__ void __launch_bounds__(kST) gqa_attn_wide_kernel(const float* __restr
             if (lane == 0) scorr[g] = corr;
         }
         __syncthreads();
-        {   // (3)
+        {   // (3) warp w the keys KW w .. KW w + KW - 1, a lane 4 dims of every head
 #pragma unroll
             for (int g = 0; g < G; ++g) {
                 const float c = scorr[g];
@@ -1186,34 +1232,14 @@ __global__ void __launch_bounds__(kST) gqa_attn_wide_kernel(const float* __restr
             }
             const int d4 = 4 * lane;
             if (STAGE) {
-                // the tile's V rows staged: thread t copies key t's codes and scales (a few 16-byte loads each, all
-                // the block's in flight at once - a lane's 2-8 bytes a key, one key after another, was latency bound);
-                // a masked key's row is zeros (its probability is 0, its row may be stale)
-                {
-                    const int i = k0 + t;
-                    uint4* dst = (uint4*) (sv + (size_t) t * vstride);
-                    const int nc = V.cb / 16;
-                    if (i < k_hi && ks.ok(i)) {
-                        const uint8_t* bp = V.base(ks.pos(i));
-                        const uint4* src = (const uint4*) V.codes(bp, kvh);
-                        for (int c = 0; c < nc; ++c) dst[c] = src[c];
-                        const uint8_t* ss = V.scales(bp, kvh);
-                        if (V.sb == 8) *(uint2*) (sv + (size_t) t * vstride + V.cb) = *(const uint2*) ss;
-                        else *(unsigned*) (sv + (size_t) t * vstride + V.cb) = *(const unsigned*) ss;
-                    } else {
-                        for (int c = 0; c < nc; ++c) dst[c] = make_uint4(0, 0, 0, 0);
-                        *(uint2*) (sv + (size_t) t * vstride + V.cb) = make_uint2(0, 0);
-                    }
-                }
-                __syncthreads();
 #pragma unroll 8
-                for (int x = 0; x < 32; ++x) {
-                    const int kk = w * 32 + x;
+                for (int x = 0; x < KW; ++x) {
+                    const int kk = w * KW + x;
                     float v0, v1, v2, v3;
                     V.load4_s(sv + (size_t) kk * vstride, d4, v0, v1, v2, v3);
 #pragma unroll
                     for (int g = 0; g < G; ++g) {
-                        const float pv = sp[g][kk];
+                        const float pv = spm[g * SP + kk];
                         acc[g][0] += pv * v0; acc[g][1] += pv * v1; acc[g][2] += pv * v2; acc[g][3] += pv * v3;
                     }
                 }
@@ -1221,22 +1247,22 @@ __global__ void __launch_bounds__(kST) gqa_attn_wide_kernel(const float* __restr
             // (FP16 V, whose rows are too large to stage: a lane its 4 values, a key at a time.  A no-test loop over the
             // valid prefix where the view is not streamed: 143 registers, 25% slower)
 #pragma unroll 8
-            for (int x = 0; x < 32; ++x) {
-                const int kk = w * 32 + x, i = k0 + kk;
+            for (int x = 0; x < KW; ++x) {
+                const int kk = w * KW + x, i = k0 + kk;
                 if (!(i < k_hi && ks.ok(i))) continue;   // (masked keys: their rows may be stale)
                 float v0, v1, v2, v3;
                 V.load4(ks.pos(i), kvh, d4, v0, v1, v2, v3);
 #pragma unroll
                 for (int g = 0; g < G; ++g) {
-                    const float pv = sp[g][kk];
+                    const float pv = spm[g * SP + kk];
                     acc[g][0] += pv * v0; acc[g][1] += pv * v1; acc[g][2] += pv * v2; acc[g][3] += pv * v3;
                 }
             }
         }
-        __syncthreads();   // (sp is the next tile's)
+        __syncthreads();   // (spm, sv: the next tile's)
     }
-    // the warps' outputs (all relative to the same running max) summed in sp's memory, one warp after another
-    float* sO = &sp[0][0];
+    // the warps' outputs (all relative to the same running max) summed in spm, one warp after another
+    float* sO = spm;
 #pragma unroll
     for (int x = 0; x < NW; ++x) {
         if (w == x)
@@ -1349,7 +1375,11 @@ bool gqa_attn(const float* q, const GqaKv& kv, int n_pos, int n_head, float* scr
         // splits of whole 128-key tiles, ~40 a K/V head (~320 blocks: four an SM on 80): more splits, more blocks at once
         // but a larger combine
         static const int target = getenv("DBG_SPLITS") ? std::atoi(getenv("DBG_SPLITS")) : 40;
-        const int tiles = (n_keys + kST - 1) / kST, per = std::max(1, (tiles + target - 1) / target), chunk = per * kST;
+        // (64-key tiles below 2K keys: twice the blocks, each a tile's chain of loads half as long; 128 past that,
+        // where the tiles' fixed costs count - DBG_TK=<32|64|128> to force one)
+        static const int tk_env = getenv("DBG_TK") ? std::atoi(getenv("DBG_TK")) : 0;
+        const int TK = tk_env > 0 ? tk_env : n_keys <= 2048 ? 64 : 128;
+        const int tiles = (n_keys + TK - 1) / TK, per = std::max(1, (tiles + target - 1) / target), chunk = per * TK;
         const int n_split = (n_keys + chunk - 1) / chunk;
         float* part = scratch;
         float* out = scratch + (size_t) n_head * n_split * (kD + 2);
@@ -1357,16 +1387,17 @@ bool gqa_attn(const float* q, const GqaKv& kv, int n_pos, int n_head, float* scr
         int vk_cb = 0, vk_sb = 0;
         mode_bytes(kv, vk_cb, vk_sb);
         const int vstride = vk_cb >= 256 ? 0 : (vk_cb + std::max(vk_sb, 8) + 15) / 16 * 16;
-        if (vstride > 0)
-            gqa_attn_wide_kernel<8, true><<<dim3(kv.n_kv, n_split), kST, (size_t) kST * vstride, s>>>(
-                q, kv, n_pos, 1.0f / sqrtf((float) kD), chunk, vstride, part);
-        else
-            gqa_attn_wide_kernel<8, false><<<dim3(kv.n_kv, n_split), kST, 0, s>>>(
-                q, kv, n_pos, 1.0f / sqrtf((float) kD), chunk, 0, part);
+        const dim3 grid(kv.n_kv, n_split);
+        const float sc = 1.0f / sqrtf((float) kD);
+        const size_t smem = (size_t) TK * vstride;
+#define WIDE(tk)                                                                                                   \
+        if (vstride > 0) gqa_attn_wide_kernel<8, tk, true><<<grid, kST, smem, s>>>(q, kv, n_pos, sc, chunk, vstride, part); \
+        else gqa_attn_wide_kernel<8, tk, false><<<grid, kST, 0, s>>>(q, kv, n_pos, sc, chunk, 0, part);
+        if (TK == 32) { WIDE(32) } else if (TK == 64) { WIDE(64) } else { WIDE(128) }
+#undef WIDE
         check("gqa_attn_wide");
-        gqa_combine_kernel<<<n_head, kD, 0, s>>>(part, n_split, out, v_rot(kv));
+        gqa_combine_kernel<<<n_head, kD, 0, s>>>(part, n_split, out, (Q8_1*) out_q8_1, v_rot(kv));
         check("gqa_combine");
-        quantize_q8_1(out, out_q8_1, n_head * kD, s);
         return true;
     }
     const int n_split = (n_keys + kChunk - 1) / kChunk;
@@ -1388,9 +1419,8 @@ bool gqa_attn(const float* q, const GqaKv& kv, int n_pos, int n_head, float* scr
 #endif
     gqa_attn_kernel<<<dim3(kv.n_kv, n_split), 256, 0, s>>>(q, kv, n_pos, n_head, 1.0f / sqrtf((float) kD), part);
     check("gqa_attn");
-    gqa_combine_kernel<<<n_head, kD, 0, s>>>(part, n_split, out, v_rot(kv));
+    gqa_combine_kernel<<<n_head, kD, 0, s>>>(part, n_split, out, (Q8_1*) out_q8_1, v_rot(kv));
     check("gqa_combine");
-    quantize_q8_1(out, out_q8_1, n_head * kD, s);
     return true;
 }
 
