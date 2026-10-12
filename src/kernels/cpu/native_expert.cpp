@@ -10,14 +10,22 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
 #include <mutex>
 
 namespace strata::kernels::cpu {
 namespace {
 
 const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((ggml_type) type); }
+
+std::atomic<uint64_t> exact_rows{0}, ggml_rows{0};
+bool flag_one(const char* name) {
+    const char* v = std::getenv(name);
+    return v && v[0] == '1' && v[1] == '\0';
+}
 
 void init_once() {
     static std::once_flag once;
@@ -72,10 +80,28 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 }
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+    static const bool on = flag_one("STRATA_GLM_Q8K1125") && cpu_avx2_ok();
+    static const bool reported = [&] {
+        if (flag_one("STRATA_GLM_UPSTREAM_DIAG"))
+            std::fprintf(stderr, "upstream1125: quant_act=%s type=%d n=%lld\n",
+                         on && f.gu_act == GGML_TYPE_Q8_K ? "avx2" : "ggml", f.gu_act, (long long) f.n_embd);
+        return true;
+    }();
+    (void) reported;
+    if (on && f.gu_act == GGML_TYPE_Q8_K) { q8k_quant_avx2(x, dst, f.n_embd); return; }
     traits(f.gu_act)->from_float(x, dst, f.n_embd);
 }
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
+    static const bool on = flag_one("STRATA_GLM_Q8K1125") && cpu_avx2_ok();
+    static const bool reported = [&] {
+        if (flag_one("STRATA_GLM_UPSTREAM_DIAG"))
+            std::fprintf(stderr, "upstream1125: quant_h=%s type=%d n=%lld\n",
+                         on && f.d_act == GGML_TYPE_Q8_K ? "avx2" : "ggml", f.d_act, (long long) f.n_ff);
+        return true;
+    }();
+    (void) reported;
+    if (on && f.d_act == GGML_TYPE_Q8_K) { q8k_quant_avx2(h, dst, f.n_ff); return; }
     traits(f.d_act)->from_float(h, dst, f.n_ff);
 }
 
@@ -115,6 +141,23 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const uint8_t* up_base,
                           const void* const* act, int nt, float* const* ff, int r0, int r1,
                           float swiglu_limit) {
+    // The exact single-row gate/up kernel replaces ggml's vec_dot for singleton IQ2_XXS rows; it needs AVX-2
+    // (and no AVX-512 build of ggml, whose path takes precedence).  STRATA_GLM_CPU_EXACT1=0 falls back to ggml.
+    static const bool exact_one = [] {
+        const char* ex = std::getenv("STRATA_GLM_CPU_EXACT1");
+        return !(ex && ex[0] == '0' && ex[1] == '\0');
+    }() && cpu_avx2_ok() && !cpu_avx512_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;
+    static const bool diag = flag_one("STRATA_GLM_CPU_EXACT1_DIAG");
+    // Only replace ggml's singleton IQ2_XXS dots. Other formats, multi-token calls,
+    // and the contiguous multi-token dispatch keep their existing arithmetic.
+    if (exact_one && nt == 1 && f.gu_type == 16 && r1 > r0) {
+        iq2xxs256_gu_split_exact_one(gate_base, up_base, f.gu_row, (int) f.n_embd, act[0], ff[0],
+                                    r0, r1, swiglu_limit);
+        if (diag) exact_rows.fetch_add((uint64_t) (r1 - r0), std::memory_order_relaxed);
+        return;
+    }
+    if (diag && r1 > r0 && nt > 0)
+        ggml_rows.fetch_add((uint64_t) (r1 - r0) * (uint64_t) nt, std::memory_order_relaxed);
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     const int n = (int) f.n_embd;
     const bool clamp = swiglu_limit != std::numeric_limits<float>::infinity();
@@ -132,6 +175,10 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
             ff[t][r] = (g / (1.f + std::exp(-g))) * u;
         }
     }
+}
+
+NativeSplitCounts native_split_counts() noexcept {
+    return {exact_rows.load(std::memory_order_relaxed), ggml_rows.load(std::memory_order_relaxed)};
 }
 
 void native_down_rows_split(const NativeFmt& f, const uint8_t* down_base, const void* const* hq,
