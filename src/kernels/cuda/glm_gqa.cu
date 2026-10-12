@@ -1294,6 +1294,247 @@ __global__ void __launch_bounds__(kST) gqa_attn_wide_kernel(const float* __restr
     }
 }
 
+#if !defined(STRATA_USE_HIP)
+// ---- decode on the tensor cores (sm_70+, WMMA m8n32k16: the G = 8 query heads of a K/V head are the 8 rows).  A
+// 128-key tile: (1) warp w the scores of keys 32 w .. 32 w + 31 - each lane decodes its key's row to FP16, 32 dims at a
+// time, into the warp's buffer, then Q . K^T on the tensor cores (F32 sums); (2) the online softmax (warp w heads w,
+// w + 4), the probabilities as FP16; (3) warp w output dims 32 w .. 32 w + 31 of P . V - each lane decodes its key's 32
+// dims of V, 32 keys at a time.  The warps split the dims in (3): no merge across warps; thread t keeps dim t of every
+// head's output.  On a K8V4 / TQ6V4 cache at 26K positions 151-166 against 225-230 us a layer for the wide kernel.
+// 32 dims (32 c .. 32 c + 31) of a row: its bytes (ld32), then FP16 (dec32: 16 half2, dims in order).  KIND a
+// compile-time constant.  (A K row's 4 chunks loaded at once, or the tile's V chunks before the scores, measured
+// slower: 8-35% at 4K-26K keys)
+struct R32 {
+    uint4 u[4];
+    float sc;
+};
+template <int KIND>
+__device__ __forceinline__ void ld32(const uint8_t* cp, const uint8_t* sp, int c, R32& r) {
+    if (KIND == kF16) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) r.u[i] = ((const uint4*) (cp + 64 * c))[i];
+    } else if (KIND == kI8) {
+        r.u[0] = ((const uint4*) (cp + 32 * c))[0];
+        r.u[1] = ((const uint4*) (cp + 32 * c))[1];
+        r.sc = __half2float(((const __half*) sp)[c]);
+    } else if (KIND == kL4) {
+        r.u[0] = *(const uint4*) (cp + 16 * c);
+        r.sc = __half2float(((const __half*) sp)[c]);
+    } else if (KIND == kT3) {
+        const unsigned* src = (const unsigned*) (cp + 12 * c);
+        r.u[0] = make_uint4(src[0], src[1], src[2], 0u);
+        r.sc = *(const float*) sp;
+    } else {
+        r.u[0] = *(const uint4*) (cp + 16 * c);
+        if (KIND == kT6) {
+            const uint2 hi = *(const uint2*) (cp + kD / 2 + 8 * c);
+            r.u[1] = make_uint4(hi.x, hi.y, 0u, 0u);
+        }
+        r.sc = *(const float*) sp;
+    }
+}
+template <int KIND>
+__device__ __forceinline__ void dec32(const R32& r, const float* lv, __half2* o) {
+    const float sc = r.sc;
+    if (KIND == kF16) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) ((uint4*) o)[i] = r.u[i];
+    } else if (KIND == kI8) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int8_t* qb = (const int8_t*) &r.u[i];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) o[8 * i + j] = __floats2half2_rn(qb[2 * j] * sc, qb[2 * j + 1] * sc);
+        }
+    } else if (KIND == kL4) {
+        const unsigned w4[4] = {r.u[0].x, r.u[0].y, r.u[0].z, r.u[0].w};
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                o[4 * k + j] = __floats2half2_rn((float) ((int) ((w4[k] >> (8 * j)) & 15u) - 8) * sc,
+                                                 (float) ((int) ((w4[k] >> (8 * j + 4)) & 15u) - 8) * sc);
+    } else if (KIND == kT3) {
+        const unsigned w0 = r.u[0].x, w1 = r.u[0].y, w2 = r.u[0].z;
+        const unsigned g4[4] = {w0 & 0xffffffu, (w0 >> 24) | ((w1 & 0xffffu) << 8), (w1 >> 16) | ((w2 & 0xffu) << 16),
+                                w2 >> 8};
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                o[4 * k + j] = __floats2half2_rn(lv[(g4[k] >> (6 * j)) & 7u] * sc, lv[(g4[k] >> (6 * j + 3)) & 7u] * sc);
+    } else {   // kT4, kT6: 32 nibbles (and their high 2 bits)
+        const unsigned lw[4] = {r.u[0].x, r.u[0].y, r.u[0].z, r.u[0].w};
+        const unsigned hw[4] = {r.u[1].x & 0xffffu, r.u[1].x >> 16, r.u[1].y & 0xffffu, r.u[1].y >> 16};
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                unsigned c0 = (lw[k] >> (8 * j)) & 15u, c1 = (lw[k] >> (8 * j + 4)) & 15u;
+                if (KIND == kT6) {
+                    c0 |= ((hw[k] >> (4 * j)) & 3u) << 4;
+                    c1 |= ((hw[k] >> (4 * j + 2)) & 3u) << 4;
+                }
+                o[4 * k + j] = __floats2half2_rn(lv[c0] * sc, lv[c1] * sc);
+            }
+    }
+}
+
+constexpr int kMT = 128, kMLdQ = kD + 8, kMLdB = 32 + 8, kMLdS = kMT + 4, kMLdP = kMT + 8;
+template <int KK, int VK, bool QS, bool PS>
+__global__ void __launch_bounds__(128) gqa_attn_mma_kernel(const float* __restrict__ q, GqaKv kv, int n_pos,
+                                                           float scale, int chunk, float* __restrict__ part) {
+    using namespace nvcuda;
+    constexpr int G = 8;
+    __shared__ __align__(32) __half sqh[(QS ? 2 : 1) * G * kMLdQ];   // Q, FP16, [head][dim] (QS: then q - its FP16)
+    __shared__ __align__(32) __half sbuf[4][32 * kMLdB];        // a warp's 32 keys x 32 dims of K or V, FP16
+    __shared__ __align__(32) float sS[G * kMLdS];               // the tile's scores [head][key]; (3) a tile's P . V
+    __shared__ __align__(32) __half sP[(PS ? 2 : 1) * G * kMLdP];    // the probabilities, FP16 [head][key] (PS: + rest)
+    __shared__ float scorr[G], smx[G], sls[G];
+    __shared__ float scb[2][64];
+    const int kvh = blockIdx.x, split = blockIdx.y, t = threadIdx.x, lane = t & 31, w = t >> 5;
+    load_cbs(scb, kv.kk, kv.vk, t, 128);
+    for (int i = t; i < G * kD; i += 128) {
+        const float x = q[(size_t) kvh * G * kD + i] * scale;
+        const __half hx = __float2half(x);
+        sqh[(i / kD) * kMLdQ + i % kD] = hx;
+        if (QS) sqh[G * kMLdQ + (i / kD) * kMLdQ + i % kD] = __float2half(x - __half2float(hx));
+    }
+    __syncthreads();
+    const Keys ks = keys_of(kv, n_pos);
+    const bool cached = kv.sel != nullptr;
+    const Rows K = k_rows(kv, scb[0], cached), V = v_rows(kv, scb[1], cached);
+    const int k_lo = split * chunk, k_hi = min(k_lo + chunk, ks.n_idx);
+    float m_r[2] = {-INFINITY, -INFINITY}, l_r[2] = {0.0f, 0.0f};
+    float o[G];
+#pragma unroll
+    for (int g = 0; g < G; ++g) o[g] = 0.0f;
+    __half* B = sbuf[w];
+    // B's row lane from 16 half2 (zeros for a masked key: its row may be stale), then the warp's 2 MMAs of 16
+    const auto put = [&](const __half2* h, bool ok) {
+        __syncwarp();   // (the buffer's previous rows read)
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            ((uint4*) (B + lane * kMLdB))[j] = ok ? ((const uint4*) h)[j] : make_uint4(0u, 0u, 0u, 0u);
+        __syncwarp();
+    };
+    for (int k0 = k_lo; k0 < k_hi; k0 += kMT) {
+        {   // (1) keys k0 + 32 w + lane
+            const int i = k0 + 32 * w + lane;
+            const bool ok = i < k_hi && ks.ok(i);
+            const uint8_t* bp = ok ? K.base(ks.pos(i)) : nullptr;
+            wmma::fragment<wmma::accumulator, 8, 32, 16, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+#pragma unroll 1
+            for (int c = 0; c < kD / 32; ++c) {
+                __half2 h[16];
+                if (ok) {
+                    R32 r;
+                    ld32<KK>(K.codes(bp, kvh), K.scales(bp, kvh), c, r);
+                    dec32<KK>(r, K.lv, h);
+                }
+                put(h, ok);
+#pragma unroll
+                for (int kk = 0; kk < 2; ++kk) {
+                    wmma::fragment<wmma::matrix_a, 8, 32, 16, __half, wmma::row_major> fa;
+                    wmma::fragment<wmma::matrix_b, 8, 32, 16, __half, wmma::col_major> fb;
+                    wmma::load_matrix_sync(fa, sqh + 32 * c + 16 * kk, kMLdQ);
+                    wmma::load_matrix_sync(fb, B + 16 * kk, kMLdB);   // (key n's dims at n * kMLdB: column-major)
+                    wmma::mma_sync(acc, fa, fb, acc);
+                    if (QS) {
+                        wmma::load_matrix_sync(fa, sqh + G * kMLdQ + 32 * c + 16 * kk, kMLdQ);
+                        wmma::mma_sync(acc, fa, fb, acc);
+                    }
+                }
+            }
+            wmma::store_matrix_sync(sS + 32 * w, acc, kMLdS, wmma::mem_row_major);
+            __syncwarp();
+            if (!ok)
+#pragma unroll
+                for (int g = 0; g < G; ++g) sS[g * kMLdS + 32 * w + lane] = -INFINITY;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {   // (2) heads w, w + 4
+            const int g = w + 4 * j;
+            float* sp = sS + g * kMLdS;
+            float mt = -INFINITY;
+#pragma unroll
+            for (int x = lane; x < kMT; x += 32) mt = fmaxf(mt, sp[x]);
+            mt = wmax(mt);
+            const float mn = fmaxf(m_r[j], mt);
+            const float corr = m_r[j] == -INFINITY ? 0.0f : __expf(m_r[j] - mn);
+            float ls = 0.0f;
+#pragma unroll
+            for (int x = lane; x < kMT; x += 32) {
+                const float v = sp[x];
+                const float pv = v == -INFINITY ? 0.0f : __expf(v - mn);
+                const __half hp = __float2half(pv);
+                sP[g * kMLdP + x] = hp;
+                if (PS) sP[G * kMLdP + g * kMLdP + x] = __float2half(pv - __half2float(hp));
+                ls += pv;
+            }
+            ls = wsum(ls);
+            l_r[j] = l_r[j] * corr + ls;
+            m_r[j] = mn;
+            if (lane == 0) scorr[g] = corr;
+        }
+        __syncthreads();
+        {   // (3) dims 32 w .. 32 w + 31, 32 keys at a time
+            wmma::fragment<wmma::accumulator, 8, 32, 16, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+#pragma unroll
+            for (int kb = 0; kb < kMT / 32; ++kb) {
+                const int i = k0 + 32 * kb + lane;
+                const bool ok = i < k_hi && ks.ok(i);
+                __half2 h[16];
+                if (ok) {
+                    const uint8_t* bp = V.base(ks.pos(i));
+                    R32 r;
+                    ld32<VK>(V.codes(bp, kvh), V.scales(bp, kvh), w, r);
+                    dec32<VK>(r, V.lv, h);
+                }
+                put(h, ok);
+#pragma unroll
+                for (int kk = 0; kk < 2; ++kk) {
+                    wmma::fragment<wmma::matrix_a, 8, 32, 16, __half, wmma::row_major> fa;
+                    wmma::fragment<wmma::matrix_b, 8, 32, 16, __half, wmma::row_major> fb;
+                    wmma::load_matrix_sync(fa, sP + 32 * kb + 16 * kk, kMLdP);
+                    wmma::load_matrix_sync(fb, B + 16 * kk * kMLdB, kMLdB);   // (key k's dims at k * kMLdB)
+                    wmma::mma_sync(acc, fa, fb, acc);
+                    if (PS) {
+                        wmma::load_matrix_sync(fa, sP + G * kMLdP + 32 * kb + 16 * kk, kMLdP);
+                        wmma::mma_sync(acc, fa, fb, acc);
+                    }
+                }
+            }
+            // (sS is free: every warp has read its scores in (2))
+            wmma::store_matrix_sync(sS + 32 * w, acc, kMLdS, wmma::mem_row_major);
+            __syncwarp();
+#pragma unroll
+            for (int g = 0; g < G; ++g) o[g] = o[g] * scorr[g] + sS[g * kMLdS + t];
+        }
+        __syncthreads();   // (sS, sP, scorr: the next tile's)
+    }
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+        if (lane == 0) {
+            smx[w + 4 * j] = m_r[j];
+            sls[w + 4 * j] = l_r[j];
+        }
+    __syncthreads();
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        float* po = part + ((size_t) (kvh * G + g) * gridDim.y + split) * (kD + 2);
+        po[t] = o[g];
+        if (t == 0) {
+            po[kD] = smx[g];
+            po[kD + 1] = sls[g];
+        }
+    }
+}
+#endif
+
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) std::fprintf(stderr, "glm_gqa %s: %s\n", what, cudaGetErrorString(e));
@@ -1366,13 +1607,48 @@ bool gqa_attn(const float* q, const GqaKv& kv, int n_pos, int n_head, float* scr
     if (n_head % kv.n_kv != 0 || n_head / kv.n_kv > kMaxGroup || n_pos < 1) return false;
     // (a streamed view: the splits of its largest selection - those past the step's own selection are empty)
     const int n_keys = kv.sel != nullptr ? kv.max_sel * kGqaPage : n_pos;
-    // STRATA_GLM_GQA_DEC=wide (the default for 8 heads a K/V head) | tc | warp
+    // STRATA_GLM_GQA_DEC= (default: the tensor cores, 8 heads a K/V head) | wide | tc | warp
     static const int dec = [] {
         const char* v = getenv("STRATA_GLM_GQA_DEC");
-        return v == nullptr ? 0 : std::strcmp(v, "tc") == 0 ? 1 : std::strcmp(v, "warp") == 0 ? 2 : 0;
+        return v == nullptr ? 0 : std::strcmp(v, "tc") == 0 ? 1 : std::strcmp(v, "warp") == 0 ? 2
+             : std::strcmp(v, "wide") == 0 ? 3 : 0;
     }();
+#if !defined(STRATA_USE_HIP)
     if (dec == 0 && n_head / kv.n_kv == 8) {
-        // splits of whole 128-key tiles, ~40 a K/V head (~320 blocks: four an SM on 80): more splits, more blocks at once
+        // the tensor cores (gqa_attn_mma_kernel): 128-key tiles, ~40 splits a K/V head (20 or 80: 7-27% slower at 26K)
+        static const int target = getenv("DBG_SPLITS") ? std::atoi(getenv("DBG_SPLITS")) : 40;
+        const int tiles = (n_keys + kMT - 1) / kMT, per = std::max(1, (tiles + target - 1) / target), chunk = per * kMT;
+        const int n_split = (n_keys + chunk - 1) / chunk;
+        float* part = scratch;
+        float* out = scratch + (size_t) n_head * n_split * (kD + 2);
+        const dim3 grid(kv.n_kv, n_split);
+        const float sc = 1.0f / sqrtf((float) kD);
+        // q as two FP16 parts (its FP16 and the rest: two MMAs a step): with q in FP16 alone the KL against FP16 K/V
+        // rose 0.062 -> 0.075 (tq6v3), with the two 0.065 as the F32 kernel's (~2% slower).  The probabilities as two
+        // as well changed nothing.  (DBG_MMA_SPLIT: 0 none, 1 q, 2 P, 3 both)
+        static const int msplit = getenv("DBG_MMA_SPLIT") ? std::atoi(getenv("DBG_MMA_SPLIT")) : 1;
+#define MMA2(a, b, x, y) gqa_attn_mma_kernel<a, b, x, y><<<grid, 128, 0, s>>>(q, kv, n_pos, sc, chunk, part)
+#define MMA(a, b)                                                                                                    \
+    do {                                                                                                             \
+        if (msplit == 0) MMA2(a, b, false, false);                                                                    \
+        else if (msplit == 1) MMA2(a, b, true, false);                                                               \
+        else if (msplit == 2) MMA2(a, b, false, true);                                                               \
+        else MMA2(a, b, true, true);                                                                                 \
+    } while (0)
+        if (kv.kk == kF16) MMA(kF16, kF16);
+        else if (kv.kk == kI8) { if (kv.vk == kI8) MMA(kI8, kI8); else MMA(kI8, kL4); }
+        else if (kv.kk == kT4) { if (kv.vk == kT4) MMA(kT4, kT4); else MMA(kT4, kT3); }
+        else { if (kv.vk == kT4) MMA(kT6, kT4); else MMA(kT6, kT3); }
+#undef MMA
+#undef MMA2
+        check("gqa_attn_mma");
+        gqa_combine_kernel<<<n_head, kD, 0, s>>>(part, n_split, out, (Q8_1*) out_q8_1, v_rot(kv));
+        check("gqa_combine");
+        return true;
+    }
+#endif
+    if ((dec == 0 || dec == 3) && n_head / kv.n_kv == 8) {
+        // (HIP, or STRATA_GLM_GQA_DEC=wide) splits of whole 128-key tiles, ~40 a K/V head (~320 blocks: four an SM on 80): more splits, more blocks at once
         // but a larger combine
         static const int target = getenv("DBG_SPLITS") ? std::atoi(getenv("DBG_SPLITS")) : 40;
         // (64-key tiles below 2K keys: twice the blocks, each a tile's chain of loads half as long; 128 past that,
