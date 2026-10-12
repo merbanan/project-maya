@@ -106,8 +106,8 @@ static bool pack_shard_names(const std::string& pack_dir, std::vector<std::strin
 static uint64_t pack_row_vram(const std::string& name, const std::string& kind, const strata::TensorInfo* t, bool fast,
                               std::string* how = nullptr) {
     if (fast && name == "token_embd.weight") return 0;
-    if (fast && kind == "4" && t->elements() >= 65536) {
-        if (how) *how = " bf16";
+    if (fast && (kind == "4" || kind == "5") && t->elements() >= 65536) {
+        if (how) *how = kind == "4" ? " bf16" : " f16";
         return ((uint64_t) t->elements() * 2 + 255u) & ~(uint64_t) 255u;
     }
     if (kind != "0" || name == "attn_k_b.weight" || name == "attn_v_b.weight") {
@@ -453,9 +453,96 @@ static bool hy3_geometry(const strata::GgufFile& g, Glm5Geometry& out, std::stri
     return true;
 }
 
+// deepseek4 (DeepSeek-V4 Flash, llama.cpp's LLM_ARCH_DEEPSEEK4 / antirez's ds4 GGUFs): see Glm5Geometry
+static bool dsv4_geometry(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
+    const std::string p = "deepseek4.";
+    const auto num = [&](const std::string& key, double def) -> double {
+        const auto* v = g.get(p + key);
+        if (!v) return def;
+        if (v->type == strata::MetaType::ARRAY) return v->items.empty() || !v->items[0].is_num() ? def : v->items[0].num();
+        return v->is_num() ? v->num() : def;
+    };
+    out.arch = 2;
+    out.n_embd = (int) num("embedding_length", 4096);
+    const int block_count = (int) num("block_count", 43);
+    out.nextn = (int) num("nextn_predict_layers", 0);
+    // (llama.cpp counts the draft block in block_count only when the file holds it; antirez's GGUFs ship it apart)
+    if (out.nextn > 0 && g.find("blk." + std::to_string(block_count - out.nextn) + ".nextn.eh_proj.weight") == nullptr)
+        out.nextn = 0;
+    out.n_layers = block_count - out.nextn;
+    out.n_head = (int) num("attention.head_count", 64);
+    out.n_kv = (int) num("attention.head_count_kv", 1);
+    out.head_dim = (int) num("attention.key_length", 512);
+    const int v_len = (int) num("attention.value_length", out.head_dim);
+    out.n_rot = (int) num("rope.dimension_count", 64);
+    out.rope_base = (float) num("rope.freq_base", 10000.0);
+    out.rope_factor = (float) num("rope.scaling.factor", 1.0);
+    out.rope_orig_ctx = (int64_t) num("rope.scaling.original_context_length", 0);
+    out.yarn_fast = (float) num("rope.scaling.yarn_beta_fast", 32.0);
+    out.yarn_slow = (float) num("rope.scaling.yarn_beta_slow", 1.0);
+    out.comp_rope_base = (float) num("attention.compress_rope_freq_base", 160000.0);
+    out.norm_eps = (float) num("attention.layer_norm_rms_epsilon", 1e-6);
+    out.q_lora = (int) num("attention.q_lora_rank", 1024);
+    out.o_lora = (int) num("attention.output_lora_rank", 1024);
+    out.o_groups = (int) num("attention.output_group_count", 8);
+    out.n_swa = (int) num("attention.sliding_window", 128);
+    out.idx_heads = (int) num("attention.indexer.head_count", 64);
+    out.idx_key = (int) num("attention.indexer.key_length", 128);
+    out.idx_top_k = (int) num("attention.indexer.top_k", 512);
+    out.n_expert = (int) num("expert_count", 256);
+    out.n_exp_used = (int) num("expert_used_count", 6);
+    out.n_ff_exp = (int) num("expert_feed_forward_length", 2048);
+    out.n_shared = (int) num("expert_shared_count", 1);
+    out.w_scale = (float) num("expert_weights_scale", 1.5);
+    out.norm_w = (int) num("expert_weights_norm", 1);
+    out.hash_layers = (int) num("hash_layer_count", 0);
+    out.swiglu_exp = out.swiglu_shexp = (float) num("swiglu_clamp_exp", 10.0);
+    out.hc = (int) num("hyper_connection.count", 4);
+    out.sinkhorn_iters = (int) num("hyper_connection.sinkhorn_iterations", 20);
+    out.hc_eps = (float) num("hyper_connection.epsilon", 1e-6);
+    const int gating = (int) num("expert_gating_func", 4);   // llama.cpp: 4 sqrt(softplus)
+    out.dense_lead = 0;
+    out.n_ff_dense = out.n_ff_exp;
+    if (const auto* v = g.get(p + "vocab_size")) out.n_vocab = (int) v->u;
+    if (const auto* ow = g.find("output.weight"); ow != nullptr && ow->shape.size() >= 2) out.n_vocab = (int) ow->shape[1];
+    out.comp_ratio.assign((size_t) out.n_layers, 0);
+    const auto* cr = g.get(p + "attention.compress_ratios");
+    if (cr == nullptr || cr->type != strata::MetaType::ARRAY || (int) cr->items.size() < out.n_layers) {
+        err = "deepseek4: attention.compress_ratios is missing or shorter than the trunk";
+        return false;
+    }
+    for (int il = 0; il < out.n_layers; ++il) {
+        const int r = (int) cr->items[(size_t) il].num();
+        if (r != 0 && r != 4 && r != 128) {
+            err = "deepseek4: layer " + std::to_string(il) + " compress ratio " + std::to_string(r) + " (0, 4, 128)";
+            return false;
+        }
+        out.comp_ratio[(size_t) il] = r;
+    }
+    out.n_head_kv.assign((size_t) out.n_layers, out.n_kv);
+    out.indexer_full.assign((size_t) out.n_layers, 1);
+    out.eog.clear();
+    for (const char* k : {"tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"})
+        if (const auto* v = g.get(k))
+            if (std::find(out.eog.begin(), out.eog.end(), (int32_t) v->u) == out.eog.end()) out.eog.push_back((int32_t) v->u);
+    if (gating != 4) {
+        err = "deepseek4: expert_gating_func " + std::to_string(gating) + " (only sqrt(softplus) is implemented)";
+        return false;
+    }
+    if (out.n_kv != 1 || out.head_dim != 512 || v_len != 512 || out.n_rot != 64 || out.n_head % out.o_groups != 0 ||
+        out.idx_key != 128 || out.hc != 4 || out.n_shared != 1 || out.n_exp_used > 8 || out.n_embd != 4096) {
+        err = "deepseek4: the shape is not DeepSeek-V4 Flash's (one 512-wide K/V head, rope 64, 4096 wide, 128-wide "
+              "indexer, 4 mHC streams, at most 8 experts a token)";
+        return false;
+    }
+    return true;
+}
+
 bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
-    if (const auto* a = g.get("general.architecture"))
+    if (const auto* a = g.get("general.architecture")) {
         if (a->s == "hy_v3") return hy3_geometry(g, out, err);
+        if (a->s == "deepseek4") return dsv4_geometry(g, out, err);
+    }
     // two spellings in the wild: llama.cpp's canonical "glm5-next" and unsloth's "glm5next" -
     // the KV PREFIX follows the file's own arch string, so it is detected once here
     const std::string p = g.get("glm5next.block_count") ? "glm5next." : "glm5-next.";
@@ -638,8 +725,9 @@ Glm5Model::~Glm5Model() {
 bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string& err) {
     strata::GgufFile gguf(gguf_path);
     if (!Glm5Geometry::from_gguf(gguf, g_, err)) return false;
-    if (g_.gqa()) {
-        err = "glm5_model: hy_v3 runs from a pack on the fast path only (tools/iq_pack.py, --glm-pack)";
+    if (g_.gqa() || g_.dsv4()) {
+        err = std::string("glm5_model: ") + (g_.gqa() ? "hy_v3" : "deepseek4") +
+              " runs from a pack on the fast path only (tools/iq_pack.py, --glm-pack)";
         return false;
     }
     max_ctx_ = max_ctx;
@@ -762,10 +850,36 @@ bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string&
     return true;
 }
 
+// deepseek4: a compressor window's floats - kv then scores, (ratio 4: 8 rows of 2 x 512, else ratio rows of 512)
+int64_t Glm5Model::d4_st_floats(int il) const {
+    const int r = g_.ratio(il);
+    if (r == 0) return 0;
+    return r == 4 ? (int64_t) 2 * 8 * 2 * g_.head_dim : (int64_t) 2 * r * g_.head_dim;
+}
+
+void Glm5Model::d4_reset_scores() {
+    if (!g_.dsv4() || state_ == nullptr) return;
+    static std::vector<float> ninf;
+    for (int il = l0_; il < l1_; ++il) {
+        const int64_t half = d4_st_floats(il) / 2;
+        if (half > 0) {
+            if ((int64_t) ninf.size() < half) ninf.assign((size_t) half, -INFINITY);
+            cudaMemcpy(state_ + d4_st_[(size_t) il] + half, ninf.data(), (size_t) half * sizeof(float),
+                       cudaMemcpyHostToDevice);
+        }
+        if (d4_ist_[(size_t) il] >= 0) {
+            const int64_t ih = (int64_t) 8 * 2 * g_.idx_key;
+            if ((int64_t) ninf.size() < ih) ninf.assign((size_t) ih, -INFINITY);
+            cudaMemcpy(state_ + d4_ist_[(size_t) il] + ih, ninf.data(), (size_t) ih * sizeof(float), cudaMemcpyHostToDevice);
+        }
+    }
+}
+
 void Glm5Model::reset() {
     if (!loaded_) return;
     cudaSetDevice(dev_);
     cudaMemset(state_, 0, state_bytes_);
+    d4_reset_scores();
     pos_ = 0;
     kv_trim(std::max<int64_t>(snap_pos_, 0));   // hy_v3: the K / V records' pool slots past the kept prefix go back
     if (fast_ && fast_->route_error_h && cudaStreamSynchronize(fast_->cs) == cudaSuccess)
@@ -1099,8 +1213,20 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     const int gkv_m = strata::kernels::glmf::gqa_kv_mode_parse(gkv_env);
     const int gkv8 = gkv_m >= 0 ? gkv_m
                    : (getenv("STRATA_GLM_KV_INT8") != nullptr && std::atoi(getenv("STRATA_GLM_KV_INT8")) != 0) ? 1 : 0;
-    const double dsa_state = g.gqa() ? (double) strata::kernels::glmf::gqa_kv_rec_bytes(g.n_kv, gkv8) * (double) max_ctx
-                                     : 4.0 * (lat + 2.0 * g.idx_key * (double) max_ctx + (double) g.idx_key * max_pools);
+    // (deepseek4: a layer's mean - the ring, the FP16 pooled rows, the indexer's on the ratio-4 layers, the windows)
+    double d4_state = 0.0;
+    if (g.dsv4()) {
+        for (int l = 0; l < g.n_layers; ++l) {
+            const int r = g.ratio(l);
+            d4_state += 2.0 * g.n_swa * g.head_dim;
+            if (r > 0) d4_state += 2.0 * ((double) max_ctx / r + 1) * (g.head_dim + (r == 4 ? g.idx_key : 0)) +
+                                   4.0 * (r == 4 ? 2.0 * 8 * 2 * (g.head_dim + g.idx_key) : 2.0 * r * g.head_dim);
+        }
+        d4_state /= std::max(1, g.n_layers);
+    }
+    const double dsa_state = g.gqa()   ? (double) strata::kernels::glmf::gqa_kv_rec_bytes(g.n_kv, gkv8) * (double) max_ctx
+                             : g.dsv4() ? d4_state
+                                        : 4.0 * (lat + 2.0 * g.idx_key * (double) max_ctx + (double) g.idx_key * max_pools);
     const double kda_state = 4.0 * ((double) g.d_inner() * g.kda_head_dim + 3.0 * g.d_inner() * (g.d_conv - 1));
     // the experts: a layer's blob and its VRAM slot's stride (native_experts.txt)
     std::vector<double> blob((size_t) L + 1, 0.0), stride((size_t) L + 1, 0.0);
@@ -2265,7 +2391,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         err = "pack: bad layer range [" + std::to_string(l0_) + ", " + std::to_string(l1_) + ")";
         return false;
     }
-    if (g_.gqa() && getenv("STRATA_GLM_SLOW") != nullptr) {
+    if ((g_.gqa() || g_.dsv4()) && getenv("STRATA_GLM_SLOW") != nullptr) {
         err = "pack: hy_v3 runs on the fast path only (not STRATA_GLM_SLOW)";
         return false;
     }
@@ -2411,7 +2537,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // token_embd at all (the embedding row is dequantized on the host from the shard mapping)
     fast_mode_ = getenv("STRATA_GLM_SLOW") == nullptr;
     const auto keep16 = [&](const Row& r, const strata::TensorInfo* t) {
-        return fast_mode_ && r.kind == "4" && t->elements() >= 65536;
+        return fast_mode_ && (r.kind == "4" || r.kind == "5") && t->elements() >= 65536;
     };
     const auto skip_upload = [&](const Row& r) { return fast_mode_ && r.name == "token_embd.weight"; };
     uint64_t bytes = 0;
@@ -2492,6 +2618,24 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             }
             { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, raw.data(), (size_t) r.bytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
             w16_[r.name] = (const uint16_t*) ((uint8_t*) w_arena_ + at);
+            if (r.kind == "5") w16h_.insert(r.name);
+            at += (r.bytes + 255u) & ~(uint64_t) 255u;
+            continue;
+        }
+        if (r.kind == "6") {   // I32 (deepseek4's hash-routing tables): as stored
+            if (r.bytes != (uint64_t) t->elements() * 4) {
+                err = "pack: I32 row " + r.name + " has " + std::to_string(r.bytes) + " bytes";
+                return false;
+            }
+            raw.resize((size_t) r.bytes);
+            dense.seekg((long long) r.offset);
+            dense.read((char*) raw.data(), (long long) r.bytes);
+            if (!dense) {
+                err = "pack: short read on dense.bin for " + r.name;
+                return false;
+            }
+            { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, raw.data(), (size_t) r.bytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+            wi32_[r.name] = (const int32_t*) ((uint8_t*) w_arena_ + at);
             at += (r.bytes + 255u) & ~(uint64_t) 255u;
             continue;
         }
@@ -2552,6 +2696,17 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             const uint16_t* src = (const uint16_t*) raw.data();
             uint32_t* dst = (uint32_t*) host.data();
             for (size_t i = 0; i < (size_t) n_f32; ++i) dst[i] = (uint32_t) src[i] << 16;
+        } else if (r.kind == "5") {
+            // small FP16 rows in dense.bin (deepseek4's ape tables, ...): F32
+            raw.resize((size_t) r.bytes);
+            dense.seekg((long long) r.offset);
+            dense.read((char*) raw.data(), (long long) r.bytes);
+            if (!dense) {
+                err = "pack: short read on dense.bin for " + r.name;
+                return false;
+            }
+            const uint16_t* src = (const uint16_t*) raw.data();
+            for (size_t i = 0; i < (size_t) n_f32; ++i) host[i] = ggml_fp16_to_fp32((ggml_fp16_t) src[i]);
         } else if (r.kind == "2") {
             dense.seekg((long long) r.offset);
             dense.read((char*) host.data(), (long long) r.bytes);
@@ -2655,6 +2810,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // ik_ring_), the whole context on the reference path (whose kernels index them by position)
     ik_ring_ = fast_mode_ ? (int) std::min<int64_t>(max_ctx, 8192 + 64) : (int) max_ctx;
     gqa_kv_.assign((size_t) g_.n_layers + 1, -1);
+    for (auto* v : {&d4_swa_, &d4_comp_, &d4_icomp_, &d4_st_, &d4_ist_}) v->assign((size_t) g_.n_layers + 1, -1);
     kv_loff_.assign((size_t) g_.n_layers + 1, 0);
     kv_b_ = nullptr;
     kv_b_bytes_ = 0;
@@ -2706,6 +2862,26 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         if (il < l0_ || il >= l1_) continue;   // the other half's caches stay on the other device
         if (g_.gqa()) {
             // hy_v3: the layer's rows are in the records (above)
+        } else if (g_.dsv4()) {
+            // deepseek4: the raw ring (FP16), the pooled rows (FP16, one a ratio positions), the indexer's pooled rows
+            // (ratio 4), the compressor windows (F32 kv + scores)
+            const int r = g_.ratio(il);
+            d4_swa_[(size_t) il] = floats;
+            floats += (int64_t) g_.n_swa * g_.head_dim / 2;
+            if (r > 0) {
+                const int64_t rows = max_ctx / r + 1;
+                d4_comp_[(size_t) il] = floats;
+                floats += (rows * g_.head_dim + 1) / 2;
+                d4_st_[(size_t) il] = floats;
+                floats += d4_st_floats(il);
+                if (r == 4) {
+                    d4_icomp_[(size_t) il] = floats;
+                    floats += (rows * g_.idx_key + 1) / 2;
+                    d4_ist_[(size_t) il] = floats;
+                    floats += (int64_t) 2 * 8 * 2 * g_.idx_key;
+                }
+            }
+            floats = (floats + 63) / 64 * 64;   // (256-byte runs)
         } else if (g_.is_recr(il)) {
             kda_S_[(size_t) il] = floats;
             floats += (int64_t) g_.d_inner() * g_.kda_head_dim;

@@ -102,6 +102,9 @@ class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
                  pre: str = "qwen35", special_ids: dict[str, int] | None = None):
         self.tokens = tokens
+        # (DeepSeek-V4's "joyai-llm" is llama.cpp's DEEPSEEK3_LLM regex set, the one hunyuan-dense shares)
+        if pre == "joyai-llm":
+            pre = "hunyuan-dense"
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.

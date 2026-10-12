@@ -84,6 +84,10 @@ __device__ __forceinline__ void q8_1_store_warp(float v, block_q8_1* dst, int la
 }
 __device__ __forceinline__ float dsigmoid(float x) { return 1.0f / (1.0f + __expf(-x)); }
 __device__ __forceinline__ float bf(uint16_t v) { return __uint_as_float((uint32_t) v << 16); }
+// a 16-bit weight: BF16, or FP16 (f16)
+__device__ __forceinline__ float w16f(uint16_t v, bool f16) {
+    return f16 ? __half2float(__ushort_as_half(v)) : __uint_as_float((uint32_t) v << 16);
+}
 
 // ---------------------------------------------------------------- llama.cpp vecdotq helpers
 __device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
@@ -425,6 +429,20 @@ __device__ __forceinline__ float row_dot_bf16(const uint16_t* row, const float* 
              __uint_as_float(w.y << 16) * a.z + __uint_as_float(w.y & 0xffff0000u) * a.w +
              __uint_as_float(w.z << 16) * b.x + __uint_as_float(w.z & 0xffff0000u) * b.y +
              __uint_as_float(w.w << 16) * b.z + __uint_as_float(w.w & 0xffff0000u) * b.w;
+    }
+    return warp_sum(s);
+}
+
+__device__ __forceinline__ float row_dot_f16(const uint16_t* row, const float* x, int n_in, int lane) {
+    float s = 0.0f;
+    const uint4* r8 = (const uint4*) row;
+    const float4* x4 = (const float4*) x;
+    for (int k = lane; k < n_in / 8; k += 32) {
+        const uint4 w = r8[k];
+        const float4 a = x4[2 * k], b = x4[2 * k + 1];
+        const float2 w0 = __half22float2(*(const __half2*) &w.x), w1 = __half22float2(*(const __half2*) &w.y),
+                     w2 = __half22float2(*(const __half2*) &w.z), w3 = __half22float2(*(const __half2*) &w.w);
+        s += w0.x * a.x + w0.y * a.y + w1.x * a.z + w1.y * a.w + w2.x * b.x + w2.y * b.y + w3.x * b.z + w3.y * b.w;
     }
     return warp_sum(s);
 }
@@ -961,6 +979,7 @@ __device__ __forceinline__ float any_row_dot(int type, const void* w, int row, c
     switch (type) {
         case kTypeF32: return row_dot_f32((const float*) w + (size_t) row * n_in, xf, n_in, lane);
         case kTypeBF16: return row_dot_bf16((const uint16_t*) w + (size_t) row * n_in, xf, n_in, lane);
+        case kTypeF16: return row_dot_f16((const uint16_t*) w + (size_t) row * n_in, xf, n_in, lane);
 #define GF_CASE(T) case T: return row_dot<T>((const uint8_t*) w + (size_t) row * rbytes<T>(n_in), (const block_q8_1*) xq, n_in, lane);
         GF_CASE(12) GF_CASE(13) GF_CASE(14) GF_CASE(8) GF_CASE(16) GF_CASE(18) GF_CASE(19) GF_CASE(23) GF_CASE(10) GF_CASE(11)
         GF_CASE(17) GF_CASE(22) GF_CASE(21) GF_CASE(29)
@@ -1227,7 +1246,7 @@ __global__ void __launch_bounds__(HC_THREADS) hc_kernel(const __grid_constant__ 
     for (int m = warp; m < HC_MIX; m += HC_THREADS / 32) {
         const uint16_t* wr = a.w_fn + (size_t) m * hc_dim + (size_t) b * HC_CHUNK;
         float acc = 0.0f;
-        for (int i = lane; i < HC_CHUNK; i += 32) acc += sR[i] * bf(wr[i]);
+        for (int i = lane; i < HC_CHUNK; i += 32) acc += sR[i] * w16f(wr[i], a.w_f16);
         acc = warp_sum(acc);
         if (lane == 0) spart[m] = acc;
     }
@@ -1359,7 +1378,7 @@ __global__ void __launch_bounds__(HC_THREADS) hc2_kernel(const __grid_constant__
         float acc = 0.0f;
         for (int i = lane; i < 4 * HC2_EB; i += 32) {
             const int d = i / HC2_EB, j = i - d * HC2_EB;
-            acc += sR[d][j] * bf(wr[(size_t) d * n_embd + j]);
+            acc += sR[d][j] * w16f(wr[(size_t) d * n_embd + j], a.w_f16);
         }
         acc = warp_sum(acc);
         if (lane == 0) spart[m] = acc;
@@ -1486,8 +1505,12 @@ __global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const __grid_constant__
         for (int d = 0; d < 4; ++d) {
             const uint2 w = wv[r][d];
             const float* x = &sR[d][4 * lane];
-            acc += __uint_as_float(w.x << 16) * x[0] + __uint_as_float(w.x & 0xffff0000u) * x[1] +
-                   __uint_as_float(w.y << 16) * x[2] + __uint_as_float(w.y & 0xffff0000u) * x[3];
+            if (a.w_f16)
+                acc += w16f((uint16_t) w.x, true) * x[0] + w16f((uint16_t) (w.x >> 16), true) * x[1] +
+                       w16f((uint16_t) w.y, true) * x[2] + w16f((uint16_t) (w.y >> 16), true) * x[3];
+            else
+                acc += __uint_as_float(w.x << 16) * x[0] + __uint_as_float(w.x & 0xffff0000u) * x[1] +
+                       __uint_as_float(w.y << 16) * x[2] + __uint_as_float(w.y & 0xffff0000u) * x[3];
         }
         acc = warp_sum(acc);
         if (lane == 0) part[(size_t) m * nb + b] = acc;
@@ -2146,7 +2169,14 @@ struct RouteArgs {
                                 // clears this; 0 keeps the old rule (a spare, if one is free)
     int pf_rank;                // STRATA_GLM_PREFETCH_RANK: prefetch only the prediction's first pf_rank ranks
     int near_n;                 // STRATA_GLM_ROUTE_LOG: the route's next near_n ranks after the top k (0: none)
+    int score_fn;               // 0 sigmoid, 1 sqrt(softplus) (DeepSeek-V4)
+    const int* hash_ids;        // the k experts given (DeepSeek-V4's hash layers), else nullptr: the top k
 };
+// a router logit's probability: sigmoid (GLM, Hy3) or sqrt(softplus) (DeepSeek-V4; softplus as ds4's)
+__device__ __forceinline__ float route_prob(float l, int fn) {
+    if (fn == 1) return sqrtf(l > 20.0f ? l : l < -20.0f ? expf(l) : log1pf(expf(l)));
+    return 1.0f / (1.0f + expf(-l));
+}
 
 __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_constant__ RouteArgs a) {
     const int tid = threadIdx.x, lane = tid & 31;
@@ -2171,7 +2201,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     if (a.cpu_plan != 0ull && a.d.dcnt != nullptr && ((*a.d.seq + 1) & 4095u) == 0u)
         for (int i = tid; i < a.d.n_keys; i += ROUTE_THREADS) a.d.dcnt[i] >>= 1;
     for (int e = tid; e < E; e += ROUTE_THREADS) {
-        const float p = 1.0f / (1.0f + expf(-a.logits[e]));
+        const float p = route_prob(a.logits[e], a.score_fn);
         s_p[e] = p;
         s_sel[e] = a.bias ? p + a.bias[e] : p;
         if (!isfinite(a.logits[e]) || !isfinite(s_sel[e])) atomicMax(&bad, 1);
@@ -2179,7 +2209,15 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     __shared__ float s_bv[32];
     __shared__ int s_bi[32];
     __syncthreads();
-    topk_argmax(s_sel, E, a.k, s_ids, s_bv, s_bi);
+    if (a.hash_ids != nullptr) {   // the given experts (the selection score plays no part)
+        if (tid < a.k) {
+            s_ids[tid] = a.hash_ids[tid];
+            if (s_ids[tid] >= 0 && s_ids[tid] < E) s_sel[s_ids[tid]] = -INFINITY;   // (the near misses: past them)
+        }
+        __syncthreads();
+    } else {
+        topk_argmax(s_sel, E, a.k, s_ids, s_bv, s_bi);
+    }
     if (tid == 0)
         for (int i = 0; i < a.k; ++i)
             if (s_ids[i] < 0 || s_ids[i] >= E) atomicMax(&bad, 1);
@@ -2193,7 +2231,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     if (a.pred_logits != nullptr) {
         __syncthreads();
         for (int e = tid; e < E; e += ROUTE_THREADS) {
-            const float p = 1.0f / (1.0f + expf(-a.pred_logits[e]));
+            const float p = route_prob(a.pred_logits[e], a.score_fn);
             s_sel[e] = a.pred_bias ? p + a.pred_bias[e] : p;   // s_sel is free again: the selection is done
             if (!isfinite(a.pred_logits[e]) || !isfinite(s_sel[e])) atomicMax(&bad, 2);
         }
@@ -2215,7 +2253,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             const int e = lane + 32 * j;
             float x = -INFINITY;
             if (e < E) {
-                const float p = 1.0f / (1.0f + expf(-lg[e]));
+                const float p = route_prob(lg[e], a.score_fn);
                 x = bs ? p + bs[e] : p;
                 if (!isfinite(lg[e]) || !isfinite(x)) atomicMax(&bad, 3);
             }
@@ -3082,7 +3120,8 @@ __global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ 
 
 int mv_type_ok(int t) {
     switch (t) {
-        case kTypeF32: case kTypeBF16: case 12: case 13: case 14: case 8: case 16: case 18: case 19: case 23: case 10: case 11:
+        case kTypeF32: case kTypeBF16: case kTypeF16: case 12: case 13: case 14: case 8: case 16: case 18: case 19: case 23:
+        case 10: case 11:
         case 17: case 22: case 21: case 29: return 1;
         default: return 0;
     }
@@ -3112,7 +3151,7 @@ int launch_errors() { return g_launch_errors.load(std::memory_order_relaxed); }
 size_t row_bytes(int type, int64_t n_in) {
     switch (type) {
         case kTypeF32: return (size_t) n_in * 4;
-        case kTypeBF16: return (size_t) n_in * 2;
+        case kTypeBF16: case kTypeF16: return (size_t) n_in * 2;
         case 12: return (size_t) (n_in / 256) * sizeof(block_q4_K);
         case 13: return (size_t) (n_in / 256) * sizeof(block_q5_K);
         case 14: return (size_t) (n_in / 256) * sizeof(block_q6_K);
@@ -3463,11 +3502,13 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                const float* x, int n_embd, const MoeDev& d, const float* sh_gate, const float* sh_up, float sh_limit,
                int n_ff_sh, void* sh_hq, cudaStream_t s, const float* pred_logits, const float* pred_bias,
                int max_prefetch, const float* ahead_logits, const float* const* ahead_bias, int n_ahead,
-               int skip_from, unsigned long long cpu_plan, int promote_min, int pf_rank, int near_n) {
+               int skip_from, unsigned long long cpu_plan, int promote_min, int pf_rank, int near_n, int score_fn,
+               const int* hash_ids) {
     RouteArgs a{logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, layer, x, n_embd, d,
                 sh_gate, sh_up, sh_limit, n_ff_sh, (block_q8_1*) sh_hq, pred_logits, pred_bias, max_prefetch,
                 ahead_logits, {}, 0, skip_from, d.cpu_seq != nullptr ? cpu_plan : 0ull, promote_min,
-                pf_rank > 0 ? pf_rank : k, std::max(0, std::min(near_n, std::min(16, n_expert - k)))};
+                pf_rank > 0 ? pf_rank : k, std::max(0, std::min(near_n, std::min(16, n_expert - k))), score_fn,
+                hash_ids};
     if (ahead_logits != nullptr && ahead_bias != nullptr && n_expert <= 512) {
         a.n_ahead = std::min(n_ahead, kAhead);
         for (int i = 0; i < a.n_ahead; ++i) a.ahead_bias[i] = ahead_bias[i];

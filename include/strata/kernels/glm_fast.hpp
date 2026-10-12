@@ -19,6 +19,7 @@ namespace strata::kernels::glmf {
 
 constexpr int kTypeF32 = 0;
 constexpr int kTypeBF16 = 30;
+constexpr int kTypeF16 = 1;     // (ggml's GGML_TYPE_F16; DeepSeek-V4's compressors, indexer and routers)
 
 /// y[r] = alpha * (W_r . x) + (bias ? bias[r] : 0) for r in [0, n_out).  Quantized types read
 /// `xq` (q8_1, n_in / 32 blocks); F32 / BF16 weights read `xf`.
@@ -63,7 +64,8 @@ struct HcArgs {
     float* pre = nullptr;
     float* post = nullptr;
     float* comb = nullptr;
-    const uint16_t* w_fn = nullptr;   // BF16 [hc_mix_dim][hc * n_embd]
+    const uint16_t* w_fn = nullptr;   // BF16 [hc_mix_dim][hc * n_embd] (w_f16: FP16 - DeepSeek-V4's)
+    bool w_f16 = false;
     const float* w_scale = nullptr;   // 3
     const float* w_base = nullptr;    // hc_mix_dim
     const float* norm_w = nullptr;    // n_embd
@@ -226,7 +228,11 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                float sh_limit, int n_ff_sh, void* sh_hq, cudaStream_t s, const float* pred_logits = nullptr,
                const float* pred_bias = nullptr, int max_prefetch = 0, const float* ahead_logits = nullptr,
                const float* const* ahead_bias = nullptr, int n_ahead = 0, int skip_from = 8,
-               unsigned long long cpu_plan = 0, int promote_min = 0, int pf_rank = 0, int near_n = 0);
+               unsigned long long cpu_plan = 0, int promote_min = 0, int pf_rank = 0, int near_n = 0,
+               int score_fn = 0, const int* hash_ids = nullptr);
+/// (score_fn: 0 sigmoid(logit) - GLM, Hy3; 1 sqrt(softplus(logit)) - DeepSeek-V4.  hash_ids: the route's k experts
+/// given (DeepSeek-V4's hash-routed first layers: the token's row of ffn_gate_tid2eid) - weighted by the same
+/// probabilities, no bias, no pick)
 /// The CPU LANE's split: of f RAM-tier experts in a route, cpu_take(plan, f) go to the host (4 bits per f, f = 0..8).
 inline int cpu_take(unsigned long long plan, int f) { return (int) ((plan >> (4 * f)) & 15ull); }
 /// Waits (on the device) for the host's CPU-lane answer of the last route when it had CPU experts, then adds it to

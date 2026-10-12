@@ -105,11 +105,19 @@ HYV3_NATIVE_OK = (
     "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
     "token_embd.weight", "output.weight",
 )
-ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "hy_v3")   # unsloth spells glm5next without the hyphen
+# deepseek4 (DeepSeek-V4 Flash, antirez's ds4 GGUFs): the Q8_0 attention / shared-expert / head projections are served
+# natively; everything else non-expert is F16 / F32 (the compressors, the indexer, the routers, the mHC mixes - packed
+# as stored) or the I32 hash-routing tables of the first layers (index kind 6, raw)
+DSV4_NATIVE_OK = (
+    "attn_q_a.weight", "attn_q_b.weight", "attn_kv.weight", "attn_output_a.weight", "attn_output_b.weight",
+    "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+    "token_embd.weight", "output.weight",
+)
+ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "hy_v3", "deepseek4")   # unsloth spells glm5next without the hyphen
 
 
 def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
-    if arch == "hy_v3":
+    if arch in ("hy_v3", "deepseek4"):
         return False
     if arch in ("glm5-next", "glm5next"):
         # glm5-next has no PLE and no output_hc; its F32 router stays F32 (the runner reads it
@@ -238,6 +246,15 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                 return 1
             ne0, ne1 = index_shape(t.shape)
             convert = compat_bf16 and needs_bf16(t.name, t.type_name, arch) and t.type_name != "BF16"
+            if arch == "deepseek4" and t.type_name == "I32":
+                raw = tensor_bytes(mm, g, t).tobytes()
+                rows.append([t.name, "0", "6", str(at), str(len(raw)), "0", str(len(raw)), str(ne0), str(ne1),
+                             "0", "0", "1"] + ["0"] * 7)
+                fo.write(raw)
+                pad = (-len(raw)) % ALIGN
+                fo.write(b"\0" * pad)
+                at += len(raw) + pad
+                continue
             if t.type_name in FLOAT or convert:
                 raw = tensor_bytes(mm, g, t).tobytes()
                 if convert:
@@ -263,6 +280,10 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                 pad = (-len(raw)) % ALIGN
                 fo.write(b"\0" * pad)
                 at += len(raw) + pad
+            elif arch == "deepseek4" and not name.endswith(DSV4_NATIVE_OK):
+                print("%s is %s: not in the deepseek4 native set (DSV4_NATIVE_OK); refusing to pack it silently"
+                      % (t.name, t.type_name))
+                return 1
             elif arch == "hy_v3" and not name.endswith(HYV3_NATIVE_OK):
                 print("%s is %s: not in the hy_v3 native set (HYV3_NATIVE_OK); refusing to pack it silently"
                       % (t.name, t.type_name))
@@ -380,6 +401,9 @@ def main() -> int:
     if arch == "hy_v3":
         prefix = "hy_v3."
         print("hy_v3: packing for the Glm5Model runner's hy_v3 path (GQA attention, quantized dense served natively)")
+    elif arch == "deepseek4":
+        prefix = "deepseek4."
+        print("deepseek4: packing for the Glm5Model runner's DeepSeek-V4 path (Q8_0 projections served natively)")
     elif arch in ("glm5-next", "glm5next"):
         # two spellings in the wild: llama.cpp's canonical "glm5-next" (llama-arch.cpp L156) and
         # unsloth's "glm5next" - the KV PREFIX follows the same spelling, so it is read per file
@@ -388,7 +412,7 @@ def main() -> int:
               "gate remains closed until the pack wiring lands - docs/GLM5-FLASH.md §9)" % arch)
     block_count = None
     trunk = None
-    if arch in ("glm5-next", "glm5next", "hy_v3"):
+    if arch in ("glm5-next", "glm5next", "hy_v3", "deepseek4"):
         bc = g.metadata.get(prefix + "block_count")
         if bc is None:
             print("%s: %sblock_count is missing; cannot tell the trunk from the NextN block" % (arch, prefix))
@@ -397,6 +421,11 @@ def main() -> int:
         # the NextN/MTP layer counts INTO block_count in the wild (unsloth ships 46 with
         # nextn_predict_layers 1): the servable trunk is what is left after subtracting it
         nextn = int(g.metadata.get(prefix + "nextn_predict_layers", 0) or 0)
+        # (deepseek4: llama.cpp counts the draft block in block_count only when its tensors are in the file - antirez's
+        # GGUFs ship it separately, so a file without blk.<bc - nextn>.nextn.* is all trunk)
+        if arch == "deepseek4" and nextn and not any(t.name.startswith("blk.%d.nextn." % (int(bc) - nextn))
+                                                     for t in g.tensors):
+            nextn = 0
         trunk = block_count - nextn
         if trunk < 1:
             print("%s: block_count %d - nextn %d leaves no trunk" % (arch, block_count, nextn))
@@ -437,7 +466,7 @@ def main() -> int:
     else:
         n_layers = 1 + max(int(n.split(".")[1]) for n in T if n.startswith("blk.") and n.endswith("_exps.weight"))
     # the MoE layers only: the leading dense blocks ship no router and no experts
-    if arch == "hy_v3":
+    if arch in ("hy_v3", "deepseek4"):
         # no leading_dense_block_count key: the dense blocks are the layers before the first router
         lead = 0
         while "blk.%d.ffn_gate_inp.weight" % lead not in T:

@@ -588,6 +588,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         Ly.moe = il >= g.dense_lead;
         Ly.mtp = is_mtp;
         Ly.gqa = g.gqa();
+        Ly.dsv4 = g.dsv4() && !is_mtp;
         if (Ly.gqa) {
             // hy_v3: plain pre-norm residuals, grouped-query attention, the router in F32; the draft block is a Hy3
             // layer read through eh_proj, its output through the shared head's norm
@@ -637,6 +638,36 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.dt_bias = f32("ssm_dt.bias");
             Ly.ssm_a = f32("ssm_a");
             Ly.ssm_norm = f32("ssm_norm.weight");
+        } else if (Ly.dsv4) {
+            // deepseek4: the q LoRA, one K/V head, the sinks, the grouped output; the compressors (ratio > 0) and the
+            // indexer (ratio 4) in FP16
+            const int r = g.ratio(il);
+            Ly.q_a = q("attn_q_a.weight");
+            Ly.q_b = q("attn_q_b.weight");
+            Ly.kv_a = q("attn_kv.weight");
+            Ly.q_a_norm = f32("attn_q_a_norm.weight");
+            Ly.kv_a_norm = f32("attn_kv_a_norm.weight");
+            Ly.sinks = f32("attn_sinks.weight");
+            Ly.o_a = q("attn_output_a.weight");
+            Ly.o_b = q("attn_output_b.weight");
+            if (r > 0) {
+                Ly.c_kv = b16("attn_compressor_kv.weight");
+                Ly.c_gate = b16("attn_compressor_gate.weight");
+                Ly.c_ape = f32("attn_compressor_ape.weight");
+                Ly.c_norm = f32("attn_compressor_norm.weight");
+            }
+            if (r == 4) {
+                Ly.ic_kv = b16("indexer_compressor_kv.weight");
+                Ly.ic_gate = b16("indexer_compressor_gate.weight");
+                Ly.ic_ape = f32("indexer_compressor_ape.weight");
+                Ly.ic_norm = f32("indexer_compressor_norm.weight");
+                Ly.idx_q_b = b16("indexer.attn_q_b.weight");
+                Ly.idx_proj = b16("indexer.proj.weight");
+            }
+            for (const char* n : {"attn_compressor_kv.weight", "attn_compressor_gate.weight",
+                                  "indexer_compressor_kv.weight", "indexer_compressor_gate.weight",
+                                  "indexer.attn_q_b.weight", "indexer.proj.weight", "hc_attn_fn.weight", "hc_ffn_fn.weight"})
+                if (w16_.count(P + n) != 0 && w16h_.count(P + n) == 0) missing += P + n + " (fp16 expected) ";
         } else {
             Ly.q_a = q_or_b16("attn_q_a.weight", g.n_embd, g.q_lora);
             Ly.q_b = q("attn_q_b.weight");
@@ -653,15 +684,23 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.k_b = b16("attn_k_b.weight");
             Ly.v_b = b16("attn_v_b.weight");
         }
-        Ly.out = q("attn_output.weight");
+        if (!Ly.dsv4) Ly.out = q("attn_output.weight");
         }
         if (Ly.moe) {
             // hy_v3: BF16 when the pack holds it so (iq_pack.py: an F32 router of exact BF16 values), else F32
             if (Ly.gqa && w16_.count(P + "ffn_gate_inp.weight") == 0) Ly.router32 = f32("ffn_gate_inp.weight");
             else Ly.router = b16("ffn_gate_inp.weight");
+            Ly.router16 = w16h_.count(P + "ffn_gate_inp.weight") != 0;
+            if (g.dsv4() && il < g.hash_layers) {
+                // deepseek4's hash-routed layers: the token's experts from the table, no selection bias
+                const auto it = wi32_.find(P + "ffn_gate_tid2eid.weight");
+                if (it == wi32_.end()) missing += P + "ffn_gate_tid2eid.weight (i32) ";
+                else Ly.tid2eid = it->second;
+            } else {
             // (llama.cpp's hy_v3 GGUFs name the selection bias exp_probs_b, ds4's and GLM's exp_probs_b.bias)
             Ly.router_bias = w_.count(P + "exp_probs_b.bias") == 0 && w_.count(P + "exp_probs_b") != 0
                                  ? f32("exp_probs_b") : f32("exp_probs_b.bias");
+            }
             Ly.sh_gate = q("ffn_gate_shexp.weight");
             Ly.sh_up = q("ffn_up_shexp.weight");
             Ly.sh_down = q("ffn_down_shexp.weight");
@@ -793,6 +832,54 @@ bool Glm5Model::fast_setup(std::string& err) {
         F->gv = F->gk + kf;
         F->gscr = F->gv + kf;
     }
+    if (g.dsv4()) {
+        // deepseek4's attention buffers (floats; the q8_1 copies at 36 / 32 bytes a value, rounded up)
+        const size_t QL = (size_t) g.q_lora, QH = (size_t) g.n_head * g.head_dim, LO = (size_t) g.o_groups * g.o_lora,
+                     IQ = (size_t) g.idx_heads * g.idx_key, NC = (size_t) std::max<int64_t>(1, max_ctx_ / 4 + 1);
+        const auto q8f = [](size_t n) { return (n / 32 * 36 + 3) / 4; };
+        const size_t fl = 2 * QL + q8f(QL) + QH + (size_t) g.head_dim + 4 * (size_t) g.head_dim + 4 * (size_t) g.idx_key +
+                          IQ + (size_t) g.idx_heads + NC + QH + q8f(QH) + LO + q8f(LO) + (size_t) g.idx_top_k + 64 * 16;
+        if (cudaMalloc(&F->d4, fl * sizeof(float)) != cudaSuccess) {
+            err = "glm fast: the deepseek4 attention buffers did not allocate";
+            return false;
+        }
+        float* at = F->d4;
+        const auto take = [&](size_t n) { float* r = at; at += (n + 15) / 16 * 16; return r; };
+        F->d4_qr = take(QL);
+        F->d4_qrn = take(QL);
+        F->d4_qrn_q8 = take(q8f(QL));
+        F->d4_q = take(QH);
+        F->d4_kv = take((size_t) g.head_dim);
+        F->d4_ckv = take(2 * (size_t) g.head_dim);
+        F->d4_csc = take(2 * (size_t) g.head_dim);
+        F->d4_ickv = take(2 * (size_t) g.idx_key);
+        F->d4_icsc = take(2 * (size_t) g.idx_key);
+        F->d4_iq = take(IQ);
+        F->d4_iw = take((size_t) g.idx_heads);
+        F->d4_score = take(NC);
+        F->d4_heads = take(QH);
+        F->d4_heads_q8 = take(q8f(QH));
+        F->d4_low = take(LO);
+        F->d4_low_q8 = take(q8f(LO));
+        F->d4_sel = (int*) take((size_t) g.idx_top_k);
+        // each layer's rope (rope_tail_layer_inplace): the compressed layers on compress_rope_freq_base with YaRN
+        F->d4_rope.assign((size_t) g.n_layers + 1, gf::Dsv4Rope{});
+        for (int il = 0; il < g.n_layers; ++il) {
+            gf::Dsv4Rope& r = F->d4_rope[(size_t) il];
+            const bool comp = g.ratio(il) != 0;
+            r.base = comp && g.comp_rope_base > 0.0f ? g.comp_rope_base : g.rope_base;
+            r.scale = comp && g.rope_factor > 0.0f ? 1.0f / g.rope_factor : 1.0f;
+            r.ext = comp && g.rope_factor > 1.0f ? 1.0f : 0.0f;
+            if (r.ext != 0.0f && g.rope_orig_ctx > 0) {
+                const float nd = (float) g.n_rot;
+                const auto cd = [&](float beta) {
+                    return nd * std::log((float) g.rope_orig_ctx / (beta * 2.0f * (float) M_PI)) / (2.0f * std::log(r.base));
+                };
+                r.corr0 = std::max(0.0f, std::floor(cd(g.yarn_fast)));
+                r.corr1 = std::min(nd - 1.0f, std::ceil(cd(g.yarn_slow)));
+            }
+        }
+    }
     if (mtp_il_ >= 0) {
         if (cudaMalloc(&F->mtp_h, (size_t) g.n_embd * sizeof(float)) != cudaSuccess ||
             cudaMalloc(&F->mtp_catq, (size_t) 2 * g.n_embd / 32 * 36) != cudaSuccess ||
@@ -859,8 +946,9 @@ bool Glm5Model::fast_setup(std::string& err) {
         // time, in part order - the first part's RAM measurement then sees none of the later parts' prompt staging, as
         // when they load one after another (it took that staging twice: once pinned, once in the headroom)
         if (split_load_ != nullptr) split_load_->wait(part_);
-        // the batched prompt path: its sizes (it borrows the pool's tail, see below)
-        if (!prefill_setup(err)) return false;
+        // the batched prompt path: its sizes (it borrows the pool's tail, see below).  (deepseek4: none yet - its
+        // prompts run through the token path)
+        if (!g.dsv4() && !prefill_setup(err)) return false;
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         {
@@ -3608,7 +3696,8 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     // a router job: BF16 (GLM's packs) or F32 (hy_v3's, as its GGUF stores it)
     const auto rjob = [&](const FastState::Layer& La, float* y) -> gf::MvJob {
         if (La.router32 != nullptr) return {La.router32, nullptr, F->x, y, nullptr, 1.0f, gf::kTypeF32, g.n_embd, g.n_expert};
-        return {La.router, nullptr, F->x, y, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.n_expert};
+        return {La.router, nullptr, F->x, y, nullptr, 1.0f, La.router16 ? gf::kTypeF16 : gf::kTypeBF16, g.n_embd,
+                g.n_expert};
     };
     j[0] = rjob(Ly, F->rlog);
     j[1] = {Ly.sh_gate.q, F->xq, nullptr, F->sh_g, nullptr, 1.0f, Ly.sh_gate.type, g.n_embd, FFs};
@@ -3654,7 +3743,8 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
                   pred ? F->plog : nullptr, pred ? F->L[(size_t) il + 1].router_bias : nullptr,
                   pred ? F->max_pf : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah,
                   il == mtp_il_ ? mtp_skip_from() : trunk_skip_from(il), lane ? F->cpu_plan : 0ull, promote_min,
-                  pf_rank, near_n);
+                  pf_rank, near_n, g.dsv4() ? 1 : 0,
+                  Ly.tid2eid != nullptr && cur_tok_ >= 0 ? Ly.tid2eid + (size_t) cur_tok_ * g.n_exp_used : nullptr);
     if (F->prof_on) F->mark("moe_route");
     ++F->expected;
     // the side stream copies the next layer's predicted experts while this layer computes.  STRATA_GLM_PREFETCH_AT:
@@ -3924,6 +4014,82 @@ void Glm5Model::kv_trim(int64_t keep) {
     (void) back;
 }
 
+// ---- deepseek4: one attention mixer (glm_dsv4.hpp): the projections of x (f32) / xq (q8_1), the q LoRA's middle,
+// the cache update, the indexer's pick (ratio 4, more pooled rows than its top k), the attention, the grouped output
+bool Glm5Model::fast_dsv4(int il, int64_t p, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const auto& Ly = F->L[(size_t) il];
+    const int r = g.ratio(il), HD = g.head_dim, W = r == 4 ? 2 * HD : HD, IW = 2 * g.idx_key;
+    gf::MvJob j[gf::kMaxMvJobs];
+    int nj = 0;
+    j[nj++] = {Ly.q_a.q, F->xq, nullptr, F->d4_qr, nullptr, 1.0f, Ly.q_a.type, g.n_embd, g.q_lora};
+    j[nj++] = {Ly.kv_a.q, F->xq, nullptr, F->d4_kv, nullptr, 1.0f, Ly.kv_a.type, g.n_embd, HD};
+    if (r > 0) {
+        j[nj++] = {Ly.c_kv, nullptr, F->x, F->d4_ckv, nullptr, 1.0f, gf::kTypeF16, g.n_embd, W};
+        j[nj++] = {Ly.c_gate, nullptr, F->x, F->d4_csc, nullptr, 1.0f, gf::kTypeF16, g.n_embd, W};
+    }
+    if (r == 4) {
+        j[nj++] = {Ly.ic_kv, nullptr, F->x, F->d4_ickv, nullptr, 1.0f, gf::kTypeF16, g.n_embd, IW};
+        j[nj++] = {Ly.ic_gate, nullptr, F->x, F->d4_icsc, nullptr, 1.0f, gf::kTypeF16, g.n_embd, IW};
+        j[nj++] = {Ly.idx_proj, nullptr, F->x, F->d4_iw, nullptr, 1.0f, gf::kTypeF16, g.n_embd, g.idx_heads};
+    }
+    if (!gf::mv(j, nj, s)) { err = "glm fast: deepseek4 projections"; return false; }
+    if (F->prof_on) F->mark("d4_proj_mv");
+    gf::dsv4_qr_norm(F->d4_qr, Ly.q_a_norm, g.norm_eps, g.q_lora, F->d4_qrn, F->d4_qrn_q8, s);
+    nj = 0;
+    j[nj++] = {Ly.q_b.q, F->d4_qrn_q8, nullptr, F->d4_q, nullptr, 1.0f, Ly.q_b.type, g.q_lora, g.n_head * HD};
+    if (r == 4)
+        j[nj++] = {Ly.idx_q_b, nullptr, F->d4_qrn, F->d4_iq, nullptr, 1.0f, gf::kTypeF16, g.q_lora,
+                   g.idx_heads * g.idx_key};
+    if (!gf::mv(j, nj, s)) { err = "glm fast: deepseek4 q"; return false; }
+    if (F->prof_on) F->mark("d4_q_mv");
+    gf::Dsv4Layer L;
+    L.ratio = r;
+    L.swa = (uint16_t*) (state_ + d4_swa_[(size_t) il]);
+    if (r > 0) {
+        L.comp = (uint16_t*) (state_ + d4_comp_[(size_t) il]);
+        L.st_kv = state_ + d4_st_[(size_t) il];
+        L.st_sc = L.st_kv + d4_st_floats(il) / 2;
+    }
+    if (r == 4) {
+        L.icomp = (uint16_t*) (state_ + d4_icomp_[(size_t) il]);
+        L.ist_kv = state_ + d4_ist_[(size_t) il];
+        L.ist_sc = L.ist_kv + 8 * 2 * g.idx_key;
+    }
+    const gf::Dsv4Rope& rope = F->d4_rope[(size_t) il];
+    const gf::Dsv4KvArgs a{F->d4_kv, Ly.kv_a_norm, F->d4_ckv, F->d4_csc, Ly.c_ape, Ly.c_norm,
+                           F->d4_ickv, F->d4_icsc, Ly.ic_ape, Ly.ic_norm, g.norm_eps, g.n_swa};
+    gf::dsv4_kv_update(a, L, rope, (int) p, s);
+    if (F->prof_on) F->mark("d4_kv");
+    const int n_comp = r > 0 ? (int) ((p + 1) / r) : 0;
+    const int* sel = nullptr;
+    int n_sel = n_comp;
+    if (r == 4 && n_comp > g.idx_top_k) {
+        gf::dsv4_indexer(F->d4_iq, F->d4_iw, g.idx_heads, L, n_comp, rope, (int) p, g.idx_top_k, F->d4_score, F->d4_sel, s);
+        sel = F->d4_sel;
+        n_sel = g.idx_top_k;
+        if (F->prof_on) F->mark("d4_indexer");
+    }
+    gf::dsv4_attn(F->d4_q, Ly.sinks, L, g.n_swa, (int) p, sel, n_sel, rope, g.norm_eps, g.n_head, F->d4_heads, s);
+    if (F->prof_on) F->mark("d4_attn");
+    // the grouped output: group gr's heads (GD values) through wo_a's rows [gr o_lora, (gr + 1) o_lora), then wo_b
+    gf::quantize_q8_1(F->d4_heads, F->d4_heads_q8, g.n_head * HD, s);
+    const int GD = g.n_head / g.o_groups * HD;
+    const size_t wrow = gf::row_bytes(Ly.o_a.type, GD);
+    for (int gr = 0; gr < g.o_groups; ++gr)
+        j[gr] = {(const uint8_t*) Ly.o_a.q + (size_t) gr * g.o_lora * wrow,
+                 (const uint8_t*) F->d4_heads_q8 + (size_t) gr * (GD / 32) * 36, nullptr, F->d4_low + (size_t) gr * g.o_lora,
+                 nullptr, 1.0f, Ly.o_a.type, GD, g.o_lora};
+    if (!gf::mv(j, g.o_groups, s)) { err = "glm fast: deepseek4 output a"; return false; }
+    gf::quantize_q8_1(F->d4_low, F->d4_low_q8, g.o_groups * g.o_lora, s);
+    gf::MvJob ob = {Ly.o_b.q, F->d4_low_q8, nullptr, F->mixer, nullptr, 1.0f, Ly.o_b.type, g.o_groups * g.o_lora, g.n_embd};
+    if (!gf::mv(&ob, 1, s)) { err = "glm fast: deepseek4 output b"; return false; }
+    if (F->prof_on) F->mark("d4_out_mv");
+    return true;
+}
+
 bool Glm5Model::fast_layers_gqa(int64_t p, std::string& err) {
     FastState* F = fast_;
     if (!kv_ensure(p + 16, err)) return false;   // (+16: the draft block's rows ahead of p)
@@ -4000,6 +4166,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
         h.post = F->post;
         h.comb = F->comb;
         h.w_fn = Ly.hc_attn_fn;
+        h.w_f16 = g.dsv4();
         h.w_scale = Ly.hc_attn_scale;
         h.w_base = Ly.hc_attn_base;
         h.norm_w = Ly.attn_norm;
@@ -4058,6 +4225,8 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
             gf::MvJob o = {Ly.out.q, F->gated_q, nullptr, F->mixer, nullptr, 1.0f, Ly.out.type, DI, g.n_embd};
             if (!gf::mv(&o, 1, s)) { err = "glm fast: kda output"; return false; }
             if (F->prof_on) F->mark("kda_out_mv");
+        } else if (Ly.dsv4) {
+            if (!fast_dsv4(il, p, err)) return false;
         } else {
             if (!fast_dsa(il, p, err)) return false;
         }
@@ -4127,6 +4296,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const int64_t p = pos_++;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->cur_tok_ = token;
     // between tokens (every device idle): finished promotions go live in the device tables
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         cudaSetDevice(m->dev_);
@@ -4170,6 +4340,10 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     if (g.gqa())
         gf::rms_q8(tail->state_, nullptr, tail->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FT->head_x,
                    FT->head_xq, FT->cs);
+    else if (g.dsv4())
+        gf::dsv4_hc_head(tail->state_, tail->w16_.at("output_hc_fn.weight"), tail->w_.at("output_hc_scale.weight"),
+                         tail->w_.at("output_hc_base.weight"), g.hc_eps, tail->w_.at("output_norm.weight"), g.norm_eps,
+                         g.n_embd, FT->head_x, FT->head_xq, FT->cs);
     else
         gf::head_prep(tail->state_, tail->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FT->head_x, FT->head_xq,
                       FT->cs);

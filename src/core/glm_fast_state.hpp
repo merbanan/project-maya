@@ -5,6 +5,7 @@
 
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/glm_dsv4.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "glm_memory.hpp"
 #include "glm_layer_graphs.hpp"
@@ -210,6 +211,14 @@ struct Glm5Model::FastState {
     void *qr_q = nullptr, *attn_q = nullptr;
     // hy_v3's attention: q (n_head x 128), k and v (n_kv x 128), the attention scratch (splits + output)
     float *gq = nullptr, *gk = nullptr, *gv = nullptr, *gscr = nullptr;
+    // deepseek4's attention buffers (one allocation, d4 at its head): qr, qr_n (+ q8_1), q, kv_raw, the compressor
+    // projections, the indexer's q and weights, the scores, the selection, the heads (+ q8_1), the low rank (+ q8_1)
+    float *d4 = nullptr, *d4_qr = nullptr, *d4_qrn = nullptr, *d4_q = nullptr, *d4_kv = nullptr, *d4_ckv = nullptr,
+          *d4_csc = nullptr, *d4_ickv = nullptr, *d4_icsc = nullptr, *d4_iq = nullptr, *d4_iw = nullptr,
+          *d4_score = nullptr, *d4_heads = nullptr, *d4_low = nullptr;
+    void *d4_qrn_q8 = nullptr, *d4_heads_q8 = nullptr, *d4_low_q8 = nullptr;
+    int* d4_sel = nullptr;
+    std::vector<gf::Dsv4Rope> d4_rope;   // per layer
     float *rlog = nullptr, *plog = nullptr, *sh_g = nullptr, *sh_u = nullptr;
     float* sh_out = nullptr;   // the shared expert's down (n_embd), computed alongside the routed gate/up
     // prediction quality (the next layer's router on this layer's FFN input)
@@ -265,7 +274,14 @@ struct Glm5Model::FastState {
     int* tok_h = nullptr;       // pinned
     // per layer: the resolved weights
     struct Layer {
-        bool recr = false, moe = false, mtp = false, gqa = false;
+        bool recr = false, moe = false, mtp = false, gqa = false, dsv4 = false;
+        // deepseek4: the attention's own weights (q_a, q_b, kv_a = attn_kv, q_a_norm, kv_a_norm, idx_q_b, idx_proj below)
+        WSlot o_a, o_b;
+        const float* sinks = nullptr;
+        const uint16_t *c_kv = nullptr, *c_gate = nullptr, *ic_kv = nullptr, *ic_gate = nullptr;   // FP16
+        const float *c_ape = nullptr, *c_norm = nullptr, *ic_ape = nullptr, *ic_norm = nullptr;
+        const int32_t* tid2eid = nullptr;   // the hash-routing table (the first hash_layers layers)
+        bool router16 = false;              // the router is FP16
         const float *q_norm = nullptr, *k_norm = nullptr;          // hy_v3: per-head q / k RMS norms (head_dim)
         const float* router32 = nullptr;                            // hy_v3: the router in F32 (as the GGUF stores it)
         WSlot eh;                                                   // the NextN block: eh_proj and its norms

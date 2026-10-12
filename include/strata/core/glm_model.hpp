@@ -29,6 +29,7 @@
 #include <condition_variable>
 #include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -78,17 +79,30 @@ struct Glm5Geometry {
     // hy_v3 (Tencent Hy3): every layer is grouped-query attention (n_head query heads over n_kv K/V heads of
     // head_dim, per-head RMS norms on q and k, NeoX rope over the whole head) with plain pre-norm residuals - no
     // hyper-connections (hc = 1), no KDA, no DSA; the MoE side is GLM's (sigmoid router + bias, shared expert)
-    int arch = 0;                      // 0 glm5-next, 1 hy_v3
+    int arch = 0;                      // 0 glm5-next, 1 hy_v3, 2 deepseek4
     int n_kv = 8, head_dim = 128;
     float rope_base = 10000.0f;
+    // deepseek4 (DeepSeek-V4 Flash): every layer is one-K/V-head attention of head_dim (512; the value is the key
+    // vector) over a sliding window of n_swa raw rows plus, per comp_ratio, pooled rows - 4: one a 4 positions with
+    // an indexer picking idx_top_k of them; 128: one a 128 positions, all visible - with a per-head sink logit;
+    // q from a LoRA (q_lora) with a per-head RMS norm; rope on the last n_rot dims of a head (YaRN on the compressed
+    // layers); the output through o_groups grouped LoRAs (o_lora each).  mHC as glm5-next (hc, sinkhorn_iters) with a
+    // learned head mix; the router sqrt(softplus) (+ bias for the pick), hash routing by token id on the first
+    // hash_layers layers.
+    int n_rot = 64, o_lora = 1024, o_groups = 8, n_swa = 128, hash_layers = 0;
+    std::vector<int> comp_ratio;       // per layer: 0, 4 or 128
+    float comp_rope_base = 160000.0f, rope_factor = 1.0f, yarn_fast = 32.0f, yarn_slow = 1.0f;
+    int64_t rope_orig_ctx = 0;
     std::vector<int32_t> eog;          // the end-of-generation ids from the GGUF (empty: the driver's GLM set)
 
     int d_inner() const { return kda_head_dim * n_head; }
     int top_pools_max() const { return idx_top_k / idx_kpool; }
     int n_sel_max() const { return idx_top_k + (idx_select_tail ? idx_kpool - 1 : 0); }
     bool gqa() const { return arch == 1; }
-    bool is_recr(int il) const { return !gqa() && n_head_kv[(size_t) il] == 0; }
-    bool is_dsa(int il) const { return !gqa() && n_head_kv[(size_t) il] != 0; }
+    bool dsv4() const { return arch == 2; }
+    bool is_recr(int il) const { return arch == 0 && n_head_kv[(size_t) il] == 0; }
+    bool is_dsa(int il) const { return arch == 0 && n_head_kv[(size_t) il] != 0; }
+    int ratio(int il) const { return dsv4() && il >= 0 && il < (int) comp_ratio.size() ? comp_ratio[(size_t) il] : 0; }
 
     static bool from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
 };
@@ -220,6 +234,11 @@ private:
     // per-layer state offsets, in floats into state_ (-1: the layer has no such state)
     std::vector<int64_t> kda_S_, kda_conv_, dsa_lat_, dsa_ik_, dsa_ig_, dsa_pool_;
     std::vector<int64_t> gqa_kv_;                 // hy_v3: per layer region a of the K / V records (floats into state_), -1 none
+    // deepseek4: per layer (floats into state_) the raw ring, the pooled rows, the pooled indexer rows, the compressor
+    // windows (kv then scores) and the indexer compressor's; -1 none
+    std::vector<int64_t> d4_swa_, d4_comp_, d4_icomp_, d4_st_, d4_ist_;
+    int64_t d4_st_floats(int il) const;           // a layer's compressor window floats (kv + scores)
+    void d4_reset_scores();                       // the windows' scores to -inf (the empty window)
     // hy_v3's position-major K / V records (glm_fast.hpp GqaKv): a record's bytes, each layer's offset inside it, the
     // first position of region b - the expert pool's lendable tail (xpool), lent to the cache as the context grows
     // (kv_ensure) and back when it shrinks (kv_trim) - its bytes, and the positions lent so far ([p0, kv_lent_))
@@ -392,6 +411,9 @@ public:
     int last_tok_ = -1;                                    // the greedy argmax of the last fast forward
     int32_t force_tok_ = -1;                               // force_next()
     std::map<std::string, const uint16_t*> w16_;           // the pack's big BF16 rows, kept BF16 (fast mode)
+    std::set<std::string> w16h_;                           // ... those of them that are FP16 (deepseek4)
+    std::map<std::string, const int32_t*> wi32_;           // I32 rows (deepseek4's hash-routing tables), on the device
+    int32_t cur_tok_ = -1;                                 // the token the fast path is running (hash routing)
     bool fast_setup(std::string& err);
     bool fast_setup_finish(std::string& err);
     void ram_left_check() const;
@@ -401,6 +423,7 @@ public:
     bool fast_layers(int64_t p, bool hop_in, std::string& err);
     bool fast_dsa(int il, int64_t p, std::string& err);     // one DSA mixer (x -> mixer)
     bool fast_gqa(int il, int64_t p, std::string& err);     // hy_v3: one attention mixer (xq -> mixer)
+    bool fast_dsv4(int il, int64_t p, std::string& err);    // deepseek4: one attention mixer (x, xq -> mixer)
     // hy_v3, STRATA_GLM_KV_STREAM=<positions>: the whole cache in host memory, that many positions a layer cached in
     // VRAM, a decode step attending to the best pages (glm_kv_stream.hpp)
     KvStream* kvs_ = nullptr;
