@@ -83,6 +83,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <csignal>
+#if defined(__linux__)
+#include <execinfo.h>
+#include <unistd.h>
+#endif
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -2726,7 +2730,26 @@ static int glm_pack_generate(const Options& o) {
 
 }  // namespace
 
+#if defined(__linux__)
+// STRATA_SEGV_TRACE=1 (debug): a crash prints the frames' addresses (addr2line -e build/strata resolves them)
+static void segv_trace(int sig) {
+    void* f[64];
+    const int n = backtrace(f, 64);
+    const char m[] = "strata: fatal signal, frames:\n";
+    (void) !write(2, m, sizeof m - 1);
+    backtrace_symbols_fd(f, n, 2);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+#endif
+
 int main(int argc, char** argv) {
+#if defined(__linux__)
+    if (getenv("STRATA_SEGV_TRACE") != nullptr) {
+        signal(SIGSEGV, segv_trace);
+        signal(SIGABRT, segv_trace);
+    }
+#endif
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.

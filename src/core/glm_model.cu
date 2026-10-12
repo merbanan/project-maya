@@ -106,7 +106,7 @@ static bool pack_shard_names(const std::string& pack_dir, std::vector<std::strin
 static uint64_t pack_row_vram(const std::string& name, const std::string& kind, const strata::TensorInfo* t, bool fast,
                               std::string* how = nullptr) {
     if (fast && name == "token_embd.weight") return 0;
-    if (fast && (kind == "4" || kind == "5") && t->elements() >= 65536) {
+    if (fast && (kind == "4" || (kind == "5" && name.find("_ape.") == std::string::npos)) && t->elements() >= 65536) {
         if (how) *how = kind == "4" ? " bf16" : " f16";
         return ((uint64_t) t->elements() * 2 + 255u) & ~(uint64_t) 255u;
     }
@@ -2537,7 +2537,9 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // token_embd at all (the embedding row is dequantized on the host from the shard mapping)
     fast_mode_ = getenv("STRATA_GLM_SLOW") == nullptr;
     const auto keep16 = [&](const Row& r, const strata::TensorInfo* t) {
-        return fast_mode_ && (r.kind == "4" || r.kind == "5") && t->elements() >= 65536;
+        // (deepseek4's ape tables stay F32 whatever their size: the compressor adds their rows to its scores in F32)
+        return fast_mode_ && (r.kind == "4" || (r.kind == "5" && r.name.find("_ape.") == std::string::npos)) &&
+               t->elements() >= 65536;
     };
     const auto skip_upload = [&](const Row& r) { return fast_mode_ && r.name == "token_embd.weight"; };
     uint64_t bytes = 0;

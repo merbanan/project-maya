@@ -1428,7 +1428,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             err = "glm fast: the table update buffers did not allocate";
             return false;
         }
-        F->stage.assign((size_t) g.n_exp_used, nullptr);
+        F->stage.assign((size_t) std::max(8, g.n_exp_used), nullptr);   // (the warm streams 8 a batch; DeepSeek-V4 routes 6)
         for (auto& sbuf : F->stage)
             if (cudaHostAlloc((void**) &sbuf, sstride, cudaHostAllocPortable) != cudaSuccess) {
                 err = "glm fast: pinned disk staging did not allocate";
