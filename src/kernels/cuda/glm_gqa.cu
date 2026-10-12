@@ -51,7 +51,6 @@ __host__ __device__ __forceinline__ int row_bytes(int kind) {
          : kind == kT3 ? kD * 3 / 8 + 4 : kind == kT4 ? kD / 2 + 4 : kD * 6 / 8 + 4;
 }
 __host__ __device__ __forceinline__ int tq_levels(int kind) { return kind == kT3 ? 8 : kind == kT4 ? 16 : 64; }
-__host__ __device__ __forceinline__ int tq_code_bytes(int kind) { return row_bytes(kind) - 4; }
 // the Lloyd-Max levels of a unit Gaussian (MSE 0.0346 / 0.0095 / 0.00064)
 __constant__ float c_cb3[8] = {-2.151946f, -1.343909f, -0.756005f, -0.245094f, 0.245094f, 0.756005f, 1.343909f,
                                2.151946f};
@@ -91,24 +90,40 @@ __device__ __forceinline__ float wmax(float v) {
     return v;
 }
 
-// a K or V row (position, head): its record (region a below p0, else b), the layer's K / V part, the head's row
+// a K or V row (position, head): its record (region a below p0, else b; a streamed view's cached page), the layer's
+// part of it - laid out [K codes][V codes][K scales][V scales], so every row's codes are 16-byte aligned (whole-row
+// vector loads) - the head's codes at coff + h cb and scales at soff + h sb
+__host__ __device__ __forceinline__ int code_bytes(int kind) {
+    return kind == kF16 ? kD * 2 : kind == kI8 ? kD : kind == kL4 ? kD / 2 : kind == kT3 ? kD * 3 / 8 : kind == kT4 ? kD / 2
+         : kD * 6 / 8;
+}
+__host__ __device__ __forceinline__ int scale_bytes(int kind) {
+    return kind == kF16 ? 0 : kind == kI8 || kind == kL4 ? (kD / 32) * 2 : 4;
+}
 struct Rows {
     const uint8_t* a;
     const uint8_t* b;
     long long p0, rec;
-    int off, rb, kind;   // kind: kF16 .. kT6
-    const float* cb;     // a TurboQuant kind's levels (shared memory)
+    int coff, cb, soff, sb, kind;   // kind: kF16 .. kT6
+    const float* lv;     // a TurboQuant kind's levels (shared memory)
     const int* ptab;     // KV streaming: the rows of the cached pages (page table -> slots, rec bytes a position)
     const uint8_t* slots;
-    __device__ __forceinline__ const uint8_t* row(long long pos, int h) const {
-        if (ptab != nullptr)
-            return slots + ((size_t) ptab[pos / kGqaPage] * kGqaPage + (size_t) (pos % kGqaPage)) * rec + off + h * rb;
-        return (pos < p0 ? a + pos * rec : b - (pos - p0) * rec) + off + h * rb;   // (region b grows down)
+    __device__ __forceinline__ const uint8_t* base(long long pos) const {
+        if (ptab != nullptr) return slots + ((size_t) ptab[pos / kGqaPage] * kGqaPage + (size_t) (pos % kGqaPage)) * rec;
+        return pos < p0 ? a + pos * rec : b - (pos - p0) * rec;   // (region b grows down)
     }
+    __device__ __forceinline__ const uint8_t* codes(const uint8_t* bp, int h) const { return bp + coff + h * cb; }
+    __device__ __forceinline__ const uint8_t* scales(const uint8_t* bp, int h) const { return bp + soff + h * sb; }
     __device__ __forceinline__ void load4(long long pos, int h, int d, float& x0, float& x1, float& x2, float& x3) const {
-        const uint8_t* rp = row(pos, h);
+        load4_b(base(pos), h, d, x0, x1, x2, x3);
+    }
+    // values d .. d + 3 of head h's row in the record at bp
+    __device__ __forceinline__ void load4_b(const uint8_t* bp, int h, int d, float& x0, float& x1, float& x2,
+                                            float& x3) const {
+        const uint8_t* rp = codes(bp, h);
+        const uint8_t* sp = scales(bp, h);
         if (kind >= kT3) {
-            const float sc = *(const float*) (rp + tq_code_bytes(kind));
+            const float sc = *(const float*) sp;
             unsigned c0, c1, c2, c3;
             if (kind == kT4) {
                 const unsigned qq = *(const uint16_t*) (rp + d / 2);
@@ -124,17 +139,17 @@ struct Rows {
                 c2 = ((lo >> 8) & 15) | (((hi >> 4) & 3) << 4);
                 c3 = (lo >> 12) | ((hi >> 6) << 4);
             }
-            x0 = cb[c0] * sc; x1 = cb[c1] * sc; x2 = cb[c2] * sc; x3 = cb[c3] * sc;
+            x0 = lv[c0] * sc; x1 = lv[c1] * sc; x2 = lv[c2] * sc; x3 = lv[c3] * sc;
         } else if (kind == kL4) {
             const uint16_t qq = *(const uint16_t*) (rp + d / 2);
-            const float sc = __half2float(((const __half*) (rp + kD / 2))[d / 32]);
+            const float sc = __half2float(((const __half*) sp)[d / 32]);
             x0 = (float) ((int) (qq & 15) - 8) * sc;
             x1 = (float) ((int) ((qq >> 4) & 15) - 8) * sc;
             x2 = (float) ((int) ((qq >> 8) & 15) - 8) * sc;
             x3 = (float) ((int) ((qq >> 12) & 15) - 8) * sc;
         } else if (kind == kI8) {
             const char4 q = *(const char4*) (rp + d);
-            const float sc = __half2float(((const __half*) (rp + kD))[d / 32]);
+            const float sc = __half2float(((const __half*) sp)[d / 32]);
             x0 = q.x * sc; x1 = q.y * sc; x2 = q.z * sc; x3 = q.w * sc;
         } else {
             const __half2* hp = (const __half2*) ((const __half*) rp + d);
@@ -144,13 +159,16 @@ struct Rows {
     }
 };
 // (cached: the rows of the cached pages - a streamed view's selection; else the view's own records)
-__device__ __forceinline__ Rows k_rows(const GqaKv& kv, const float* cb = nullptr, bool cached = false) {
-    return {(const uint8_t*) kv.a, (const uint8_t*) kv.b, kv.p0, kv.rec, kv.k_off, row_bytes(kv.kk), kv.kk, cb,
-            cached ? kv.ptab : nullptr, kv.slots};
+__device__ __forceinline__ Rows k_rows(const GqaKv& kv, const float* lv = nullptr, bool cached = false) {
+    const int ck = code_bytes(kv.kk), cv = code_bytes(kv.vk);
+    return {(const uint8_t*) kv.a, (const uint8_t*) kv.b, kv.p0, kv.rec, kv.k_off, ck,
+            kv.k_off + kv.n_kv * (ck + cv), scale_bytes(kv.kk), kv.kk, lv, cached ? kv.ptab : nullptr, kv.slots};
 }
-__device__ __forceinline__ Rows v_rows(const GqaKv& kv, const float* cb = nullptr, bool cached = false) {
-    return {(const uint8_t*) kv.a, (const uint8_t*) kv.b, kv.p0, kv.rec, kv.k_off + kv.n_kv * row_bytes(kv.kk),
-            row_bytes(kv.vk), kv.vk, cb, cached ? kv.ptab : nullptr, kv.slots};
+__device__ __forceinline__ Rows v_rows(const GqaKv& kv, const float* lv = nullptr, bool cached = false) {
+    const int ck = code_bytes(kv.kk), cv = code_bytes(kv.vk);
+    return {(const uint8_t*) kv.a, (const uint8_t*) kv.b, kv.p0, kv.rec, kv.k_off + kv.n_kv * ck, cv,
+            kv.k_off + kv.n_kv * (ck + cv + scale_bytes(kv.kk)), scale_bytes(kv.vk), kv.vk, lv,
+            cached ? kv.ptab : nullptr, kv.slots};
 }
 // the decode's key index i: position i, or (a streamed view's selection) position j of the (i / kGqaPage)-th selected
 // page; n_idx keys in all, those at n_pos or past it (the last page's tail) masked
@@ -194,7 +212,9 @@ __device__ __forceinline__ void fwht128(float* s, int t) {
 // one row of 128 values into the cache (kD threads, value t from each): FP16, INT8 with a scale per 32 (a warp), or
 // 4-bit codes, two a byte (the even thread writes the pair), with a scale per 32
 __device__ __forceinline__ void store_row(const Rows& R, long long pos, int h, int t, float val) {
-    uint8_t* rp = (uint8_t*) R.row(pos, h);
+    const uint8_t* bp = R.base(pos);
+    uint8_t* rp = (uint8_t*) R.codes(bp, h);
+    uint8_t* sp = (uint8_t*) R.scales(bp, h);
     if (R.kind >= kT3) {   // TurboQuant (a rotated row): the nearest level of val * sqrt(128) / |row|, the LS scale
         __shared__ float red[4];
         const float* cb = tq_cb(R.kind);
@@ -225,20 +245,20 @@ __device__ __forceinline__ void store_row(const Rows& R, long long pos, int h, i
                 g[2] = (uint8_t) (u >> 16);
             }
         }
-        if (t == 0) *(float*) (rp + tq_code_bytes(R.kind)) = den > 0.0f ? num / den : 0.0f;
+        if (t == 0) *(float*) sp = den > 0.0f ? num / den : 0.0f;
     } else if (R.kind == kL4) {
         const float amax = wmax(fabsf(val));
         const float sc = amax / 7.0f;
         const int q = sc > 0.0f ? max(-7, min(7, __float2int_rn(val / sc))) : 0;
         const int qn = __shfl_xor_sync(0xffffffffu, q, 1);
         if ((t & 1) == 0) rp[t / 2] = (uint8_t) ((q + 8) | ((qn + 8) << 4));
-        if ((t & 31) == 0) ((__half*) (rp + kD / 2))[t / 32] = __float2half(sc);
+        if ((t & 31) == 0) ((__half*) sp)[t / 32] = __float2half(sc);
     } else if (R.kind == kI8) {
         const float amax = wmax(fabsf(val));
         const float sc = amax / 127.0f;
         const int q = sc > 0.0f ? __float2int_rn(val / sc) : 0;
         rp[t] = (uint8_t) (int8_t) max(-127, min(127, q));
-        if ((t & 31) == 0) ((__half*) (rp + kD))[t / 32] = __float2half(sc);
+        if ((t & 31) == 0) ((__half*) sp)[t / 32] = __float2half(sc);
     } else {
         ((__half*) rp)[t] = __float2half(val);
     }
@@ -1008,6 +1028,203 @@ __global__ void gqa_invalidate_kernel(GqaStream st, int page_lo, int page_hi) {
     }
 }
 
+// ---- decode, wide (the default): block (K/V head, split of `chunk` keys), 128 threads, ~8 KB of shared memory - many
+// blocks an SM, so many loads in flight (the tensor-core kernel below fits two: ~10% of the memory's bandwidth).  Per
+// 128-key tile: (1) thread t takes key t's scores for the G heads, streaming its K row against q in shared memory (a
+// broadcast read); (2) warp w the online softmax of heads w, w + 4, ...; (3) warp w the keys 32 w .. 32 w + 31 of P.V,
+// a lane 4 dimensions, every head's output in registers.  The warps' outputs are summed once, at the end.
+constexpr int kST = 128;
+// q (G heads, shared memory) . head h's K row in the record at bp -> sc[G], the row read in 16-byte loads and decoded in
+// registers (a thread a key: dims at a time from one load, nothing for L1 to keep between them)
+template <int G>
+__device__ __forceinline__ void dot_row(const Rows& K, const uint8_t* bp, int h, const float (*sq)[kD], float* sc) {
+    const uint8_t* cp = K.codes(bp, h);
+    const uint8_t* spp = K.scales(bp, h);
+    const auto fma8 = [&](int d, const float* x) {
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            const float4 a = *(const float4*) &sq[g][d], b = *(const float4*) &sq[g][d + 4];
+            sc[g] += a.x * x[0] + a.y * x[1] + a.z * x[2] + a.w * x[3] + b.x * x[4] + b.y * x[5] + b.z * x[6] + b.w * x[7];
+        }
+    };
+    float x[8];
+    if (K.kind == kF16) {
+#pragma unroll 4
+        for (int c = 0; c < kD / 8; ++c) {
+            const uint4 u = ((const uint4*) cp)[c];
+            const __half2* hh = (const __half2*) &u;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 f = __half22float2(hh[j]);
+                x[2 * j] = f.x;
+                x[2 * j + 1] = f.y;
+            }
+            fma8(8 * c, x);
+        }
+    } else if (K.kind == kI8) {
+        const uint2 s4 = *(const uint2*) spp;   // (4 FP16 scales, one a 32)
+        const __half* hs = (const __half*) &s4;
+#pragma unroll
+        for (int c = 0; c < kD / 16; ++c) {
+            const uint4 u = ((const uint4*) cp)[c];
+            const float scb = __half2float(hs[c / 2]);
+            const int8_t* qb = (const int8_t*) &u;
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) x[j] = (float) qb[8 * k + j] * scb;
+                fma8(16 * c + 8 * k, x);
+            }
+        }
+    } else if (K.kind == kT4 || K.kind == kT6) {
+        const float rs = *(const float*) spp;
+#pragma unroll
+        for (int c = 0; c < kD / 32; ++c) {
+            const uint4 lo = ((const uint4*) cp)[c];   // 32 nibbles: dims 32 c ..
+            uint2 hi = make_uint2(0, 0);
+            if (K.kind == kT6) hi = ((const uint2*) (cp + kD / 2))[c];   // their high 2 bits
+            const unsigned lw[4] = {lo.x, lo.y, lo.z, lo.w};
+            const unsigned hw[4] = {hi.x & 0xffffu, hi.x >> 16, hi.y & 0xffffu, hi.y >> 16};
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) x[j] = K.lv[((lw[k] >> (4 * j)) & 15u) | (((hw[k] >> (2 * j)) & 3u) << 4)];
+                fma8(32 * c + 8 * k, x);
+            }
+        }
+#pragma unroll
+        for (int g = 0; g < G; ++g) sc[g] *= rs;
+    } else {   // (3-bit and 4-bit linear K: no packing of their own here)
+#pragma unroll 4
+        for (int d = 0; d < kD; d += 4) {
+            K.load4_b(bp, h, d, x[0], x[1], x[2], x[3]);
+#pragma unroll
+            for (int g = 0; g < G; ++g) {
+                const float4 a = *(const float4*) &sq[g][d];
+                sc[g] += a.x * x[0] + a.y * x[1] + a.z * x[2] + a.w * x[3];
+            }
+        }
+    }
+}
+template <int G>
+__global__ void __launch_bounds__(kST) gqa_attn_wide_kernel(const float* __restrict__ q, GqaKv kv, int n_pos,
+                                                            float scale, int chunk, float* __restrict__ part) {
+    constexpr int NW = kST / 32, HW = (G + NW - 1) / NW;   // warps, heads a warp
+    __shared__ __align__(16) float sq[G][kD];
+    __shared__ float sp[G][kST + 1];
+    __shared__ float scorr[G], smx[G], sls[G];
+    __shared__ float scb[2][64];
+    const int kvh = blockIdx.x, split = blockIdx.y, t = threadIdx.x, lane = t & 31, w = t >> 5;
+    load_cbs(scb, kv.kk, kv.vk, t, kST);
+    for (int i = t; i < G * kD; i += kST) sq[i / kD][i % kD] = q[(size_t) kvh * G * kD + i] * scale;
+    __syncthreads();
+    const Keys ks = keys_of(kv, n_pos);
+    const bool cached = kv.sel != nullptr;
+    const Rows K = k_rows(kv, scb[0], cached), V = v_rows(kv, scb[1], cached);
+    const int k_lo = split * chunk, k_hi = min(k_lo + chunk, ks.n_idx);
+    float m_r[HW], l_r[HW];
+#pragma unroll
+    for (int j = 0; j < HW; ++j) {
+        m_r[j] = -INFINITY;
+        l_r[j] = 0.0f;
+    }
+    float acc[G][4];
+#pragma unroll
+    for (int g = 0; g < G; ++g) acc[g][0] = acc[g][1] = acc[g][2] = acc[g][3] = 0.0f;
+    for (int k0 = k_lo; k0 < k_hi; k0 += kST) {
+        {   // (1) key k0 + t
+            const int i = k0 + t;
+            float sc[G];
+            if (i < k_hi && ks.ok(i)) {
+#pragma unroll
+                for (int g = 0; g < G; ++g) sc[g] = 0.0f;
+                dot_row<G>(K, K.base(ks.pos(i)), kvh, sq, sc);
+            } else {
+#pragma unroll
+                for (int g = 0; g < G; ++g) sc[g] = -INFINITY;
+            }
+#pragma unroll
+            for (int g = 0; g < G; ++g) sp[g][t] = sc[g];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < HW; ++j) {   // (2)
+            const int g = w + NW * j;
+            if (g >= G) break;
+            float mt = -INFINITY;
+            for (int x = lane; x < kST; x += 32) mt = fmaxf(mt, sp[g][x]);
+            mt = wmax(mt);
+            const float mn = fmaxf(m_r[j], mt);
+            const float corr = m_r[j] == -INFINITY ? 0.0f : __expf(m_r[j] - mn);
+            float ls = 0.0f;
+            for (int x = lane; x < kST; x += 32) {
+                const float v = sp[g][x];
+                const float pv = v == -INFINITY ? 0.0f : __expf(v - mn);
+                sp[g][x] = pv;
+                ls += pv;
+            }
+            ls = wsum(ls);
+            l_r[j] = l_r[j] * corr + ls;
+            m_r[j] = mn;
+            if (lane == 0) scorr[g] = corr;
+        }
+        __syncthreads();
+        {   // (3)
+#pragma unroll
+            for (int g = 0; g < G; ++g) {
+                const float c = scorr[g];
+                acc[g][0] *= c; acc[g][1] *= c; acc[g][2] *= c; acc[g][3] *= c;
+            }
+            const int d4 = 4 * lane;
+            // (a no-test loop over the valid prefix where the view is not streamed: 143 registers, 25% slower)
+#pragma unroll 8
+            for (int x = 0; x < 32; ++x) {
+                const int kk = w * 32 + x, i = k0 + kk;
+                if (!(i < k_hi && ks.ok(i))) continue;   // (masked keys: their rows may be stale)
+                float v0, v1, v2, v3;
+                V.load4(ks.pos(i), kvh, d4, v0, v1, v2, v3);
+#pragma unroll
+                for (int g = 0; g < G; ++g) {
+                    const float pv = sp[g][kk];
+                    acc[g][0] += pv * v0; acc[g][1] += pv * v1; acc[g][2] += pv * v2; acc[g][3] += pv * v3;
+                }
+            }
+        }
+        __syncthreads();   // (sp is the next tile's)
+    }
+    // the warps' outputs (all relative to the same running max) summed in sp's memory, one warp after another
+    float* sO = &sp[0][0];
+#pragma unroll
+    for (int x = 0; x < NW; ++x) {
+        if (w == x)
+#pragma unroll
+            for (int g = 0; g < G; ++g)
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    float& o = sO[g * kD + 4 * lane + c];
+                    o = (x == 0 ? 0.0f : o) + acc[g][c];
+                }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int j = 0; j < HW; ++j) {
+        const int g = w + NW * j;
+        if (g < G && lane == 0) {
+            smx[g] = m_r[j];
+            sls[g] = l_r[j];
+        }
+    }
+    __syncthreads();
+    for (int g = 0; g < G; ++g) {
+        float* o = part + ((size_t) (kvh * G + g) * gridDim.y + split) * (kD + 2);
+        o[t] = sO[g * kD + t];
+        if (t == 0) {
+            o[kD] = smx[g];
+            o[kD + 1] = sls[g];
+        }
+    }
+}
+
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) std::fprintf(stderr, "glm_gqa %s: %s\n", what, cudaGetErrorString(e));
@@ -1055,7 +1272,8 @@ GqaKv gqa_kv_view(void* a, void* b, int64_t p0, int64_t rec, int64_t layer_off, 
 }
 
 size_t gqa_attn_scratch_floats(int n_head, int max_pos) {
-    const int n_split = (max_pos + kChunk - 1) / kChunk;
+    // (the wide kernel's splits: at most kWideSplits a K/V head - see gqa_attn)
+    const int n_split = std::max((max_pos + kChunk - 1) / kChunk, 256);
     return (size_t) n_head * n_split * (kD + 2) + (size_t) n_head * kD;
 }
 
@@ -1073,6 +1291,26 @@ bool gqa_attn(const float* q, const GqaKv& kv, int n_pos, int n_head, float* scr
     if (n_head % kv.n_kv != 0 || n_head / kv.n_kv > kMaxGroup || n_pos < 1) return false;
     // (a streamed view: the splits of its largest selection - those past the step's own selection are empty)
     const int n_keys = kv.sel != nullptr ? kv.max_sel * kGqaPage : n_pos;
+    // STRATA_GLM_GQA_DEC=wide (the default for 8 heads a K/V head) | tc | warp
+    static const int dec = [] {
+        const char* v = getenv("STRATA_GLM_GQA_DEC");
+        return v == nullptr ? 0 : std::strcmp(v, "tc") == 0 ? 1 : std::strcmp(v, "warp") == 0 ? 2 : 0;
+    }();
+    if (dec == 0 && n_head / kv.n_kv == 8) {
+        // splits of whole 128-key tiles, ~40 a K/V head (~320 blocks: four an SM on 80): more splits, more blocks at once
+        // but a larger combine
+        static const int target = getenv("DBG_SPLITS") ? std::atoi(getenv("DBG_SPLITS")) : 40;
+        const int tiles = (n_keys + kST - 1) / kST, per = std::max(1, (tiles + target - 1) / target), chunk = per * kST;
+        const int n_split = (n_keys + chunk - 1) / chunk;
+        float* part = scratch;
+        float* out = scratch + (size_t) n_head * n_split * (kD + 2);
+        gqa_attn_wide_kernel<8><<<dim3(kv.n_kv, n_split), kST, 0, s>>>(q, kv, n_pos, 1.0f / sqrtf((float) kD), chunk, part);
+        check("gqa_attn_wide");
+        gqa_combine_kernel<<<n_head, kD, 0, s>>>(part, n_split, out, v_rot(kv));
+        check("gqa_combine");
+        quantize_q8_1(out, out_q8_1, n_head * kD, s);
+        return true;
+    }
     const int n_split = (n_keys + kChunk - 1) / kChunk;
     float* part = scratch;
     float* out = scratch + (size_t) n_head * n_split * (kD + 2);
@@ -1083,7 +1321,7 @@ bool gqa_attn(const float* q, const GqaKv& kv, int n_pos, int n_head, float* scr
         int dev = 0, major = 0;
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        return major >= 7 && !(v != nullptr && v[0] == '0');
+        return major >= 7 && !(v != nullptr && v[0] == '0') && dec != 2;
     }();
     // (below 128 positions the warp kernel is faster: 6 against 10 us a layer at 1 position, 21 against 31 at 37)
     if (tc && std::min(n_keys, n_pos) >= 128)
