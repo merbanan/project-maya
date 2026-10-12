@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace strata::kernels {
 namespace {
@@ -435,6 +436,8 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
     if (threadIdx.x == 0) out[t] = pick;
 }
 
+#include "sampler_legacy.inc"
+
 }  // namespace
 
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
@@ -454,10 +457,24 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
         sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, shmem, (cudaStream_t) stream>>>(
             logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
     } else {
-        // The same block-per-token shape: the selection's k argmax rounds reduce inside the block.  See
-        // `sampler_kernel`'s header for what the old one-thread-per-token launch cost.
-        sampler_kernel<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
-            logits, n_vocab, n_tokens, history, history_len, p, out);
+        // Isolated qualification gate: keep v1.0.30's kernel available in this same binary.
+        static const bool radix = [] {
+            const char* v = std::getenv("STRATA_GLM_SAMPLER92");
+            return !(v && std::strcmp(v, "0") == 0);
+        }();
+        static const bool reported = [&] {
+            if (std::getenv("STRATA_GLM_UPSTREAM_DIAG"))
+                std::fprintf(stderr, "upstream92: sampled kernel=%s vocab=%d top_k=%d\n",
+                             radix ? "radix" : "legacy", n_vocab, p.top_k);
+            return true;
+        }();
+        (void) reported;
+        if (radix)
+            sampler_kernel<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
+                logits, n_vocab, n_tokens, history, history_len, p, out);
+        else
+            sampler_legacy_kernel<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
+                logits, n_vocab, n_tokens, history, history_len, p, out);
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
