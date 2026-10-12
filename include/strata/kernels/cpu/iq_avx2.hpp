@@ -5,12 +5,22 @@
 // 32-value chunk are decoded once per verify window and every token applies them with five instructions.
 #pragma once
 
+// Exact, existing Q8_K activation representation; this does not change the model or KV cache format.
+#include <cstdint>
+
 #include <cstddef>
 #include <cstdint>
 
 namespace strata::kernels::cpu {
+void q8k_quant_avx2(const float* x, void* y, int64_t n);
 
 bool iq256_supported(int ggml_type) noexcept;
+/// IQ2_XXS singleton, with ggml AVX2's accumulation/hsum order. Caller checks AVX2/FMA/F16C.
+/// Narrow GLM adaptation of Strata #1415/#1544; existing multi-token arithmetic is untouched.
+void iq2xxs256_rows_exact_one(const uint8_t* w, size_t row_bytes, int n, const void* act,
+                            float* out, int r0, int r1);
+void iq2xxs256_gu_split_exact_one(const uint8_t* gate, const uint8_t* up, size_t row_bytes, int n,
+                                const void* act, float* ff, int r0, int r1, float swiglu_limit);
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]), rows [r0, r1); gate rows at blob, up rows at blob + up_off.
 void iq256_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                    int nt, float* const* ff, int r0, int r1);

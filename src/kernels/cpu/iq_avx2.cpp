@@ -20,6 +20,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace strata::kernels::cpu {
 namespace {
@@ -189,6 +190,60 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
     for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
 }
 
+// Strata #1415/#1544 (1ba010ef/9d0614f4), adapted to Maya's IQ2_XXS split-base path.
+// ggml puts the 1/8 scale AFTER its horizontal reduction. Moving it into each block,
+// or using hsum8's hadd tree, changes bits. Integer partial sums are kept separate,
+// as in ggml_vec_dot_iq2_xxs_q8_K; the multi-token functions above stay unchanged.
+// The singleton path also needs Strata's compile-time sign table: Maya's older
+// Fmt32 calls even_signs_table() inside every half, retaining initialization guards
+// in the MSVC hot loop. Keep that existing multi-token code intact; use a constexpr
+// table here, with the same 7 sign bits plus ggml's even-parity eighth bit.
+struct ExactEvenSigns {
+    uint64_t v[128];
+    constexpr ExactEvenSigns() : v{} {
+        for (int i = 0; i < 128; ++i) {
+            int parity = 0;
+            for (int k = 0; k < 7; ++k) parity ^= (i >> k) & 1;
+            const int bits = i | (parity << 7);
+            for (int k = 0; k < 8; ++k)
+                v[i] |= (uint64_t) (((bits >> k) & 1) ? 0xFF : 0x01) << (8 * k);
+        }
+    }
+};
+static constexpr ExactEvenSigns exact_signs{};
+static_assert(exact_signs.v[0] == 0x0101010101010101ull && exact_signs.v[1] == 0xFF010101010101FFull);
+
+inline float iq2xxs_dot_exact_one(const uint8_t* row, int nb, const block_q8_K* y) {
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const uint8_t* blk = row + (size_t) i * Fmt32<16>::bytes;
+        __m256i sums[2] = {_mm256_setzero_si256(), _mm256_setzero_si256()};
+        for (int j = 0; j < 4; ++j) {
+            for (int half = 0; half < 2; ++half) {
+                const uint8_t* q = blk + 2 + 16 * j + 8 * half;
+                const uint32_t w0 = u32(q), w1 = u32(q + 4);
+                const __m256i grid = _mm256_set_epi64x((long long) iq2xxs_grid[w0 >> 24],
+                    (long long) iq2xxs_grid[(w0 >> 16) & 255], (long long) iq2xxs_grid[(w0 >> 8) & 255],
+                    (long long) iq2xxs_grid[w0 & 255]);
+                const __m256i sign = _mm256_set_epi64x((long long) exact_signs.v[(w1 >> 21) & 127],
+                    (long long) exact_signs.v[(w1 >> 14) & 127], (long long) exact_signs.v[(w1 >> 7) & 127],
+                    (long long) exact_signs.v[w1 & 127]);
+                const __m256i scale = sc32(2 * (int) (w1 >> 28) + 1);
+                const __m256i a = _mm256_loadu_si256((const __m256i*) (y[i].qs + 64 * j + 32 * half));
+                const __m256i p = _mm256_maddubs_epi16(grid, _mm256_sign_epi8(a, sign));
+                sums[half] = _mm256_add_epi32(sums[half], _mm256_madd_epi16(p, scale));
+            }
+        }
+        const float d = h2f(u16(blk)) * y[i].d;
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d),
+                             _mm256_cvtepi32_ps(_mm256_add_epi32(sums[0], sums[1])), acc);
+    }
+    __m128 s = _mm_add_ps(_mm256_extractf128_ps(acc, 1), _mm256_castps256_ps128(acc));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_movehdup_ps(s));
+    return 0.125f * _mm_cvtss_f32(s);
+}
+
 // ---- IQ2_XS (17) with ggml's vectorized sign decode (arch/x86/quants.c, ggml_vec_dot_iq2_xs_q8_K):
 // the 7-bit sign indices never touch ksigns_iq2xs - the 8th sign bit is reconstructed by parity (two
 // shifts, a xor and ggml's bit_helper pshufb) and the per-half sign vectors come out of shuffles of one
@@ -339,8 +394,30 @@ void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* 
 
 }  // namespace
 
+#include "q8k_exact_port.inc"
+
 bool iq256_supported(int type) noexcept {
     return type == 16 || type == 17 || type == 18 || type == 21 || type == 22;
+}
+
+void iq2xxs256_rows_exact_one(const uint8_t* w, size_t row_bytes, int n, const void* act,
+                            float* out, int r0, int r1) {
+    for (int r = r0; r < r1; ++r)
+        out[r] = iq2xxs_dot_exact_one(w + (size_t) r * row_bytes, n / QK_K, (const block_q8_K*) act);
+}
+
+void iq2xxs256_gu_split_exact_one(const uint8_t* gate, const uint8_t* up, size_t row_bytes, int n,
+                                const void* act, float* ff, int r0, int r1, float swiglu_limit) {
+    const bool clamp = swiglu_limit != std::numeric_limits<float>::infinity();
+    for (int r = r0; r < r1; ++r) {
+        float g = iq2xxs_dot_exact_one(gate + (size_t) r * row_bytes, n / QK_K, (const block_q8_K*) act);
+        float u = iq2xxs_dot_exact_one(up + (size_t) r * row_bytes, n / QK_K, (const block_q8_K*) act);
+        if (clamp) {
+            g = std::fmin(g, swiglu_limit);
+            u = std::fmin(std::fmax(u, -swiglu_limit), swiglu_limit);
+        }
+        ff[r] = (g / (1.f + std::exp(-g))) * u;
+    }
 }
 
 void iq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,

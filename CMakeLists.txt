@@ -797,6 +797,9 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(native_split_test src/kernels/cpu/native_split_test.cpp)
     target_link_libraries(native_split_test PRIVATE strata_kernels_cpu)
     add_test(NAME native_split_test COMMAND native_split_test)
+    # Explicit real-pack gate; pass pack, output dump and expected exact-path activation.
+    add_executable(glm_cpu_exact1_test tests/glm_cpu_exact1_test.cpp)
+    target_link_libraries(glm_cpu_exact1_test PRIVATE strata_kernels_cpu)
   endif()
   if(STRATA_ENABLE_CUDA)
     # prompt-speed plan step 2b: llama.cpp's MMQ kernels (ggml-cuda, MIT) for the prompt path's experts, compiled

@@ -25,6 +25,9 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#ifdef STRATA_NATIVE_EXPERTS
+#include "strata/kernels/cpu/native_expert.hpp"
+#endif
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
@@ -1581,6 +1584,9 @@ static int glm_pack_generate(const Options& o) {
         if (stop_req.load()) finish = "cancel";
         const auto t1 = std::chrono::steady_clock::now();
         const auto st1 = model.fast_stats();
+#ifdef STRATA_NATIVE_EXPERTS
+        const auto cpu_split1 = strata::kernels::cpu::native_split_counts();
+#endif
         int64_t produced = 0;
         // one emitted token: the T line, the live tier counters every 8 tokens, the stop conditions (false: stop)
         // LOOP GUARD: a heavily quantized model can fall into repeating a short pattern ("0 0 0 ...") until the
@@ -1718,6 +1724,15 @@ static int glm_pack_generate(const Options& o) {
         const double decode_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
         // the decode phase's expert-tier counters (the fast path; zeros on the reference path)
         const auto st2 = model.fast_stats();
+#ifdef STRATA_NATIVE_EXPERTS
+        if (env_num("STRATA_GLM_CPU_EXACT1_DIAG", 0) == 1) {
+            const auto cpu_split2 = strata::kernels::cpu::native_split_counts();
+            std::fprintf(stderr, "glm cpu exact1: decode tokens=%lld exact_rows=%llu ggml_rows=%llu\n",
+                         (long long) produced,
+                         (unsigned long long) (cpu_split2.exact_rows - cpu_split1.exact_rows),
+                         (unsigned long long) (cpu_split2.ggml_rows - cpu_split1.ggml_rows));
+        }
+#endif
         const uint64_t d_hits = st2.hits - st1.hits, d_miss = st2.misses - st1.misses;
         std::printf("DONE %lld %lld %.1f %.1f %s %llu %llu %zu %llu %llu\n", (long long) produced,
                     (long long) prompt.size(), prompt_ms, decode_ms, finish,
