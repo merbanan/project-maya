@@ -146,7 +146,10 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
     static const bool exact_one = [] {
         const char* ex = std::getenv("STRATA_GLM_CPU_EXACT1");
         return !(ex && ex[0] == '0' && ex[1] == '\0');
-    }() && cpu_avx2_ok() && !cpu_avx512_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;
+    }() && cpu_avx2_ok() && (!cpu_avx512_ok() || [] {   // STRATA_GLM_CPU_EXACT1=2: on with AVX-512 too (A/B only)
+        const char* ex = std::getenv("STRATA_GLM_CPU_EXACT1");
+        return ex && ex[0] == '2';
+    }()) && std::getenv("STRATA_NO_IQ256") == nullptr;
     static const bool diag = flag_one("STRATA_GLM_CPU_EXACT1_DIAG");
     // Only replace ggml's singleton IQ2_XXS dots. Other formats, multi-token calls,
     // and the contiguous multi-token dispatch keep their existing arithmetic.
