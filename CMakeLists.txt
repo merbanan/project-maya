@@ -243,6 +243,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/glm_fast.cu
                           src/kernels/cuda/glm_gqa.cu
                           src/kernels/cuda/glm_dsv4.cu
+                          src/kernels/cuda/dense_kernels.cu
                           src/kernels/cuda/glm_batch.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
@@ -318,7 +319,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
-    src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu)
+    src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu src/core/dense_model.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
@@ -352,6 +353,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata src/program/generate.cpp)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+
+  # a DENSE qwen35 model (Qwen3.8-27B): the same server protocol as `strata --serve`, no experts
+  add_executable(strata-dense src/program/dense_main.cpp)
+  target_include_directories(strata-dense PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata-dense PRIVATE strata_engine strata_prefill ${_strata_gpu_runtime_target})
 
   if(STRATA_ENABLE_HIP)
     enable_testing()
