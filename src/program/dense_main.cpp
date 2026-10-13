@@ -311,6 +311,32 @@ int main(int argc, char** argv) {
                  model.weight_bytes() / 1073741824.0, model.kv_bytes() / 1073741824.0, (long long) model.max_context(),
                  draft);
 
+    if (const char* e = std::getenv("STRATA_DENSE_BENCH")) {
+        // the cost of a forward pass by width: a prompt of N tokens, then verify windows of 1..8 (each committed 1)
+        const int n0 = std::max(16, std::atoi(e));
+        std::vector<int32_t> toks((size_t) n0 + 64, 1000);
+        for (size_t i = 0; i < toks.size(); ++i) toks[i] = (int32_t) (1000 + (i * 7919) % 50000);
+        for (int i = 0; i < n0; i += model.chunk()) {
+            const int T = std::min(model.chunk(), n0 - i);
+            if (!model.forward(toks.data() + i, T, false, 0, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        }
+        model.sync(err);
+        for (int T = 1; T <= 8; ++T) {
+            double tot = 0;
+            const int reps = 12;
+            for (int r = 0; r < reps; ++r) {
+                const auto t0 = Clock::now();
+                if (!model.forward(toks.data() + n0, T, true, strata::core::DenseModel::kAll, err) || !model.sync(err)) {
+                    std::fprintf(stderr, "%s\n", err.c_str()); return 1;
+                }
+                if (r >= 2) tot += ms_since(t0);
+                model.commit(1, err);
+            }
+            std::fprintf(stderr, "bench ctx %lld: verify window %d: %.2f ms\n", (long long) model.position(), T, tot / (reps - 2));
+        }
+        return 0;
+    }
+
     Lines in;
     std::thread reader([&] {
         std::string line;

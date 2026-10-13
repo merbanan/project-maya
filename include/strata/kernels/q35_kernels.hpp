@@ -35,13 +35,13 @@ void q35_conv_seq(float* conv_state, const float* raw, int ld, const float* w, f
 /// x / sqrt(sum(x^2) + eps) over each 128-wide row of the first n_rows rows of every token (q and k heads).
 void q35_qk_l2(float* x, int ld, int T, int n_rows, float eps, void* stream);
 
-/// g = softplus(alpha + dt) * ssm_a, b = sigmoid(beta), in place, rows of h_v for T tokens (stride h_v).
-void q35_gate_beta(float* alpha, float* beta, const float* dt, const float* ssm_a, int T, int h_v, void* stream);
+/// g = softplus(alpha + dt) * ssm_a, b = sigmoid(beta), in place, rows of h_v for T tokens (row stride ld).
+void q35_gate_beta(float* alpha, float* beta, int ld, const float* dt, const float* ssm_a, int T, int h_v, void* stream);
 
 /// The delta rule over T tokens (see the header).  x rows: [q (h_k*128) | k (h_k*128) | v (h_v*128)], stride ld;
-/// g, b rows of h_v; o rows of h_v*128 (dense).  q scaled by 1/sqrt(128) inside.
-void q35_gdn_seq(float* state, const float* x, int ld, const float* g, const float* b, float* o, int T, int h_k,
-                 int h_v, bool commit, void* stream);
+/// g, b rows of h_v (row stride ldg); o rows of h_v*128 (dense).  q scaled by 1/sqrt(128) inside.
+void q35_gdn_seq(float* state, const float* x, int ld, const float* g, const float* b, int ldg, float* o, int T,
+                 int h_k, int h_v, bool commit, void* stream);
 
 /// rms(o) * w * silu(z) per 128-wide head (`rows` heads in all, dense)
 void q35_gdn_out(const float* o, const float* z, const float* w, float* y, int rows, float eps, void* stream);
@@ -74,5 +74,15 @@ void q35_add(float* y, const float* x, int64_t n, void* stream);
 
 /// out = silu(g) * u for T rows: g and u rows of n (strides ldg), out dense rows of n
 void q35_swiglu_rows(const float* g, const float* u, int ldg, float* out, int n, int T, void* stream);
+
+/// The tensor-core GEMV for 1..8 token rows (q35_mmt.cu): weights Q4_K / Q5_K / Q6_K / Q8_0 in GGUF blocks.
+bool q35_mmt_supported(int ggml_type);
+/// xh8 (FP16 [8][K], rows M..7 zero) = x rows 0..M-1 (dense rows of K)
+void q35_mmt_prep(const float* x, int K, int M, uint16_t* xh8, void* stream);
+/// floats of the k-split partials for N outputs
+int64_t q35_mmt_part_floats(int N);
+/// y (M rows of N, dense) = W . X^T, W N rows of K in `ggml_type` blocks
+void q35_mmt(int ggml_type, const void* W, const uint16_t* xh8, float* y, int K, int N, int M, float* part,
+             void* stream);
 
 }  // namespace strata::kernels

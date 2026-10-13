@@ -90,10 +90,10 @@ __global__ void qk_l2_kernel(float* __restrict__ x, int ld, float eps) {
 }
 
 __global__ void gate_beta_kernel(float* __restrict__ a, float* __restrict__ b, const float* __restrict__ dt,
-                                 const float* __restrict__ ssm_a, int n, int h_v) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const int h = i % h_v;
+                                 const float* __restrict__ ssm_a, int n, int h_v, int ld) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    const int h = k % h_v, i = (k / h_v) * ld + h;
     const float v = __fadd_rn(a[i], dt[h]);
     const float sp = v > 20.0f ? v : logf(1.0f + expf(v));
     a[i] = sp * ssm_a[h];
@@ -102,7 +102,7 @@ __global__ void gate_beta_kernel(float* __restrict__ a, float* __restrict__ b, c
 
 // block = value head h, thread = state column j; the column's 128 state values in registers
 __global__ void __launch_bounds__(128) gdn_seq_kernel(float* __restrict__ state, const float* __restrict__ x, int ld,
-                                                      const float* __restrict__ g, const float* __restrict__ b,
+                                                      const float* __restrict__ g, const float* __restrict__ b, int ldg,
                                                       float* __restrict__ o, int T, int h_k, int h_v, int commit) {
     constexpr int S = 128;
     const int h = blockIdx.x, j = threadIdx.x, kh = h % h_k;
@@ -118,8 +118,8 @@ __global__ void __launch_bounds__(128) gdn_seq_kernel(float* __restrict__ state,
         sk[j] = xr[h_k * S + kh * S + j];
         __syncthreads();
         const float v = xr[2 * h_k * S + h * S + j];
-        const float dec = expf(g[(size_t) t * h_v + h]);
-        const float beta = b[(size_t) t * h_v + h];
+        const float dec = expf(g[(size_t) t * ldg + h]);
+        const float beta = b[(size_t) t * ldg + h];
         float skd = 0.0f;
 #pragma unroll
         for (int i = 0; i < S; ++i) { st[i] *= dec; skd += st[i] * sk[i]; }
@@ -364,17 +364,33 @@ __global__ void attn_merge_kernel(const float* __restrict__ part_o, const float*
 }
 
 // ------------------------------------------------------------------------------------------------ small matmuls
-// block = output row, 4 warps over the tokens
-__global__ void gemv_f32_cols_kernel(const float* __restrict__ W, const float* __restrict__ x, int ldx,
-                                     float* __restrict__ y, int n_in, int n_out, int T) {
-    const int r = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+// block = (output row, 8 tokens), 256 threads along n_in; the 8 sums reduced over the block
+__global__ void __launch_bounds__(256) gemv_f32_cols_kernel(const float* __restrict__ W, const float* __restrict__ x,
+                                                            int ldx, float* __restrict__ y, int n_in, int n_out, int T) {
+    constexpr int NC = 8;
+    const int r = blockIdx.x, t0 = blockIdx.y * NC, nc = min(NC, T - t0);
     const float* wr = W + (size_t) r * n_in;
-    for (int t = w; t < T; t += blockDim.x >> 5) {
-        const float* xr = x + (size_t) t * ldx;
-        float acc = 0.0f;
-        for (int i = lane; i < n_in; i += 32) acc += wr[i] * xr[i];
-        acc = warp_sum(acc);
-        if (lane == 0) y[(size_t) t * n_out + r] = acc;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int i = threadIdx.x; i < n_in; i += blockDim.x) {
+        const float w = wr[i];
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < nc) acc[c] += w * x[(size_t) (t0 + c) * ldx + i];
+    }
+    __shared__ float sh[NC][8];
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const float v = warp_sum(acc[c]);
+        if (lane == 0) sh[c][wp] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < nc) {
+        float v = 0.0f;
+        for (int k = 0; k < (int) (blockDim.x >> 5); ++k) v += sh[threadIdx.x][k];
+        y[(size_t) (t0 + threadIdx.x) * n_out + r] = v;
     }
 }
 
@@ -447,16 +463,16 @@ void q35_qk_l2(float* x, int ld, int T, int n_rows, float eps, void* stream) {
     check("q35_qk_l2");
 }
 
-void q35_gate_beta(float* alpha, float* beta, const float* dt, const float* ssm_a, int T, int h_v, void* stream) {
+void q35_gate_beta(float* alpha, float* beta, int ld, const float* dt, const float* ssm_a, int T, int h_v, void* stream) {
     gate_beta_kernel<<<blocks((int64_t) T * h_v, 256), 256, 0, (cudaStream_t) stream>>>(alpha, beta, dt, ssm_a,
-                                                                                       T * h_v, h_v);
+                                                                                       T * h_v, h_v, ld);
     check("q35_gate_beta");
 }
 
-void q35_gdn_seq(float* state, const float* x, int ld, const float* g, const float* b, float* o, int T, int h_k,
-                 int h_v, bool commit, void* stream) {
+void q35_gdn_seq(float* state, const float* x, int ld, const float* g, const float* b, int ldg, float* o, int T,
+                 int h_k, int h_v, bool commit, void* stream) {
     if (T <= 0) return;
-    gdn_seq_kernel<<<h_v, 128, 0, (cudaStream_t) stream>>>(state, x, ld, g, b, o, T, h_k, h_v, commit);
+    gdn_seq_kernel<<<h_v, 128, 0, (cudaStream_t) stream>>>(state, x, ld, g, b, ldg, o, T, h_k, h_v, commit);
     check("q35_gdn_seq");
 }
 
@@ -516,7 +532,7 @@ void q35_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, 
 }
 
 void q35_gemv_f32_cols(const float* W, const float* x, int ldx, float* y, int n_in, int n_out, int T, void* stream) {
-    gemv_f32_cols_kernel<<<n_out, 128, 0, (cudaStream_t) stream>>>(W, x, ldx, y, n_in, n_out, T);
+    gemv_f32_cols_kernel<<<dim3(n_out, (T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(W, x, ldx, y, n_in, n_out, T);
     check("q35_gemv_f32_cols");
 }
 
