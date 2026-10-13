@@ -244,6 +244,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/glm_gqa.cu
                           src/kernels/cuda/glm_dsv4.cu
                           src/kernels/cuda/dense_kernels.cu
+                          src/kernels/cuda/q35_kernels.cu
                           src/kernels/cuda/glm_batch.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp

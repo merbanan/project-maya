@@ -1,0 +1,78 @@
+// include/strata/kernels/q35_kernels.hpp - the BATCHED kernels of the dense qwen35 model (Qwen3.8-27B): a forward
+// pass over T tokens at once (a prompt chunk, or a speculative verify window of the anchor + its drafts).
+//
+// Row layouts are token-major: activation row t of width n is x + t * ld (ld >= n).
+//
+// GDN.  The recurrence is sequential in the tokens, so q35_gdn_seq walks them inside one kernel (block = value head,
+// thread = state column j, the 128 state values of the column in registers).  `commit` = false leaves the state as it
+// was: a verify window runs with commit off, and after the target has picked how many tokens it keeps,
+// q35_gdn_seq / q35_conv_commit run again over those tokens only (their inputs stashed by the window) with commit on.
+// State layout: Maya's (S, h_v, S) = state[(i * h_v + h) * S + j] (see gdn.hpp).
+//
+// Attention.  Query rows are (token, head of the KV group) pairs: row r = t * G + g reads KV head kvh, query head
+// kvh * G + g; row t sees cache cells [0, p0 + t].  One block holds 64 rows of one KV head, so a K/V tile is read once
+// for all G heads of the group; S = Q K^T and O += P V on the tensor cores (WMMA, FP16 in, FP32 accumulate), the
+// online softmax rescaled lazily (the prompt kernel of glm_gqa.cu).  With splits > 1 the cells are cut into pieces
+// whose partial (m, l, O) a merge kernel folds: the decode / verify case, where 1-16 tokens leave too few blocks.
+#pragma once
+
+#include <cstdint>
+
+namespace strata::kernels {
+
+/// out_f32 / out_f16 (either may be null) = rms_norm(x row) * w, rows of `cols`, x row stride ldx, outputs dense.
+void q35_rms_rows(const float* x, int ldx, const float* w, float* out_f32, uint16_t* out_f16, int rows, int cols,
+                  float eps, void* stream);
+
+/// dst (FP16 bits) = src, n values.
+void q35_to_half(const float* src, uint16_t* dst, int64_t n, void* stream);
+
+/// The causal conv1d (4 taps) + SiLU over T tokens: raw row t (stride ld) -> out row t (stride ld).  conv_state
+/// (3 x C, oldest first, Maya's [c * 3 + tap] layout) is read; with commit it ends holding the last three inputs.
+void q35_conv_seq(float* conv_state, const float* raw, int ld, const float* w, float* out, int T, int C, bool commit,
+                  void* stream);
+
+/// x / sqrt(sum(x^2) + eps) over each 128-wide row of the first n_rows rows of every token (q and k heads).
+void q35_qk_l2(float* x, int ld, int T, int n_rows, float eps, void* stream);
+
+/// g = softplus(alpha + dt) * ssm_a, b = sigmoid(beta), in place, rows of h_v for T tokens (stride h_v).
+void q35_gate_beta(float* alpha, float* beta, const float* dt, const float* ssm_a, int T, int h_v, void* stream);
+
+/// The delta rule over T tokens (see the header).  x rows: [q (h_k*128) | k (h_k*128) | v (h_v*128)], stride ld;
+/// g, b rows of h_v; o rows of h_v*128 (dense).  q scaled by 1/sqrt(128) inside.
+void q35_gdn_seq(float* state, const float* x, int ld, const float* g, const float* b, float* o, int T, int h_k,
+                 int h_v, bool commit, void* stream);
+
+/// rms(o) * w * silu(z) per 128-wide head (`rows` heads in all, dense)
+void q35_gdn_out(const float* o, const float* z, const float* w, float* y, int rows, float eps, void* stream);
+
+/// The attention layer's per-token preparation for T tokens at positions p0 + t:
+///   q rows (from q_full: per head [q | gate] of 2 * D, stride ldq): rms * q_norm, NeoX rope on the first n_rot dims
+///   -> q_out (rows of n_head * D, dense);  k rows (stride ldk): rms * k_norm, rope -> K cache cell p0 + t;  v rows
+///   (stride ldk) -> V cache cell.  Caches [n_kv][max_ctx][D] FP16.
+void q35_attn_prep(const float* q_full, int ldq, const float* k, const float* v, int ldk, const float* q_norm,
+                   const float* k_norm, float eps, float rope_base, int n_rot, int p0, int T, int n_head, int n_kv,
+                   int D, float* q_out, uint16_t* k_cache, uint16_t* v_cache, int max_ctx, void* stream);
+
+/// Scratch floats q35_attn needs for T tokens with up to max_ctx cells (the split partials).
+int64_t q35_attn_scratch_floats(int T, int n_head, int D, int max_ctx);
+
+/// out rows (n_head * D, dense) = softmax(q k^T / sqrt(D)) V over the causal cells; then out *= sigmoid(gate) where
+/// gate is the second half of every head's 2 * D block of q_full (stride ldq).  D must be 256, n_head / n_kv <= 8.
+/// splits: 0 = choose.
+void q35_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int p0, int T, int n_head, int n_kv,
+              int D, int max_ctx, const float* q_full, int ldq, float* out, float* scratch, int splits, void* stream);
+
+/// y[t][r] = sum_i W[r][i] x[t][i] for T tokens: an F32 matrix (n_out rows of n_in), x rows stride ldx, y dense.
+void q35_gemv_f32_cols(const float* W, const float* x, int ldx, float* y, int n_in, int n_out, int T, void* stream);
+
+/// out[t] = argmax of row t (n wide, stride ld), ties to the lower id.
+void q35_argmax_rows(const float* x, int64_t ld, int n, int T, int32_t* out, void* stream);
+
+/// y += x, n values
+void q35_add(float* y, const float* x, int64_t n, void* stream);
+
+/// out = silu(g) * u for T rows: g and u rows of n (strides ldg), out dense rows of n
+void q35_swiglu_rows(const float* g, const float* u, int ldg, float* out, int n, int T, void* stream);
+
+}  // namespace strata::kernels

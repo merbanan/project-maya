@@ -24,6 +24,7 @@
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/dense_kernels.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/q35_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -245,6 +246,7 @@ int main(int argc, char** argv) {
     std::string gguf;
     long long context = 32768;
     bool serve = false;
+    int draft = -1, chunk = 512;            // MTP drafts a round (-1: STRATA_DENSE_DRAFT, else 3; 0: off), prompt chunk
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -254,6 +256,8 @@ int main(int argc, char** argv) {
         if (a == "--serve") serve = true;
         else if (a == "--native" || a == "--model" || a == "--gguf") gguf = next("--native");
         else if (a == "--context" || a == "-c") context = std::atoll(next("--context"));
+        else if (a == "--draft" || a == "--mtp-draft") draft = std::atoi(next("--draft"));
+        else if (a == "--chunk") chunk = std::atoi(next("--chunk"));
         else if (a == "--help" || a == "-h") { usage(); return 0; }
         // the flags setup passes to `strata` (--gpu-layers, --cache, ...) mean nothing here and are not an error
     }
@@ -262,12 +266,17 @@ int main(int argc, char** argv) {
     strata::core::DenseModel model;
     std::string err;
     std::fprintf(stderr, "strata-dense: loading %s ...\n", gguf.c_str());
-    if (!model.load(gguf, context, err)) {
+    if (const char* e = std::getenv("STRATA_DENSE_CHUNK")) chunk = std::atoi(e);
+    if (!model.load(gguf, context, err, chunk)) {
         std::fprintf(stderr, "strata-dense: %s\n", err.c_str());
         std::printf("ERR %s\n", err.c_str());
         return 1;
     }
     const auto& cfg = model.config();
+    if (draft < 0) draft = std::getenv("STRATA_DENSE_DRAFT") ? std::atoi(std::getenv("STRATA_DENSE_DRAFT")) : 3;
+    draft = std::max(0, std::min(draft, 7));
+    if (!model.has_mtp()) draft = 0;
+    cudaStream_t cs = (cudaStream_t) model.stream();
 
     // the ids that end an answer, from the model's own vocabulary
     std::vector<int32_t> stop_ids;
@@ -280,23 +289,27 @@ int main(int argc, char** argv) {
     } catch (const std::exception&) {}
     std::sort(stop_ids.begin(), stop_ids.end());
     stop_ids.erase(std::unique(stop_ids.begin(), stop_ids.end()), stop_ids.end());
-    auto is_stop = [&](int32_t t) { return std::binary_search(stop_ids.begin(), stop_ids.end(), t); };
 
     int* d_next = nullptr;
     int* d_hist = nullptr;
+    float* d_hrows = nullptr;                      // the trunk's hidden rows the MTP block has yet to read
     constexpr int kMaxHist = 4096;
-    if (cudaMalloc((void**) &d_next, sizeof(int)) != cudaSuccess || cudaMalloc((void**) &d_hist, kMaxHist * sizeof(int)) != cudaSuccess) {
+    if (cudaMalloc((void**) &d_next, 16 * sizeof(int)) != cudaSuccess ||
+        cudaMalloc((void**) &d_hist, kMaxHist * sizeof(int)) != cudaSuccess ||
+        cudaMalloc((void**) &d_hrows, (size_t) 16 * cfg.n_embd * sizeof(float)) != cudaSuccess) {
         std::printf("ERR cannot allocate the sampler buffers\n");
         return 1;
     }
 
-    std::printf("INFO engine=dense-0.1 model=%s layers=%d n_embd=%d weights_mib=%llu host_mib=%llu kv_mib=%llu context=%lld\n",
+    std::printf("INFO engine=dense-0.2 model=%s layers=%d n_embd=%d weights_mib=%llu host_mib=%llu kv_mib=%llu context=%lld mtp=%d\n",
                 cfg.arch.c_str(), cfg.n_layer, cfg.n_embd, (unsigned long long) (model.weight_bytes() >> 20),
-                (unsigned long long) (model.host_weight_bytes() >> 20), (unsigned long long) (model.kv_bytes() >> 20), (long long) model.max_context());
+                (unsigned long long) (model.host_weight_bytes() >> 20), (unsigned long long) (model.kv_bytes() >> 20),
+                (long long) model.max_context(), draft);
     std::printf("READY %lld stop\n", (long long) model.max_context());
     std::fflush(stdout);
-    std::fprintf(stderr, "strata-dense: ready - %.2f GiB of weights, %.2f GiB of KV cache, context %lld\n",
-                 model.weight_bytes() / 1073741824.0, model.kv_bytes() / 1073741824.0, (long long) model.max_context());
+    std::fprintf(stderr, "strata-dense: ready - %.2f GiB of weights, %.2f GiB of KV cache, context %lld, MTP drafts %d\n",
+                 model.weight_bytes() / 1073741824.0, model.kv_bytes() / 1073741824.0, (long long) model.max_context(),
+                 draft);
 
     Lines in;
     std::thread reader([&] {
@@ -325,6 +338,8 @@ int main(int argc, char** argv) {
         strata::kernels::SamplerParams sp;
         sp.top_k = 20; sp.top_p = 1.0f; sp.temperature = 0.0f; sp.greedy = true;
         unsigned long long seed = 0;
+        bool ignore_eos = false;
+        int req_draft = draft;
         for (;;) {
             while (*endp == ' ') ++endp;
             const char* start = endp;
@@ -344,6 +359,8 @@ int main(int argc, char** argv) {
             else if (key == "penalty_freq") sp.penalty_freq = fv;
             else if (key == "penalty_present") sp.penalty_present = fv;
             else if (key == "seed") seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
+            else if (key == "ignore_eos") ignore_eos = fv != 0.0f;
+            else if (key == "draft") req_draft = std::max(0, std::min(draft, std::atoi(tok.c_str() + eq + 1)));
         }
         std::vector<int32_t> ids;
         if (max_new < 1 || !parse_ids(endp, ids)) { std::printf("ERR bad request\n"); std::fflush(stdout); continue; }
@@ -353,38 +370,53 @@ int main(int argc, char** argv) {
             continue;
         }
         sp.seed = seed;
+        auto is_stop = [&](int32_t t) { return !ignore_eos && std::binary_search(stop_ids.begin(), stop_ids.end(), t); };
+        // penalties look at a history the verify rows would each need their own of: those requests decode plainly
+        const bool penalties = sp.penalty_last_n > 0 &&
+                               (sp.penalty_repeat != 1.0f || sp.penalty_freq != 0.0f || sp.penalty_present != 0.0f);
+        const int K = penalties ? 0 : req_draft;
 
-        // ---- what of the state can be kept
+        // ---- what of the state can be kept (the MTP cache follows the trunk: the same positions are valid)
         size_t resume = 0;
         if (!fed.empty() && fed.size() < ids.size() && std::equal(fed.begin(), fed.end(), ids.begin())) resume = fed.size();
         if (resume == 0) { model.reset(); fed.clear(); }
         const int64_t n = (int64_t) ids.size();
         const long long budget = std::min<long long>(max_new, model.max_context() - n);
 
-        // ---- read the prompt
+        // ---- read the prompt, a chunk at a time; the MTP block reads every row whose next token is known
         bool cancelled = false, failed = false;
         const auto t_prompt = Clock::now();
-        auto t_pp = Clock::now();
-        for (int64_t i = (int64_t) resume; i < n; ++i) {
-            const bool last = (i == n - 1);
-            if (!model.step(ids[(size_t) i], last, err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
-            fed.push_back(ids[(size_t) i]);
-            if (in.stop.load()) { cancelled = true; model.sync(err); break; }
-            if ((i + 1 - (int64_t) resume) % 32 == 0 || last) {
-                if (!model.sync(err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
-                const double ms = ms_since(t_pp);
-                std::printf("PP %lld %lld %.0f %.1f\n", (long long) (i + 1), (long long) n, ms_since(t_prompt),
-                            ms > 0 ? 1000.0 * 32 / ms : 0.0);
-                std::fflush(stdout);
-                t_pp = Clock::now();
+        const int ch = model.chunk();
+        for (int64_t i = (int64_t) resume; i < n && !failed;) {
+            const int T = (int) std::min<int64_t>(ch, n - i);
+            const bool last = i + T == n;
+            if (!model.forward(ids.data() + i, T, false, last ? strata::core::DenseModel::kLast : strata::core::DenseModel::kNone, err)) {
+                std::printf("ERR %s\n", err.c_str()); failed = true; break;
             }
+            if (K > 0) {
+                const int rows = last ? T - 1 : T;   // row t pairs with token i + t + 1
+                if (rows > 0 && !model.mtp_forward(ids.data() + i + 1, model.hidden_norm(), i, rows, false, err)) {
+                    std::printf("ERR %s\n", err.c_str()); failed = true; break;
+                }
+                if (last)   // the prompt's last hidden row: the first draft step reads it
+                    cudaMemcpyAsync(d_hrows, model.hidden_norm() + (size_t) (T - 1) * cfg.n_embd, cfg.n_embd * 4,
+                                    cudaMemcpyDeviceToDevice, cs);
+            }
+            fed.insert(fed.end(), ids.begin() + i, ids.begin() + i + T);
+            i += T;
+            if (!model.sync(err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
+            const double ms = ms_since(t_prompt);
+            std::printf("PP %lld %lld %.0f %.1f\n", (long long) i, (long long) n, ms,
+                        ms > 0 ? 1000.0 * (i - (int64_t) resume) / ms : 0.0);
+            std::fflush(stdout);
+            if (in.stop.load()) { cancelled = true; break; }
         }
         if (failed) { model.reset(); fed.clear(); std::fflush(stdout); continue; }
-        if (!model.sync(err)) { std::printf("ERR %s\n", err.c_str()); model.reset(); fed.clear(); std::fflush(stdout); continue; }
         const double prompt_ms = ms_since(t_prompt);
 
         // ---- decode
         long long produced = 0;
+        long long rounds = 0, drafted = 0, accepted = 0;
         const char* finish = "length";
         const auto t_dec = Clock::now();
         std::vector<int32_t> hist;                  // penalty window, most recent last
@@ -392,42 +424,102 @@ int main(int argc, char** argv) {
             const size_t take = std::min<size_t>((size_t) sp.penalty_last_n, fed.size());
             hist.assign(fed.end() - (std::ptrdiff_t) take, fed.end());
         }
-        while (!cancelled && produced < budget) {
-            if (in.stop.load()) { cancelled = true; break; }
+        auto emit = [&](int32_t t) -> bool {        // false: the answer ends here
+            ++produced;
+            std::printf("T %d\n", t);
+            if (sp.penalty_last_n > 0) { hist.push_back(t); if ((int) hist.size() > sp.penalty_last_n) hist.erase(hist.begin()); }
+            if (is_stop(t)) { finish = "stop"; return false; }
+            return produced < budget;
+        };
+        auto sample_rows = [&](const float* logits, int rows, int* out_host) -> bool {
             sp.counter = draw_counter;
             const int* hp = nullptr;
             int hl = 0;
             if (sp.penalty_last_n > 0) {
                 std::vector<int32_t> row((size_t) sp.penalty_last_n, -1);
                 std::copy(hist.begin(), hist.end(), row.end() - (std::ptrdiff_t) hist.size());
-                cudaMemcpyAsync(d_hist, row.data(), row.size() * sizeof(int), cudaMemcpyHostToDevice, (cudaStream_t) model.stream());
+                cudaMemcpyAsync(d_hist, row.data(), row.size() * sizeof(int), cudaMemcpyHostToDevice, cs);
                 hp = d_hist;
                 hl = sp.penalty_last_n;
             }
             try {
-                strata::kernels::sample_tokens(model.logits(), 1, cfg.n_vocab, hp, hl, sp, d_next, model.stream());
-            } catch (const std::exception& e) { std::printf("ERR sampler: %s\n", e.what()); failed = true; break; }
-            int next = -1;
-            cudaMemcpyAsync(&next, d_next, sizeof(int), cudaMemcpyDeviceToHost, (cudaStream_t) model.stream());
-            if (!model.sync(err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
-            ++draw_counter;
-            ++produced;
-            std::printf("T %d\n", next);
+                if (sp.greedy) strata::kernels::q35_argmax_rows(logits, cfg.n_vocab, cfg.n_vocab, rows, d_next, cs);
+                else strata::kernels::sample_tokens(logits, rows, cfg.n_vocab, hp, hl, sp, d_next, cs);
+            } catch (const std::exception& e) { std::printf("ERR sampler: %s\n", e.what()); return false; }
+            cudaMemcpyAsync(out_host, d_next, rows * sizeof(int), cudaMemcpyDeviceToHost, cs);
+            if (!model.sync(err)) { std::printf("ERR %s\n", err.c_str()); return false; }
+            draw_counter += rows;
+            return true;
+        };
+        int anchor = -1;
+        if (!cancelled && budget > 0) {
+            if (!sample_rows(model.logits(), 1, &anchor)) failed = true;
+            else emit(anchor);                         // (a stop token sets finish)
+        }
+        bool going = !failed && !cancelled && budget > 0 && produced < budget && finish != std::string("stop");
+        // the MTP rows still to read: tokens mtp_tok at positions mtp_p0 .. with the trunk's hidden rows in d_hrows
+        std::vector<int32_t> mtp_tok = {anchor};
+        int64_t mtp_p0 = model.position() - 1;
+        while (going) {
+            if (in.stop.load()) { cancelled = true; break; }
+            const int64_t pos = model.position();
+            int k = (int) std::min<long long>(K, std::min<long long>(budget - produced, model.max_context() - pos - 1));
+            k = std::max(0, k);
+            std::vector<int32_t> win = {anchor};
+            if (k > 0) {
+                // the drafts: the MTP block over the pending rows (the last one's logits), then one row a draft
+                if (!model.mtp_forward(mtp_tok.data(), d_hrows, mtp_p0, (int) mtp_tok.size(), false, err)) {
+                    std::printf("ERR %s\n", err.c_str()); failed = true; break;
+                }
+                for (int j = 0; j < k; ++j) {
+                    int d = 0;
+                    strata::kernels::q35_argmax_rows(model.mtp_logits(), cfg.n_vocab, cfg.n_vocab, 1, d_next, cs);
+                    cudaMemcpyAsync(&d, d_next, sizeof(int), cudaMemcpyDeviceToHost, cs);
+                    if (!model.sync(err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
+                    win.push_back(d);
+                    if (j + 1 < k && !model.mtp_forward(&d, model.mtp_hidden(), pos + j, 1, false, err)) {
+                        std::printf("ERR %s\n", err.c_str()); failed = true; break;
+                    }
+                }
+                if (failed) break;
+            }
+            const int W = (int) win.size();
+            if (!model.forward(win.data(), W, K > 0, K > 0 ? strata::core::DenseModel::kAll : strata::core::DenseModel::kLast, err)) {
+                std::printf("ERR %s\n", err.c_str()); failed = true; break;
+            }
+            int picks[16];
+            if (!sample_rows(model.logits(), W, picks)) { failed = true; break; }
+            int acc = 0;
+            while (acc + 1 < W && win[acc + 1] == picks[acc]) ++acc;
+            ++rounds; drafted += W - 1; accepted += acc;
+            if (K > 0) {
+                if (!model.commit(acc + 1, err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
+                // the MTP block's next rows: the kept window's tokens after the anchor and the new anchor, with the
+                // trunk's hidden rows of the anchor .. the last kept draft
+                cudaMemcpyAsync(d_hrows, model.hidden_norm(), (size_t) (acc + 1) * cfg.n_embd * 4, cudaMemcpyDeviceToDevice, cs);
+                mtp_tok.assign(win.begin() + 1, win.begin() + 1 + acc);
+                mtp_tok.push_back(picks[acc]);
+                mtp_p0 = pos;
+            }
+            fed.insert(fed.end(), win.begin(), win.begin() + acc + 1);
+            bool more = true;
+            for (int j = 0; j < acc && more; ++j) more = emit(win[j + 1]);
+            if (more) more = emit(picks[acc]);
             std::fflush(stdout);
-            if (sp.penalty_last_n > 0) { hist.push_back(next); if ((int) hist.size() > sp.penalty_last_n) hist.erase(hist.begin()); }
-            if (is_stop(next)) { finish = "stop"; break; }
-            if (produced >= budget) break;
-            if (!model.step(next, true, err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
-            fed.push_back(next);
+            anchor = picks[acc];
+            going = more;
         }
         if (failed) { model.reset(); fed.clear(); std::fflush(stdout); continue; }
         if (cancelled) finish = "cancel";
         const double decode_ms = ms_since(t_dec);
         std::printf("DONE %lld %lld %.1f %.1f %s 0 0 %lld\n", produced, (long long) n, prompt_ms, decode_ms, finish, (long long) resume);
         std::fflush(stdout);
-        std::fprintf(stderr, "strata-dense: prompt %lld tokens = %zu reused + %lld read in %.0f ms, %lld generated in %.0f ms (%.1f tok/s)%s\n",
-                     (long long) n, resume, (long long) (n - (long long) resume), prompt_ms, produced, decode_ms,
-                     decode_ms > 0 ? 1000.0 * produced / decode_ms : 0.0, cancelled ? " (cancelled)" : "");
+        std::fprintf(stderr, "strata-dense: prompt %lld tokens = %zu reused + %lld read in %.0f ms (%.0f tok/s), %lld generated "
+                     "in %.0f ms (%.1f tok/s)%s; MTP %lld rounds, %lld of %lld drafts kept (%.2f tokens a round)\n",
+                     (long long) n, resume, (long long) (n - (long long) resume), prompt_ms,
+                     prompt_ms > 0 ? 1000.0 * (n - (long long) resume) / prompt_ms : 0.0, produced, decode_ms,
+                     decode_ms > 0 ? 1000.0 * produced / decode_ms : 0.0, cancelled ? " (cancelled)" : "",
+                     rounds, accepted, drafted, rounds ? (double) (accepted + rounds) / rounds : 0.0);
     }
     cudaFree(d_next);
     cudaFree(d_hist);
