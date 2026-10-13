@@ -354,6 +354,30 @@ int main(int argc, char** argv) {
             }
             std::fprintf(stderr, "bench ctx %lld: verify window %d: %.2f ms\n", (long long) model.position(), T, tot / (reps - 2));
         }
+        if (std::getenv("STRATA_DENSE_BENCH_GRAPH")) {   // the same pass captured once and replayed: launch overhead
+            const int T = wmax;
+            cudaStream_t gs = (cudaStream_t) model.stream();
+            cudaGraph_t graph;
+            cudaGraphExec_t exec;
+            cudaStreamBeginCapture(gs, cudaStreamCaptureModeGlobal);
+            const bool ok = model.forward(toks.data() + n0, T, true, strata::core::DenseModel::kAll, err);
+            cudaStreamEndCapture(gs, &graph);
+            model.commit(1, err);
+            size_t nodes = 0;
+            cudaGraphGetNodes(graph, nullptr, &nodes);
+            if (!ok || cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) != cudaSuccess) {
+                std::fprintf(stderr, "bench graph: capture failed: %s %s\n", err.c_str(), cudaGetErrorString(cudaGetLastError()));
+                return 1;
+            }
+            double tot = 0;
+            for (int r = 0; r < reps; ++r) {
+                const auto t0 = Clock::now();
+                cudaGraphLaunch(exec, gs);
+                cudaStreamSynchronize(gs);
+                if (r >= 2) tot += ms_since(t0);
+            }
+            std::fprintf(stderr, "bench graph: verify window %d replayed: %.2f ms (%zu nodes)\n", T, tot / (reps - 2), nodes);
+        }
         return 0;
     }
 
