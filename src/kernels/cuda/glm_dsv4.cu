@@ -372,7 +372,8 @@ __device__ __forceinline__ uint32_t okey(float f) {
     const uint32_t u = __float_as_uint(f);
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);   // larger float -> larger key
 }
-__global__ void __launch_bounds__(1024) topk_kernel(const float* score, int n, int k, int* sel) {
+// a block of 1024 threads: the top k of n scores into sel (the decode's and the prompt rows' selection)
+__device__ __forceinline__ void topk_select(const float* score, int n, int k, int* sel) {
     __shared__ unsigned int hist[2048];
     __shared__ uint32_t s_prefix, s_mask;
     __shared__ int s_need, s_bin;
@@ -400,6 +401,7 @@ __global__ void __launch_bounds__(1024) topk_kernel(const float* score, int n, i
         {
             __shared__ int s_suf[1024];
             const int per = nb / 1024;   // 2 or 1 bins a thread (nb 2048 / 1024)
+            const int need0 = s_need;    // (read before any thread can change it below)
             int c = 0;
             for (int j = 0; j < per; ++j) c += (int) hist[nb - 1 - (t * per + j)];
             s_suf[t] = c;
@@ -410,7 +412,6 @@ __global__ void __launch_bounds__(1024) topk_kernel(const float* score, int n, i
                 s_suf[t] += v;
                 __syncthreads();
             }
-            const int need0 = s_need;
             int above = s_suf[t] - c;   // the keys in the bins above this thread's
             for (int j = 0; j < per; ++j) {
                 const int b = nb - 1 - (t * per + j), h = (int) hist[b];
@@ -453,6 +454,9 @@ __global__ void __launch_bounds__(1024) topk_kernel(const float* score, int n, i
     const int need = s_need, base = s_out;
     for (int i = lo; i < hi && before < need; ++i)
         if (okey(score[i]) == thr) sel[base + before++] = i;
+}
+__global__ void __launch_bounds__(1024) topk_kernel(const float* score, int n, int k, int* sel) {
+    topk_select(score, n, k, sel);
 }
 
 // ---- the attention: one block a head (256 threads), the scores in dynamic shared memory
@@ -675,54 +679,7 @@ __global__ void __launch_bounds__(1024) rows_topk_kernel(const float* score, int
         for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = i;
         return;
     }
-    __shared__ unsigned int hist[2048];
-    __shared__ uint32_t s_prefix, s_mask;
-    __shared__ int s_need, s_out;
-    const float* sc = score + (size_t) t * ld;
-    const int tid = threadIdx.x;
-    if (tid == 0) {
-        s_prefix = 0u;
-        s_mask = 0u;
-        s_need = k;
-    }
-    __syncthreads();
-    const int shifts[3] = {21, 10, 0}, bits[3] = {11, 11, 10};
-    for (int pass = 0; pass < 3; ++pass) {
-        const int sh = shifts[pass], nb = 1 << bits[pass];
-        for (int i = tid; i < nb; i += 1024) hist[i] = 0u;
-        __syncthreads();
-        const uint32_t pre = s_prefix, msk = s_mask;
-        for (int i = tid; i < n; i += 1024) {
-            const uint32_t key = okey(sc[i]);
-            if ((key & msk) == pre) atomicAdd(&hist[(key >> sh) & (uint32_t) (nb - 1)], 1u);
-        }
-        __syncthreads();
-        if (tid == 0) {
-            int need = s_need, b = nb - 1;
-            for (; b > 0; --b) {
-                if ((int) hist[b] >= need) break;
-                need -= (int) hist[b];
-            }
-            s_need = need;
-            s_prefix = pre | ((uint32_t) b << sh);
-            s_mask = msk | ((uint32_t) (nb - 1) << sh);
-        }
-        __syncthreads();
-    }
-    const uint32_t thr = s_prefix;
-    if (tid == 0) s_out = 0;
-    __syncthreads();
-    for (int i = tid; i < n; i += 1024)
-        if (okey(sc[i]) > thr) out[atomicAdd(&s_out, 1)] = i;
-    __syncthreads();
-    if (tid == 0) {
-        int o = s_out, need = s_need;
-        for (int i = 0; i < n && need > 0; ++i)
-            if (okey(sc[i]) == thr) {
-                out[o++] = i;
-                --need;
-            }
-    }
+    topk_select(score + (size_t) t * ld, n, k, out);
 }
 // the attention of row t's 64 heads (one block of 512 a row): q (raw, per-head norm + rope here) over the raw window
 // (the ring below p0, raw16 from p0 on) and the visible pooled rows (sel: row t's k picks when more than k are visible,
