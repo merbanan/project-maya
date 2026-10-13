@@ -715,6 +715,7 @@ void DenseModel::reset() {
         if (L.state) cudaMemsetAsync(L.state, 0, sbytes, I.stream);
         if (L.conv_state) cudaMemsetAsync(L.conv_state, 0, cbytes, I.stream);
     }
+    if (I.df.on) cudaMemsetAsync(I.df.ring_pos, 0xff, (size_t) I.df.window * 8, I.stream);   // the drafter's context
     pos_ = 0;
     pending_ = 0;
 }
