@@ -234,9 +234,8 @@ __device__ __forceinline__ float sigm(float x) { return 1.0f / (1.0f + __expf(-x
 
 // 8 halves of a K8V4 K row (8 INT8 codes, the group's scale) / V row (8 4-bit codes): the codes become FP16
 // 1024 + c with a byte permute (0x64 high bytes), then (h - offset) * scale in half2 arithmetic
-__device__ __forceinline__ uint4 deq_k8(const int8_t* c, const __half* s, int d) {
-    const uint2 u = *(const uint2*) (c + d);
-    const __half2 sc = __half2half2(s[d / 32]), off = __float2half2_rn(1152.0f);   // 1024 + 128 (the sign flip)
+__device__ __forceinline__ uint4 deq_k8(uint2 u, __half s1) {
+    const __half2 sc = __half2half2(s1), off = __float2half2_rn(1152.0f);   // 1024 + 128 (the sign flip)
     const uint32_t a = u.x ^ 0x80808080u, b = u.y ^ 0x80808080u;
     uint32_t r[4];
     const uint32_t w[4] = {__byte_perm(a, 0x64u, 0x4140), __byte_perm(a, 0x64u, 0x4342),
@@ -248,9 +247,8 @@ __device__ __forceinline__ uint4 deq_k8(const int8_t* c, const __half* s, int d)
     }
     return make_uint4(r[0], r[1], r[2], r[3]);
 }
-__device__ __forceinline__ uint4 deq_v4(const uint8_t* c, const __half* s, int d) {
-    const uint32_t u = *(const uint32_t*) (c + d / 2);
-    const __half2 sc = __half2half2(s[d / 32]), off = __float2half2_rn(1032.0f);    // 1024 + 8 (the code bias)
+__device__ __forceinline__ uint4 deq_v4(uint32_t u, __half s1) {
+    const __half2 sc = __half2half2(s1), off = __float2half2_rn(1032.0f);    // 1024 + 8 (the code bias)
     // nibbles in order: byte i holds values 2i (low) and 2i + 1 (high)
     const uint32_t lo = u & 0x0F0F0F0Fu, hi = (u >> 4) & 0x0F0F0F0Fu;
     const uint32_t e = __byte_perm(lo, hi, 0x5140), f = __byte_perm(lo, hi, 0x7362);   // lo0 hi0 lo1 hi1 | lo2..
@@ -313,25 +311,44 @@ __global__ void __launch_bounds__(AW * 32) attn_tc_kernel(const float* __restric
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> fo[AD / 16];
 #pragma unroll
     for (int n = 0; n < AD / 16; ++n) wmma::fill_fragment(fo[n], 0.0f);
-    for (int k0 = ks; k0 < ke; k0 += AK) {
-        __syncthreads();
-        for (int i = tid; i < AK * (AD / 8); i += AW * 32) {
-            const int r = i / (AD / 8), d = (i % (AD / 8)) * 8, key = k0 + r;
-            uint4 kv4 = make_uint4(0, 0, 0, 0), vv4 = make_uint4(0, 0, 0, 0);
+    // the next tile's K / V (raw: FP16, or K8V4 codes and scales) prefetched into registers while this one computes
+    constexpr int PF = AK * (AD / 8) / (AW * 32);
+    uint4 pk[PF], pv[PF];
+    auto fetch = [&](int k0) {
+#pragma unroll
+        for (int j = 0; j < PF; ++j) {
+            const int i = tid + j * AW * 32, r = i / (AD / 8), d = (i % (AD / 8)) * 8, key = k0 + r;
+            pk[j] = pv[j] = make_uint4(0, 0, 0, 0);
             if (key < ke) {
                 const size_t cell = (size_t) kvh * max_ctx + key;
                 if (MODE == 0) {
-                    kv4 = *(const uint4*) ((const __half*) kv.k + cell * AD + d);
-                    vv4 = *(const uint4*) ((const __half*) kv.v + cell * AD + d);
-                } else {
-                    kv4 = deq_k8((const int8_t*) kv.k + cell * AD, (const __half*) kv.ks + cell * (AD / 32), d);
-                    vv4 = deq_v4((const uint8_t*) kv.v + cell * (AD / 2), (const __half*) kv.vs + cell * (AD / 32), d);
+                    pk[j] = __ldg((const uint4*) ((const __half*) kv.k + cell * AD + d));
+                    pv[j] = __ldg((const uint4*) ((const __half*) kv.v + cell * AD + d));
+                } else {   // K: 8 codes + its scale's bits; V: 8 nibbles + its scale's bits
+                    const uint2 kc = __ldg((const uint2*) ((const int8_t*) kv.k + cell * AD + d));
+                    pk[j] = make_uint4(kc.x, kc.y, __ldg((const unsigned short*) kv.ks + cell * (AD / 32) + d / 32), 0);
+                    pv[j] = make_uint4(__ldg((const uint32_t*) ((const uint8_t*) kv.v + cell * (AD / 2) + d / 2)),
+                                       __ldg((const unsigned short*) kv.vs + cell * (AD / 32) + d / 32), 0, 0);
                 }
+            }
+        }
+    };
+    if (ks < ke) fetch(ks);
+    for (int k0 = ks; k0 < ke; k0 += AK) {
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < PF; ++j) {
+            const int i = tid + j * AW * 32, r = i / (AD / 8), d = (i % (AD / 8)) * 8;
+            uint4 kv4 = pk[j], vv4 = pv[j];
+            if (MODE != 0) {
+                kv4 = deq_k8(make_uint2(pk[j].x, pk[j].y), __ushort_as_half((unsigned short) pk[j].z));
+                vv4 = deq_v4(pv[j].x, __ushort_as_half((unsigned short) pv[j].y));
             }
             *(uint4*) (sK + r * LDQ + d) = kv4;
             *(uint4*) (sV + r * LDQ + d) = vv4;
         }
         __syncthreads();
+        if (k0 + AK < ke) fetch(k0 + AK);
         if (!w_on || k0 > wlast) continue;
         // S (16 x AK) = Q_w . K^T
         wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[AK / 16];
