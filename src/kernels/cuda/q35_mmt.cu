@@ -85,8 +85,8 @@ __device__ __forceinline__ void scale_min_k4(int j, const uint32_t* w, float d, 
     mn = dmin * (float) mv;
 }
 
-// one super-block of the lane's row (words w) against the lane's token row xr (k from k0)
-template <int TYPE> __device__ __forceinline__ void sb_mma(const uint32_t* w, int sh, const __half* xr, int k0, float* c) {
+// one super-block of the lane's row (words w): f(k, b0, b1) for each 4 consecutive values k .. k + 3 (FP16 pairs)
+template <int TYPE, class F> __device__ __forceinline__ void sb_iter(const uint32_t* w, int sh, F&& f) {
     const __half2 off1024 = __float2half2_rn(1024.0f);
     if constexpr (TYPE == 12 || TYPE == 13) {
         const float d = h2f(w[0] & 0xffff), dmin = h2f(w[0] >> 16);
@@ -107,13 +107,11 @@ template <int TYPE> __device__ __forceinline__ void sb_mma(const uint32_t* w, in
                     lo |= ((h >> (2 * j)) & 0x01010101u) << 4;
                     hi |= ((h >> (2 * j + 1)) & 0x01010101u) << 4;
                 }
-                uint32_t a0, a1, b0, b1;
+                uint32_t b0, b1;
                 w4(lo, off1024, s1, n1, b0, b1);
-                xa(xr, k0 + 64 * j + 4 * c4, a0, a1);
-                mma884(c, a0, a1, b0, b1);
+                f(64 * j + 4 * c4, b0, b1);
                 w4(hi, off1024, s2, n2, b0, b1);
-                xa(xr, k0 + 64 * j + 32 + 4 * c4, a0, a1);
-                mma884(c, a0, a1, b0, b1);
+                f(64 * j + 32 + 4 * c4, b0, b1);
             }
         }
     } else if constexpr (TYPE == 14) {
@@ -141,20 +139,16 @@ template <int TYPE> __device__ __forceinline__ void sb_mma(const uint32_t* w, in
                 const uint32_t q2 = (a2 & 0x0F0F0F0Fu) | ((h << 2) & 0x30303030u);
                 const uint32_t q3 = ((a >> 4) & 0x0F0F0F0Fu) | (h & 0x30303030u);
                 const uint32_t q4 = ((a2 >> 4) & 0x0F0F0F0Fu) | ((h >> 2) & 0x30303030u);
-                const int kb = k0 + 128 * n + l;
-                uint32_t a0, a1, b0, b1;
+                const int kb = 128 * n + l;
+                uint32_t b0, b1;
                 w4(q1, off, sc[is], zero, b0, b1);
-                xa(xr, kb, a0, a1);
-                mma884(c, a0, a1, b0, b1);
+                f(kb, b0, b1);
                 w4(q2, off, sc[is + 2], zero, b0, b1);
-                xa(xr, kb + 32, a0, a1);
-                mma884(c, a0, a1, b0, b1);
+                f(kb + 32, b0, b1);
                 w4(q3, off, sc[is + 4], zero, b0, b1);
-                xa(xr, kb + 64, a0, a1);
-                mma884(c, a0, a1, b0, b1);
+                f(kb + 64, b0, b1);
                 w4(q4, off, sc[is + 6], zero, b0, b1);
-                xa(xr, kb + 96, a0, a1);
-                mma884(c, a0, a1, b0, b1);
+                f(kb + 96, b0, b1);
             }
         }
     } else {   // Q8_0: 8 blocks of [half d | 32 int8], 34 bytes (2-byte aligned inside the 272)
@@ -168,13 +162,21 @@ template <int TYPE> __device__ __forceinline__ void sb_mma(const uint32_t* w, in
             for (int c4 = 0; c4 < 8; ++c4) {
                 const int b = o + 2 + 4 * c4;   // 2-byte aligned
                 const uint32_t v = (b & 3) == 0 ? w[b >> 2] : __byte_perm(w[b >> 2], w[(b >> 2) + 1], 0x5432);
-                uint32_t a0, a1, b0, b1;
+                uint32_t b0, b1;
                 w4(v ^ 0x80808080u, off, s, zero, b0, b1);   // int8 -> q + 128 as a byte
-                xa(xr, k0 + 32 * bb + 4 * c4, a0, a1);
-                mma884(c, a0, a1, b0, b1);
+                f(32 * bb + 4 * c4, b0, b1);
             }
         }
     }
+}
+
+// ... against the lane's token row xr of the X tile (k from k0): the tensor-core products into c
+template <int TYPE> __device__ __forceinline__ void sb_mma(const uint32_t* w, int sh, const __half* xr, int k0, float* c) {
+    sb_iter<TYPE>(w, sh, [&](int k, uint32_t b0, uint32_t b1) {
+        uint32_t a0, a1;
+        xa(xr, k0 + k, a0, a1);
+        mma884(c, a0, a1, b0, b1);
+    });
 }
 
 // a block's 128 rows of one super-block in shared memory: row r's words at r * stride (odd: lane reads conflict free),
@@ -259,6 +261,119 @@ __global__ void __launch_bounds__(kW * 32) mmt_kernel(const uint8_t* __restrict_
     }
 }
 
+// ---- the packed layout (v100-skinny / NInfer's prepacking): rows in groups of 32; a group's super-block sb is a tile
+// of 32 blocks interleaved at 16 bytes - chunk c of lane l's block at (c * 32 + l) * 16 - so a warp's load of chunk c
+// reads 512 contiguous bytes and every lane gets its own row's words, no staging.  Blocks padded to 16 bytes (Q6_K:
+// 210 -> 224, so its blocks are aligned too); tiles in (group, super-block) order; rows past N are zero.
+template <int TYPE> __host__ __device__ constexpr int packed_bytes() { return (Fmt<TYPE>::bytes + 15) / 16 * 16; }
+
+__global__ void pack_kernel(const uint8_t* __restrict__ src, size_t row_bytes, int bb, int bp, int nsb, int N,
+                            uint4* __restrict__ dst, size_t n_chunks) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_chunks) return;
+    const int ch = bp / 16;
+    const int lane = (int) (i % 32), c = (int) (i / 32 % ch);
+    const size_t tile = i / ((size_t) 32 * ch);
+    const int sb = (int) (tile % nsb), g = (int) (tile / nsb), row = g * 32 + lane;
+    uint8_t b[16];
+    for (int k = 0; k < 16; ++k) {
+        const int off = 16 * c + k;
+        b[k] = row < N && off < bb ? src[(size_t) row * row_bytes + (size_t) sb * bb + off] : 0;
+    }
+    dst[i] = *(const uint4*) b;
+}
+
+// the inverse: a packed matrix back to GGUF rows (a thread per output byte group of 16 within a padded block)
+__global__ void unpack_kernel(const uint4* __restrict__ src, size_t row_bytes, int bb, int bp, int nsb, int N,
+                              uint8_t* __restrict__ dst, size_t n_chunks) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_chunks) return;
+    const int ch = bp / 16;
+    const int lane = (int) (i % 32), c = (int) (i / 32 % ch);
+    const size_t tile = i / ((size_t) 32 * ch);
+    const int sb = (int) (tile % nsb), g = (int) (tile / nsb), row = g * 32 + lane;
+    if (row >= N) return;
+    const uint4 v = src[i];
+    const uint8_t* b = (const uint8_t*) &v;
+    uint8_t* o = dst + (size_t) row * row_bytes + (size_t) sb * bb;
+    for (int k = 0; k < 16 && 16 * c + k < bb; ++k) o[16 * c + k] = b[k];
+}
+
+// a packed matrix's row groups g0 .. g0 + gridDim.x - 1 to FP16 rows (out: row r - 32 g0, K wide): a warp a (group,
+// super-block), a lane its row's block, the same dequant as the GEMV
+template <int TYPE>
+__global__ void __launch_bounds__(64) dequant_packed_kernel(const uint4* __restrict__ P, int K, int N, int g0,
+                                                            __half* __restrict__ out) {
+    constexpr int CH = packed_bytes<TYPE>() / 16, LD = 256 + 8;
+    __shared__ __align__(16) __half tile[2][32 * LD];   // a warp's 32 rows x 256, written out row by row
+    const int nsb = K / 256, lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    const int sb = blockIdx.y * 2 + wp, g = g0 + blockIdx.x, row = g * 32 + lane;
+    if (sb >= nsb) return;
+    __half* tl = tile[wp];
+    if (row < N) {
+        uint32_t w[4 * CH];
+        const uint4* t = P + ((size_t) g * nsb + sb) * 32 * CH + lane;
+#pragma unroll
+        for (int k = 0; k < CH; ++k) {
+            const uint4 v = __ldg(t + k * 32);
+            w[4 * k] = v.x; w[4 * k + 1] = v.y; w[4 * k + 2] = v.z; w[4 * k + 3] = v.w;
+        }
+        sb_iter<TYPE>(w, 0, [&](int k, uint32_t b0, uint32_t b1) { *(uint2*) (tl + lane * LD + k) = make_uint2(b0, b1); });
+    }
+    __syncwarp();
+    const int rows = min(32, N - g * 32);
+    for (int r = 0; r < rows; ++r)   // a row: 32 lanes x 16 bytes, contiguous
+        *(uint4*) (out + (size_t) (g * 32 + r - g0 * 32) * K + (size_t) sb * 256 + lane * 8) = *(const uint4*) (tl + r * LD + lane * 8);
+}
+
+template <int TYPE>
+__global__ void __launch_bounds__(kW * 32) mmtp_kernel(const uint4* __restrict__ P, const __half* __restrict__ X, int K,
+                                                       int N, int M, int sb_per_split, float* __restrict__ out) {
+    constexpr int CH = packed_bytes<TYPE>() / 16;
+    __shared__ __align__(16) __half sx[8 * kXld];
+    const int tid = threadIdx.x, lane = tid & 31, wp = tid >> 5;
+    const int g = blockIdx.x * kW + wp, n0 = g * 32;
+    const bool on = n0 < N;
+    const int nsb = K / 256;
+    const int sb0 = blockIdx.y * sb_per_split, sb1 = min(nsb, sb0 + sb_per_split);
+    const int tok = (lane & 3) + ((lane >> 4) << 2);
+    float c[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t w[4 * CH], nx[4 * CH];
+    auto load = [&](int sb, uint32_t* d) {
+        const uint4* t = P + ((size_t) g * nsb + sb) * 32 * CH + lane;
+#pragma unroll
+        for (int k = 0; k < CH; ++k) {
+            const uint4 v = __ldg(t + k * 32);
+            d[4 * k] = v.x; d[4 * k + 1] = v.y; d[4 * k + 2] = v.z; d[4 * k + 3] = v.w;
+        }
+    };
+    if (on && sb0 < sb1) load(sb0, nx);
+    for (int sb = sb0; sb < sb1; ++sb) {
+#pragma unroll
+        for (int k = 0; k < 4 * CH; ++k) w[k] = nx[k];
+        __syncthreads();
+        for (int i = tid; i < 8 * 32; i += kW * 32) {   // X rows 0..7, k sb*256 .. +255
+            const int r = i / 32, cc = (i % 32) * 8;
+            *(uint4*) (sx + r * kXld + cc) = __ldg((const uint4*) (X + (size_t) r * K + (size_t) sb * 256 + cc));
+        }
+        __syncthreads();
+        if (!on) continue;
+        if (sb + 1 < sb1) load(sb + 1, nx);
+        sb_mma<TYPE>(w, 0, sx + tok * kXld, 0, c);
+    }
+    if (!on) return;
+    const int j = lane & 3, hi = lane >> 4, b = 4 * ((lane >> 2) & 3);
+    const int r0 = b + (j & 1) + 16 * hi, cc = b + (j & 2);
+    const int rl[2] = {r0, r0 + 2}, cl[4] = {cc, cc + 1, cc + 16, cc + 17};
+    const int ci[8][2] = {{0, 0}, {0, 1}, {1, 0}, {1, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int rlane = rl[ci[i][0]], clane = cl[ci[i][1]];
+        const int t = (rlane & 3) + ((rlane >> 4) << 2), n = n0 + clane;
+        if (t < M && n < N) out[((size_t) blockIdx.y * M + t) * N + n] = c[i];
+    }
+}
+
 __global__ void reduce_kernel(const float* __restrict__ part, int splits, int64_t n, float* __restrict__ y) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -329,6 +444,80 @@ void q35_mmt(int ggml_type, const void* W, const uint16_t* xh8, float* y, int K,
         const int64_t n = (int64_t) M * N;
         reduce_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(part, splits, n, y);
         check("q35_mmt_reduce");
+    }
+}
+
+namespace {
+int fmt_bytes(int type) { return type == 12 ? 144 : type == 13 ? 176 : type == 14 ? 210 : type == 8 ? 272 : 0; }
+int pad16(int b) { return (b + 15) / 16 * 16; }
+}  // namespace
+
+uint64_t q35_mmt_packed_bytes(int ggml_type, int K, int N) {
+    const int bb = fmt_bytes(ggml_type);
+    if (!bb) return 0;
+    return (uint64_t) ((N + 31) / 32) * 32 * (K / 256) * pad16(bb);
+}
+
+void q35_mmt_pack(int ggml_type, const void* W, void* packed, int K, int N, void* stream) {
+    const int bb = fmt_bytes(ggml_type), bp = pad16(bb), nsb = K / 256;
+    if (!bb || K % 256) throw std::invalid_argument("q35_mmt_pack: type / K");
+    const size_t n_chunks = q35_mmt_packed_bytes(ggml_type, K, N) / 16;
+    pack_kernel<<<(unsigned) ((n_chunks + 255) / 256), 256, 0, (cudaStream_t) stream>>>(
+        (const uint8_t*) W, (size_t) nsb * bb, bb, bp, nsb, N, (uint4*) packed, n_chunks);
+    check("q35_mmt_pack");
+}
+
+void q35_mmt_unpack(int ggml_type, const void* packed, void* W, int K, int N, void* stream) {
+    const int bb = fmt_bytes(ggml_type), bp = pad16(bb), nsb = K / 256;
+    if (!bb || K % 256) throw std::invalid_argument("q35_mmt_unpack: type / K");
+    const size_t n_chunks = q35_mmt_packed_bytes(ggml_type, K, N) / 16;
+    unpack_kernel<<<(unsigned) ((n_chunks + 255) / 256), 256, 0, (cudaStream_t) stream>>>(
+        (const uint4*) packed, (size_t) nsb * bb, bb, bp, nsb, N, (uint8_t*) W, n_chunks);
+    check("q35_mmt_unpack");
+}
+
+void q35_mmt_dequant_packed(int ggml_type, const void* packed, int K, int N, int row0, int rows, uint16_t* out,
+                            void* stream) {
+    if (row0 % 32 || K % 256) throw std::invalid_argument("q35_mmt_dequant_packed: row0 / K");
+    const dim3 grid((unsigned) ((rows + 31) / 32), (unsigned) ((K / 256 + 1) / 2));
+    const uint4* P = (const uint4*) packed;
+    cudaStream_t s = (cudaStream_t) stream;
+    const int g0 = row0 / 32, n_end = std::min(N, row0 + rows);
+    switch (ggml_type) {
+    case 12: dequant_packed_kernel<12><<<grid, 64, 0, s>>>(P, K, n_end, g0, (__half*) out); break;
+    case 13: dequant_packed_kernel<13><<<grid, 64, 0, s>>>(P, K, n_end, g0, (__half*) out); break;
+    case 14: dequant_packed_kernel<14><<<grid, 64, 0, s>>>(P, K, n_end, g0, (__half*) out); break;
+    case 8: dequant_packed_kernel<8><<<grid, 64, 0, s>>>(P, K, n_end, g0, (__half*) out); break;
+    default: throw std::invalid_argument("q35_mmt_dequant_packed: weight type");
+    }
+    check("q35_mmt_dequant_packed");
+}
+
+void q35_mmtp(int ggml_type, const void* packed, const uint16_t* xh8, float* y, int K, int N, int M, float* part,
+              void* stream) {
+    if (M < 1 || M > 8 || K % 256 != 0) throw std::invalid_argument("q35_mmtp: 1..8 rows, K a multiple of 256");
+    const int nsb = K / 256, bx = (N + kW * 32 - 1) / (kW * 32);
+    int splits = std::max(1, std::min(std::min(64, nsb / 2), (8 * sm_count() + bx - 1) / bx));
+    const int per = (nsb + splits - 1) / splits;
+    splits = (nsb + per - 1) / per;
+    float* dst = splits == 1 ? y : part;
+    if (splits > 1 && (int64_t) splits * M * N > q35_mmt_part_floats(N)) throw std::runtime_error("q35_mmtp: partials");
+    const dim3 grid(bx, splits);
+    cudaStream_t s = (cudaStream_t) stream;
+    const uint4* P = (const uint4*) packed;
+    const __half* X = (const __half*) xh8;
+    switch (ggml_type) {
+    case 12: mmtp_kernel<12><<<grid, kW * 32, 0, s>>>(P, X, K, N, M, per, dst); break;
+    case 13: mmtp_kernel<13><<<grid, kW * 32, 0, s>>>(P, X, K, N, M, per, dst); break;
+    case 14: mmtp_kernel<14><<<grid, kW * 32, 0, s>>>(P, X, K, N, M, per, dst); break;
+    case 8: mmtp_kernel<8><<<grid, kW * 32, 0, s>>>(P, X, K, N, M, per, dst); break;
+    default: throw std::invalid_argument("q35_mmtp: weight type");
+    }
+    check("q35_mmtp");
+    if (splits > 1) {
+        const int64_t n = (int64_t) M * N;
+        reduce_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(part, splits, n, y);
+        check("q35_mmtp_reduce");
     }
 }
 

@@ -96,6 +96,27 @@ int main(int argc, char** argv) {
             float ms; cudaEventElapsedTime(&ms, e0, e1);
             printf("   M %d: %8.1f us  %6.0f GB/s\n", M, 1000 * ms / reps, nb * bytes / (ms / reps * 1e-3) / 1e9);
         }
+        {   // the packed layout
+            void* dQ; cudaMalloc(&dQ, strata::kernels::q35_mmt_packed_bytes(type, K, N));
+            strata::kernels::q35_mmt_pack(type, dW, dQ, K, N, s);
+            strata::kernels::q35_mmt_prep(dX, K, 8, dXh, s);
+            strata::kernels::q35_mmtp(type, dQ, dXh, dY, K, N, 8, dP, s);
+            std::vector<float> Y2(8 * (size_t) N);
+            cudaMemcpy(Y2.data(), dY, Y2.size() * 4, cudaMemcpyDeviceToHost);
+            double d = 0;
+            for (size_t i = 0; i < Y2.size(); ++i) d = fmax(d, fabs(Y2[i] - Y[i]));
+            printf("   packed: max diff to unpacked %.3g  %s\n", d, cudaGetErrorString(cudaGetLastError()));
+            for (int M : {1, 2, 4, 8}) {
+                strata::kernels::q35_mmt_prep(dX, K, M, dXh, s);
+                for (int i = 0; i < 3; ++i) strata::kernels::q35_mmtp(type, dQ, dXh, dY, K, N, M, dP, s);
+                cudaEventRecord(e0, s);
+                for (int i = 0; i < 50; ++i) strata::kernels::q35_mmtp(type, dQ, dXh, dY, K, N, M, dP, s);
+                cudaEventRecord(e1, s); cudaEventSynchronize(e1);
+                float ms; cudaEventElapsedTime(&ms, e0, e1);
+                printf("   packed M %d: %8.1f us  %6.0f GB/s\n", M, 1000 * ms / 50, nb * bytes / (ms / 50 * 1e-3) / 1e9);
+            }
+            cudaFree(dQ);
+        }
         cudaFree(dW); cudaFree(dX); cudaFree(dY); cudaFree(dXh); cudaFree(dP);
     }
     return 0;

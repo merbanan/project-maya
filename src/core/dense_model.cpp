@@ -42,6 +42,7 @@ struct QMat {
     void* dev = nullptr;
     int type = -1;
     int n_in = 0, n_out = 0;
+    bool packed = false;                            // in q35_mmtp's packed layout (else GGUF rows)
 };
 
 struct Layer {
@@ -280,8 +281,29 @@ struct DenseModel::Impl {
     }
 
     // A quantized matrix, kept in its GGUF blocks.
+    // q35_mmtp's packed layout for the GEMVs (v100-skinny / NInfer's prepacking; STRATA_DENSE_PACK=0: GGUF rows);
+    // a prompt chunk's GEMM dequantizes straight from it (q35_mmt_dequant_packed).
+    bool pack_on = true;
+    bool pack(QMat& m, bool wide, std::string& err) {
+        (void) wide;
+        if (!pack_on || !q35_mmt_supported(m.type) || m.n_in % 256) return true;
+        const uint64_t pb = q35_mmt_packed_bytes(m.type, m.n_in, m.n_out);
+        void* p = nullptr;
+        if (cudaMalloc(&p, pb) != cudaSuccess) { cudaGetLastError(); return true; }   // (no room: GGUF rows)
+        q35_mmt_pack(m.type, m.dev, p, m.n_in, m.n_out, stream);
+        if (cudaStreamSynchronize(stream) != cudaSuccess) { err = "dense model: packing failed"; return false; }
+        const uint64_t ob = native_mmvq_weight_bytes(m.type, m.n_in, m.n_out);
+        cudaFree(m.dev);
+        allocations.erase(std::find(allocations.begin(), allocations.end(), m.dev));
+        allocations.push_back(p);
+        dev_used += pb - ob;
+        m.dev = p;
+        m.packed = true;
+        return true;
+    }
+
     bool upload_mat(const Found* f, const std::string& name, int n_in, int n_out, QMat& out, uint64_t& total,
-                    std::string& err) {
+                    std::string& err, bool packable = true, bool wide = true) {
         if (!f) { err = "dense model: missing tensor " + name; return false; }
         const strata::TensorInfo& t = *f->tensor;
         if (t.shape.size() != 2 || t.shape[0] != (uint64_t) n_in || t.shape[1] != (uint64_t) n_out) {
@@ -335,9 +357,10 @@ struct DenseModel::Impl {
             host_bytes += bytes;
             ++host_tensors;
         }
+        const bool in_vram = std::find(allocations.begin(), allocations.end(), dev) != allocations.end();
         out = QMat{dev, (int) t.type, n_in, n_out};
         total += bytes;
-        return true;
+        return !(packable && in_vram) || pack(out, wide, err);
     }
 
     // ---- the projections of T token rows (x dense rows of n_in): prep() once per input, then mm() per matrix
@@ -355,7 +378,24 @@ struct DenseModel::Impl {
         if (T > kMaxCols) q35_to_half(x, xh, (int64_t) T * n_in, stream);
     }
     void mm(const QMat& w, float* y) {
-        if (cur_T > kMaxCols) { gemm.native(xh, w.type, w.dev, y, cur_T, w.n_out, w.n_in); return; }
+        if (cur_T > kMaxCols) {
+            if (w.packed) {   // dequantized to FP16 straight from the packed layout, row slices that fit the scratch
+                const int64_t step = std::max<int64_t>(32, gemm.scratch_elems() / w.n_in / 32 * 32);
+                for (int64_t r0 = 0; r0 < w.n_out; r0 += step) {
+                    const int rows = (int) std::min<int64_t>(step, w.n_out - r0);
+                    q35_mmt_dequant_packed(w.type, w.dev, w.n_in, w.n_out, (int) r0, rows, gemm.scratch(), stream);
+                    gemm.f16(xh, gemm.scratch(), y + r0, cur_T, rows, w.n_in, w.n_out);
+                }
+            } else {
+                gemm.native(xh, w.type, w.dev, y, cur_T, w.n_out, w.n_in);
+            }
+            return;
+        }
+        if (w.packed) {
+            if (!h8_ready) { q35_mmt_prep(cur_x, cur_n, cur_T, xh8, stream); h8_ready = true; }
+            q35_mmtp(w.type, w.dev, xh8, y, w.n_in, w.n_out, cur_T, mmt_part, stream);
+            return;
+        }
         if (mmt_on && (cur_T >= mmt_min || mmt1) && q35_mmt_supported(w.type)) {
             if (!h8_ready) { q35_mmt_prep(cur_x, cur_n, cur_T, xh8, stream); h8_ready = true; }
             q35_mmt(w.type, w.dev, xh8, y, w.n_in, w.n_out, cur_T, mmt_part, stream);
@@ -451,6 +491,7 @@ const float* DenseModel::mtp_hidden() const { return impl_->mtp_h; }
 bool DenseModel::load(const std::string& path, int64_t max_context, std::string& err, int chunk) {
     Impl& I = *impl_;
     I.chunk = std::max(kMaxCols + 1, chunk);
+    if (const char* e = std::getenv("STRATA_DENSE_PACK")) I.pack_on = std::atoi(e) != 0;
     if (const char* e = std::getenv("STRATA_DENSE_KV")) {
         if (std::string(e) == "k8v4") I.kv_mode = 1;
         else if (std::string(e) != "fp16") { err = std::string("dense model: STRATA_DENSE_KV=") + e + " (fp16 | k8v4)"; return false; }
@@ -664,12 +705,12 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         }
 
         // ---- 4. the input and output side
-        if (!I.upload_mat(tok, "token_embd.weight", E, cfg_.n_vocab, I.embd, total, err)) return false;
+        if (!I.upload_mat(tok, "token_embd.weight", E, cfg_.n_vocab, I.embd, total, err, false)) return false;
         if (!I.upload_floats(I.find("output_norm.weight"), "output_norm.weight", E, &I.output_norm, err)) return false;
         const Found* head = I.find("output.weight");
         if (!head) head = tok;                                   // tied embeddings
         if (!I.upload_mat(head, head == tok ? "token_embd.weight (tied head)" : "output.weight", E, cfg_.n_vocab,
-                          I.head, total, err))
+                          I.head, total, err, head != tok, false))
             return false;
         I.head_draft = I.head;
         if (const char* e = std::getenv("STRATA_DENSE_DRAFT_VOCAB")) {
@@ -1003,6 +1044,7 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
             cudaMemcpy(dev, q.data(), q.size(), cudaMemcpyHostToDevice);
             out = QMat{dev, 8, n_in, n_out};
             total += q.size();
+            if (!I.pack(out, true, err)) return false;
             return true;
         };
         const int qd = F.n_head * 128, kvd = F.n_kv * 128, cdyn = 2 * F.taps * (E / F.group);

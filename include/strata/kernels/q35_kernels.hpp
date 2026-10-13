@@ -100,4 +100,15 @@ int64_t q35_mmt_part_floats(int N);
 void q35_mmt(int ggml_type, const void* W, const uint16_t* xh8, float* y, int K, int N, int M, float* part,
              void* stream);
 
+/// The packed layout of q35_mmtp (32-row groups, blocks interleaved at 16 bytes; see q35_mmt.cu): its bytes, the
+/// repacking of a GGUF matrix (W N rows of K) into it, and the GEMV over it (as q35_mmt).
+uint64_t q35_mmt_packed_bytes(int ggml_type, int K, int N);
+void q35_mmt_pack(int ggml_type, const void* W, void* packed, int K, int N, void* stream);
+void q35_mmt_unpack(int ggml_type, const void* packed, void* W, int K, int N, void* stream);
+/// rows row0 .. row0 + rows - 1 (row0 a multiple of 32) of a packed matrix to FP16 rows of K (the prompt's GEMMs)
+void q35_mmt_dequant_packed(int ggml_type, const void* packed, int K, int N, int row0, int rows, uint16_t* out,
+                            void* stream);
+void q35_mmtp(int ggml_type, const void* packed, const uint16_t* xh8, float* y, int K, int N, int M, float* part,
+              void* stream);
+
 }  // namespace strata::kernels
