@@ -25,6 +25,7 @@
 #include "strata/kernels/dense_kernels.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/q35_kernels.hpp"
+#include "strata/spec/suffix_drafter.hpp"
 
 #include <cuda_runtime.h>
 
@@ -260,6 +261,7 @@ int main(int argc, char** argv) {
         else if (a == "--draft" || a == "--mtp-draft") draft = std::atoi(next("--draft"));
         else if (a == "--chunk") chunk = std::atoi(next("--chunk"));
         else if (a == "--dflash") dflash = next("--dflash");
+        else if (a == "--kv") setenv("STRATA_DENSE_KV", next("--kv"), 1);
         else if (a == "--help" || a == "-h") { usage(); return 0; }
         // the flags setup passes to `strata` (--gpu-layers, --cache, ...) mean nothing here and are not an error
     }
@@ -310,7 +312,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::printf("INFO engine=dense-0.2 model=%s layers=%d n_embd=%d weights_mib=%llu host_mib=%llu kv_mib=%llu context=%lld mtp=%d\n",
+    std::printf("INFO engine=dense-0.2 kv=%s model=%s layers=%d n_embd=%d weights_mib=%llu host_mib=%llu kv_mib=%llu context=%lld mtp=%d\n",
+                std::getenv("STRATA_DENSE_KV") ? std::getenv("STRATA_DENSE_KV") : "fp16",
                 cfg.arch.c_str(), cfg.n_layer, cfg.n_embd, (unsigned long long) (model.weight_bytes() >> 20),
                 (unsigned long long) (model.host_weight_bytes() >> 20), (unsigned long long) (model.kv_bytes() >> 20),
                 (long long) model.max_context(), draft);
@@ -330,9 +333,10 @@ int main(int argc, char** argv) {
             if (!model.forward(toks.data() + i, T, false, 0, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
         }
         model.sync(err);
-        for (int T = 1; T <= 8; ++T) {
+        const int wmax = std::getenv("STRATA_DENSE_BENCH_W") ? std::atoi(std::getenv("STRATA_DENSE_BENCH_W")) : 8;
+        const int reps = std::getenv("STRATA_DENSE_BENCH_REPS") ? std::atoi(std::getenv("STRATA_DENSE_BENCH_REPS")) : 12;
+        for (int T = std::getenv("STRATA_DENSE_BENCH_W") ? wmax : 1; T <= wmax; ++T) {
             double tot = 0;
-            const int reps = 12;
             for (int r = 0; r < reps; ++r) {
                 const auto t0 = Clock::now();
                 if (!model.forward(toks.data() + n0, T, true, strata::core::DenseModel::kAll, err) || !model.sync(err)) {
@@ -360,6 +364,10 @@ int main(int argc, char** argv) {
     });
     reader.detach();
 
+    // context lookup (NInfer's, Strata's suffix drafter): when the text's last tokens occurred before - code being
+    // edited, a tool's output quoted - the tokens that followed are proposed instead of the learned drafter's
+    const int lookup_min = std::getenv("STRATA_DENSE_LOOKUP_MIN") ? std::atoi(std::getenv("STRATA_DENSE_LOOKUP_MIN")) : 12;
+    strata::spec::SuffixDrafter lookup(std::max(3, lookup_min), 64);
     std::vector<int32_t> fed;                      // every token the state has consumed, in order
     uint64_t draw_counter = 0;
     std::string line;
@@ -419,6 +427,12 @@ int main(int argc, char** argv) {
         size_t resume = 0;
         if (!fed.empty() && fed.size() < ids.size() && std::equal(fed.begin(), fed.end(), ids.begin())) resume = fed.size();
         if (resume == 0) { model.reset(); fed.clear(); }
+        if (resume == 0 || lookup.size() != resume) {   // (the lookup history is the prompt and the answer so far)
+            lookup.reset();
+            lookup.append(ids.data(), ids.size());
+        } else {
+            lookup.append(ids.data() + resume, ids.size() - resume);
+        }
         const int64_t n = (int64_t) ids.size();
         const long long budget = std::min<long long>(max_new, model.max_context() - n);
 
@@ -471,8 +485,10 @@ int main(int argc, char** argv) {
         auto budget_force = [&](int32_t& t) {
             if (in_think && produced >= think_budget && t != think_end) t = think_end;
         };
+        long long lookup_rounds = 0;
         auto emit = [&](int32_t t) -> bool {        // false: the answer ends here
             if (in_think && t == think_end) in_think = false;
+            lookup.append(t);
             ++produced;
             std::printf("T %d\n", t);
             if (sp.penalty_last_n > 0) { hist.push_back(t); if ((int) hist.size() > sp.penalty_last_n) hist.erase(hist.begin()); }
@@ -514,7 +530,16 @@ int main(int argc, char** argv) {
             int k = (int) std::min<long long>(K, std::min<long long>(budget - produced, model.max_context() - pos - 1));
             k = std::max(0, k);
             std::vector<int32_t> win = {anchor};
-            if (k > 0 && use_df) {
+            int32_t lk[16];
+            const int nl = k > 0 && lookup_min > 0 ? lookup.propose(k, lk) : 0;
+            if (nl > 0 && lookup.last_match() >= lookup_min) {
+                win.insert(win.end(), lk, lk + nl);
+                ++lookup_rounds;
+                // the MTP block still reads its pending rows (its cache follows the trunk)
+                if (!use_df && !model.mtp_forward(mtp_tok.data(), d_hrows, mtp_p0, (int) mtp_tok.size(), false, err)) {
+                    std::printf("ERR %s\n", err.c_str()); failed = true; break;
+                }
+            } else if (k > 0 && use_df) {
                 std::vector<int32_t> d;
                 if (!model.dflash_draft(anchor, k, d, err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
                 win.insert(win.end(), d.begin(), d.end());
@@ -525,7 +550,7 @@ int main(int argc, char** argv) {
                 }
                 for (int j = 0; j < k; ++j) {
                     int d = 0;
-                    strata::kernels::q35_argmax_rows(model.mtp_logits(), cfg.n_vocab, cfg.n_vocab, 1, d_next, cs);
+                    strata::kernels::q35_argmax_rows(model.mtp_logits(), model.draft_vocab(), model.draft_vocab(), 1, d_next, cs);
                     cudaMemcpyAsync(&d, d_next, sizeof(int), cudaMemcpyDeviceToHost, cs);
                     if (!model.sync(err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
                     win.push_back(d);
@@ -582,11 +607,11 @@ int main(int argc, char** argv) {
                     accepted, drafted, (long long) resume);
         std::fflush(stdout);
         std::fprintf(stderr, "strata-dense: prompt %lld tokens = %zu reused + %lld read in %.0f ms (%.0f tok/s), %lld generated "
-                     "in %.0f ms (%.1f tok/s)%s; %s %lld rounds, %lld of %lld drafts kept (%.2f tokens a round)\n",
+                     "in %.0f ms (%.1f tok/s)%s; %s %lld rounds (%lld by lookup), %lld of %lld drafts kept (%.2f tokens a round)\n",
                      (long long) n, resume, (long long) (n - (long long) resume), prompt_ms,
                      prompt_ms > 0 ? 1000.0 * (n - (long long) resume) / prompt_ms : 0.0, produced, decode_ms,
                      decode_ms > 0 ? 1000.0 * produced / decode_ms : 0.0, cancelled ? " (cancelled)" : "",
-                     use_df ? "DFlash2" : "MTP", rounds, accepted, drafted, rounds ? (double) (accepted + rounds) / rounds : 0.0);
+                     use_df ? "DFlash2" : "MTP", rounds, lookup_rounds, accepted, drafted, rounds ? (double) (accepted + rounds) / rounds : 0.0);
     }
     cudaFree(d_next);
     cudaFree(d_hist);

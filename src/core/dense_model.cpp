@@ -61,7 +61,7 @@ struct Layer {
     // attention mixer
     QMat q, k, v, o;
     float *q_norm = nullptr, *k_norm = nullptr;
-    uint16_t *kc = nullptr, *vc = nullptr;
+    Q35Kv kv;                                      // the K / V cache (FP16 or K8V4)
     // the MTP (nextn) block's own
     QMat eh_proj;
     float *enorm = nullptr, *hnorm = nullptr, *head_norm = nullptr;
@@ -154,10 +154,12 @@ struct DenseModel::Impl {
     int host_tensors = 0;
     cudaStream_t stream = nullptr;
     int chunk = 512;                                // the largest T of a forward pass
+    int kv_mode = 0;                                // the K / V cache: 0 FP16, 1 K8V4 (STRATA_DENSE_KV / --kv)
 
     QMat embd;                                      // token_embd, on the device (rows dequantized per token)
     float* output_norm = nullptr;
     QMat head;
+    QMat head_draft;                                // the head's first draft_vocab rows (the drafts' vocabulary)
     void* q8_1 = nullptr;                           // the GEMVs' quantized activations (kMaxCols columns)
     uint16_t* xh = nullptr;                         // the GEMMs' FP16 activations (chunk rows of the widest input)
     strata::prefill::Gemm gemm;
@@ -439,6 +441,7 @@ float* DenseModel::logits() const { return impl_->logits; }
 void* DenseModel::stream() const { return impl_->stream; }
 const float* DenseModel::hidden_norm() const { return impl_->hn; }
 int DenseModel::chunk() const { return impl_->chunk; }
+int DenseModel::draft_vocab() const { return impl_->head_draft.n_out; }
 bool DenseModel::has_mtp() const { return impl_->mtp.attn; }
 float* DenseModel::mtp_logits() const { return impl_->mtp_logits; }
 const float* DenseModel::mtp_hidden() const { return impl_->mtp_h; }
@@ -446,6 +449,10 @@ const float* DenseModel::mtp_hidden() const { return impl_->mtp_h; }
 bool DenseModel::load(const std::string& path, int64_t max_context, std::string& err, int chunk) {
     Impl& I = *impl_;
     I.chunk = std::max(kMaxCols + 1, chunk);
+    if (const char* e = std::getenv("STRATA_DENSE_KV")) {
+        if (std::string(e) == "k8v4") I.kv_mode = 1;
+        else if (std::string(e) != "fp16") { err = std::string("dense model: STRATA_DENSE_KV=") + e + " (fp16 | k8v4)"; return false; }
+    }
     I.prof.on = std::getenv("STRATA_DENSE_PROF") != nullptr && std::atoi(std::getenv("STRATA_DENSE_PROF")) != 0;
     try {
         // ---- 1. the files and the tensor index
@@ -529,7 +536,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             int n_attn = want_mtp ? 1 : 0;
             for (int l = 0; l < NL; ++l)
                 if (I.find("blk." + std::to_string(l) + ".attn_q.weight")) ++n_attn;
-            const uint64_t kv_need = (uint64_t) n_attn * 2 * (uint64_t) HK * (uint64_t) max_context * (uint64_t) D * 2;
+            const uint64_t kv_need = (uint64_t) n_attn * q35_kv_bytes(I.kv_mode, HK, D, (int) max_context);
             const uint64_t act = (uint64_t) I.chunk * (uint64_t) (8 * E + 3 * C + 3 * V + 4 * H * D + 3 * cfg_.n_ff) * 4 +
                                  (uint64_t) cfg_.n_ff * E * 2 + (uint64_t) kMaxCols * cfg_.n_vocab * 4 * 2 +
                                  (uint64_t) q35_attn_scratch_floats(kMaxCols, H, D, (int) max_context) * 4;
@@ -560,9 +567,18 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             if (!I.upload_floats(I.find(p + "attn_q_norm.weight"), p + "attn_q_norm.weight", D, &L.q_norm, err) ||
                 !I.upload_floats(I.find(p + "attn_k_norm.weight"), p + "attn_k_norm.weight", D, &L.k_norm, err))
                 return false;
-            const uint64_t kv = (uint64_t) HK * (uint64_t) max_context * (uint64_t) D * 2;   // half
-            if (!I.alloc(&L.kc, kv, err, "K cache") || !I.alloc(&L.vc, kv, err, "V cache")) return false;
-            kv_bytes_ += 2 * kv;
+            L.kv.mode = I.kv_mode;
+            L.kv.max_ctx = (int) max_context;
+            const uint64_t cells = (uint64_t) HK * (uint64_t) max_context;
+            if (I.kv_mode == 0) {
+                if (!I.alloc(&L.kv.k, cells * D * 2, err, "K cache") || !I.alloc(&L.kv.v, cells * D * 2, err, "V cache"))
+                    return false;
+            } else if (!I.alloc(&L.kv.k, cells * D, err, "K cache") || !I.alloc(&L.kv.v, cells * D / 2, err, "V cache") ||
+                       !I.alloc(&L.kv.ks, cells * (D / 32) * 2, err, "K scales") ||
+                       !I.alloc(&L.kv.vs, cells * (D / 32) * 2, err, "V scales")) {
+                return false;
+            }
+            kv_bytes_ += q35_kv_bytes(I.kv_mode, HK, D, (int) max_context);
             return true;
         };
         auto load_common = [&](Layer& L, const std::string& p) {
@@ -653,6 +669,11 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         if (!I.upload_mat(head, head == tok ? "token_embd.weight (tied head)" : "output.weight", E, cfg_.n_vocab,
                           I.head, total, err))
             return false;
+        I.head_draft = I.head;
+        if (const char* e = std::getenv("STRATA_DENSE_DRAFT_VOCAB")) {
+            const int dv = std::atoi(e);
+            if (dv > 0 && dv < cfg_.n_vocab) I.head_draft.n_out = dv / 128 * 128;   // (rows are contiguous blocks)
+        }
         weight_bytes_ = total;
         host_bytes_ = I.host_bytes;
         if (I.host_tensors)
@@ -736,8 +757,9 @@ void attn_mixer(DenseModel::Impl& I, const DenseConfig& c, Layer& L, int64_t p0,
     I.mm(L.v, I.vcur);
     I.stage("attn_qkv", I.stream);
     q35_attn_prep(I.q_full, H * 2 * D, I.kcur, I.vcur, HK * D, L.q_norm, L.k_norm, c.rms_eps, c.rope_base, c.n_rot,
-                  (int) p0, T, H, HK, D, I.qcur, L.kc, L.vc, max_ctx, I.stream);
-    q35_attn(I.qcur, L.kc, L.vc, (int) p0, T, H, HK, D, max_ctx, I.q_full, H * 2 * D, I.attn, I.attn_scratch,
+                  (int) p0, T, H, HK, D, I.qcur, L.kv, I.stream);
+    (void) max_ctx;
+    q35_attn(I.qcur, L.kv, (int) p0, T, H, HK, D, I.q_full, H * 2 * D, I.attn, I.attn_scratch,
              T <= kMaxCols ? 0 : 1, I.stream);
     I.stage("attn_core", I.stream);
     I.prep(I.attn, H * D, T);
@@ -897,7 +919,7 @@ bool DenseModel::mtp_forward(const int32_t* toks, const float* hidden, int64_t p
         q35_rms_rows(x, E, M.head_norm, I.mtp_h, nullptr, T, E, eps, s);
         const int rows = all_logits ? T : 1;
         I.prep(all_logits ? I.mtp_h : I.mtp_h + (size_t) (T - 1) * E, E, rows);
-        I.mm(I.head, I.mtp_logits);
+        I.mm(I.head_draft, I.mtp_logits);
         return true;
     } catch (const std::exception& e) {
         err = std::string("dense model: ") + e.what();
@@ -1120,8 +1142,9 @@ bool DenseModel::dflash_draft(int32_t anchor, int K, std::vector<int32_t>& out, 
         q35_rms_rows(F.h, E, F.out_norm, F.hf, nullptr, W, E, F.eps, s);
         // the mask rows' candidates through the target's head, their gates, the walk
         I.prep(F.hf + E, E, K);
-        I.mm(I.head, F.logits);
-        q35_df_topk(F.logits, cfg_.n_vocab, F.n_cand, K, F.top_k, F.cand_i, F.cand_v, F.topk_scratch, s);
+        I.mm(I.head_draft, F.logits);
+        q35_df_topk(F.logits, I.head_draft.n_out, std::min(F.n_cand, I.head_draft.n_out), K, F.top_k, F.cand_i,
+                    F.cand_v, F.topk_scratch, s);
         I.mm(F.hproj, F.gate);
         q35_df_walk(F.cand_i, F.cand_v, F.gate, F.top_k, F.rank, F.pred, F.succ, anchor, K, F.tok, F.conf, s);
         out.resize((size_t) K);

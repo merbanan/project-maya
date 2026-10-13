@@ -360,7 +360,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # a DENSE qwen35 model (Qwen3.8-27B): the same server protocol as `strata --serve`, no experts
   add_executable(strata-dense src/program/dense_main.cpp)
   target_include_directories(strata-dense PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(strata-dense PRIVATE strata_engine strata_prefill ${_strata_gpu_runtime_target})
+  target_link_libraries(strata-dense PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 
   if(STRATA_ENABLE_HIP)
     enable_testing()

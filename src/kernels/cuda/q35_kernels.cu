@@ -136,12 +136,31 @@ __global__ void __launch_bounds__(128) gdn_seq_kernel(float* __restrict__ state,
 }
 
 // ------------------------------------------------------------------------------------------------ attention prep
-// block (token, head), D threads: the head's rms * weight, then NeoX rope on the first n_rot dims (native_rope.cu)
+// the orthonormal 256-point Walsh-Hadamard transform of s (shared) by 256 threads, in place
+__device__ __forceinline__ void fwht256(float* s, int t) {
+#pragma unroll
+    for (int h = 1; h < 256; h <<= 1) {
+        __syncthreads();
+        const float a = s[t], b = s[t ^ h];
+        __syncthreads();
+        s[t] = (t & h) ? b - a : a + b;
+    }
+    __syncthreads();
+    s[t] *= 0.0625f;   // 1 / sqrt(256)
+    __syncthreads();
+}
+__device__ __forceinline__ float warp_max(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+
+// block (token, head), D threads: the head's rms * weight, then NeoX rope on the first n_rot dims (native_rope.cu);
+// K and V into the cache (FP16, or K8V4: INT8 K, rotated 4-bit V)
 __global__ void attn_prep_kernel(const float* __restrict__ q_full, int ldq, const float* __restrict__ k,
                                  const float* __restrict__ v, int ldk, const float* __restrict__ q_norm,
                                  const float* __restrict__ k_norm, float eps, float theta_scale, int n_rot, int p0,
-                                 int n_head, int D, float* __restrict__ q_out, __half* __restrict__ kc,
-                                 __half* __restrict__ vc, int max_ctx) {
+                                 int n_head, int D, float* __restrict__ q_out, Q35Kv kv) {
     __shared__ float sh[32];
     __shared__ float row[256];
     const int t = blockIdx.x, hh = blockIdx.y, d = threadIdx.x, pos = p0 + t;
@@ -162,12 +181,47 @@ __global__ void attn_prep_kernel(const float* __restrict__ q_full, int ldq, cons
     }
     if (is_q) {
         q_out[(size_t) t * n_head * D + (size_t) hh * D + d] = r;
-    } else {
-        const int kvh = hh - n_head;
-        const size_t cell = ((size_t) kvh * max_ctx + pos) * D + d;
-        kc[cell] = __float2half(r);
-        vc[cell] = __float2half(v[(size_t) t * ldk + (size_t) kvh * D + d]);
+        return;
     }
+    const int kvh = hh - n_head;
+    const size_t cell = (size_t) kvh * kv.max_ctx + pos;
+    float vv = v[(size_t) t * ldk + (size_t) kvh * D + d];
+    if (kv.mode == 0) {
+        ((__half*) kv.k)[cell * D + d] = __float2half(r);
+        ((__half*) kv.v)[cell * D + d] = __float2half(vv);
+        return;
+    }
+    // K8V4: K codes with a scale per 32 (a warp), V rotated then 4-bit codes with a scale per 32
+    {
+        const float amax = warp_max(fabsf(r));
+        const float sc = amax / 127.0f;
+        const int q = sc > 0.0f ? max(-127, min(127, __float2int_rn(r / sc))) : 0;
+        ((int8_t*) kv.k)[cell * D + d] = (int8_t) q;
+        if ((d & 31) == 0) ((__half*) kv.ks)[cell * (D / 32) + d / 32] = __float2half(sc);
+    }
+    __syncthreads();   // (row is reused)
+    row[d] = vv;
+    fwht256(row, d);
+    vv = row[d];
+    {
+        const float amax = warp_max(fabsf(vv));
+        const float sc = amax / 7.0f;
+        const int q = sc > 0.0f ? max(-7, min(7, __float2int_rn(vv / sc))) : 0;
+        const int qn = __shfl_xor_sync(0xffffffffu, q, 1);
+        if ((d & 1) == 0) ((uint8_t*) kv.v)[cell * (D / 2) + d / 2] = (uint8_t) ((q + 8) | ((qn + 8) << 4));
+        if ((d & 31) == 0) ((__half*) kv.vs)[cell * (D / 32) + d / 32] = __float2half(sc);
+    }
+}
+
+// K8V4's output: per (token, head) rotated back by H, then the output gate (block (token, head), 256 threads)
+__global__ void unrotate_gate_kernel(float* __restrict__ out, int n_head, const float* __restrict__ q_full, int ldq) {
+    __shared__ float row[256];
+    const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    float* o = out + (size_t) t * n_head * 256 + (size_t) h * 256;
+    row[d] = o[d];
+    fwht256(row, d);
+    const float g = q_full[(size_t) t * ldq + (size_t) h * 512 + 256 + d];
+    o[d] = row[d] / (1.0f + __expf(-g));
 }
 
 // ------------------------------------------------------------------------------------------------ attention
@@ -178,9 +232,43 @@ constexpr size_t kAttnSmem = (size_t) AR * LDQ * 2 + 2 * (size_t) AK * LDQ * 2 +
 
 __device__ __forceinline__ float sigm(float x) { return 1.0f / (1.0f + __expf(-x)); }
 
-// grid (row tiles, n_kv, splits), AW warps of 16 rows; see the header
-__global__ void __launch_bounds__(AW * 32) attn_tc_kernel(const float* __restrict__ q, const __half* __restrict__ kc,
-                                                          const __half* __restrict__ vc, int p0, int T, int n_head,
+// 8 halves of a K8V4 K row (8 INT8 codes, the group's scale) / V row (8 4-bit codes): the codes become FP16
+// 1024 + c with a byte permute (0x64 high bytes), then (h - offset) * scale in half2 arithmetic
+__device__ __forceinline__ uint4 deq_k8(const int8_t* c, const __half* s, int d) {
+    const uint2 u = *(const uint2*) (c + d);
+    const __half2 sc = __half2half2(s[d / 32]), off = __float2half2_rn(1152.0f);   // 1024 + 128 (the sign flip)
+    const uint32_t a = u.x ^ 0x80808080u, b = u.y ^ 0x80808080u;
+    uint32_t r[4];
+    const uint32_t w[4] = {__byte_perm(a, 0x64u, 0x4140), __byte_perm(a, 0x64u, 0x4342),
+                           __byte_perm(b, 0x64u, 0x4140), __byte_perm(b, 0x64u, 0x4342)};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const __half2 h = __hmul2(__hsub2(*(const __half2*) &w[i], off), sc);
+        r[i] = *(const uint32_t*) &h;
+    }
+    return make_uint4(r[0], r[1], r[2], r[3]);
+}
+__device__ __forceinline__ uint4 deq_v4(const uint8_t* c, const __half* s, int d) {
+    const uint32_t u = *(const uint32_t*) (c + d / 2);
+    const __half2 sc = __half2half2(s[d / 32]), off = __float2half2_rn(1032.0f);    // 1024 + 8 (the code bias)
+    // nibbles in order: byte i holds values 2i (low) and 2i + 1 (high)
+    const uint32_t lo = u & 0x0F0F0F0Fu, hi = (u >> 4) & 0x0F0F0F0Fu;
+    const uint32_t e = __byte_perm(lo, hi, 0x5140), f = __byte_perm(lo, hi, 0x7362);   // lo0 hi0 lo1 hi1 | lo2..
+    uint32_t r[4];
+    const uint32_t w[4] = {__byte_perm(e, 0x64u, 0x4140), __byte_perm(e, 0x64u, 0x4342),
+                           __byte_perm(f, 0x64u, 0x4140), __byte_perm(f, 0x64u, 0x4342)};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const __half2 h = __hmul2(__hsub2(*(const __half2*) &w[i], off), sc);
+        r[i] = *(const uint32_t*) &h;
+    }
+    return make_uint4(r[0], r[1], r[2], r[3]);
+}
+
+// grid (row tiles, n_kv, splits), AW warps of 16 rows; see the header.  gated: the output gate applied here (FP16
+// cache); K8V4 leaves it to unrotate_gate_kernel (the output is still rotated)
+template <int MODE>
+__global__ void __launch_bounds__(AW * 32) attn_tc_kernel(const float* __restrict__ q, Q35Kv kv, int p0, int T, int n_head,
                                                           int G, int max_ctx, int split_len, float scale,
                                                           const float* __restrict__ q_full, int ldq,
                                                           float* __restrict__ out, float* __restrict__ part_o,
@@ -231,9 +319,14 @@ __global__ void __launch_bounds__(AW * 32) attn_tc_kernel(const float* __restric
             const int r = i / (AD / 8), d = (i % (AD / 8)) * 8, key = k0 + r;
             uint4 kv4 = make_uint4(0, 0, 0, 0), vv4 = make_uint4(0, 0, 0, 0);
             if (key < ke) {
-                const size_t cell = ((size_t) kvh * max_ctx + key) * AD + d;
-                kv4 = *(const uint4*) (kc + cell);
-                vv4 = *(const uint4*) (vc + cell);
+                const size_t cell = (size_t) kvh * max_ctx + key;
+                if (MODE == 0) {
+                    kv4 = *(const uint4*) ((const __half*) kv.k + cell * AD + d);
+                    vv4 = *(const uint4*) ((const __half*) kv.v + cell * AD + d);
+                } else {
+                    kv4 = deq_k8((const int8_t*) kv.k + cell * AD, (const __half*) kv.ks + cell * (AD / 32), d);
+                    vv4 = deq_v4((const uint8_t*) kv.v + cell * (AD / 2), (const __half*) kv.vs + cell * (AD / 32), d);
+                }
             }
             *(uint4*) (sK + r * LDQ + d) = kv4;
             *(uint4*) (sV + r * LDQ + d) = vv4;
@@ -321,7 +414,7 @@ __global__ void __launch_bounds__(AW * 32) attn_tc_kernel(const float* __restric
                 float* o = out + (size_t) tok * qld + (size_t) head * AD + d0;
                 const float* gt = q_full + (size_t) tok * ldq + (size_t) head * 2 * AD + AD + d0;
 #pragma unroll
-                for (int j = 0; j < 8; ++j) o[j] = Sw[ri * LDS + hi * 8 + j] * inv_l * sigm(gt[j]);
+                for (int j = 0; j < 8; ++j) o[j] = Sw[ri * LDS + hi * 8 + j] * inv_l * (MODE == 0 ? sigm(gt[j]) : 1.0f);
             } else {
                 float* o = part_o + (((size_t) split * gridDim.y + kvh) * rows + row) * AD + d0;
 #pragma unroll
@@ -339,7 +432,7 @@ __global__ void __launch_bounds__(AW * 32) attn_tc_kernel(const float* __restric
 // block = row, AD threads: fold the splits' partials, then the output gate
 __global__ void attn_merge_kernel(const float* __restrict__ part_o, const float* __restrict__ part_ml, int rows,
                                   int n_split, int G, int n_head, const float* __restrict__ q_full, int ldq,
-                                  float* __restrict__ out, int p0, int split_len) {
+                                  float* __restrict__ out, int p0, int split_len, int gated) {
     const int row = blockIdx.x, d = threadIdx.x;
     const int kvh = blockIdx.y, tok = row / G, head = kvh * G + row % G;
     part_o += (size_t) kvh * rows * AD;
@@ -360,7 +453,7 @@ __global__ void attn_merge_kernel(const float* __restrict__ part_o, const float*
         L += l * f;
     }
     const float gt = q_full[(size_t) tok * ldq + (size_t) head * 2 * AD + AD + d];
-    out[(size_t) tok * n_head * AD + (size_t) head * AD + d] = (L > 0.0f ? a / L : 0.0f) * sigm(gt);
+    out[(size_t) tok * n_head * AD + (size_t) head * AD + d] = (L > 0.0f ? a / L : 0.0f) * (gated ? sigm(gt) : 1.0f);
 }
 
 // ------------------------------------------------------------------------------------------------ small matmuls
@@ -480,14 +573,18 @@ void q35_gdn_out(const float* o, const float* z, const float* w, float* y, int r
     dense_gdn_out_norm_silu(o, z, w, y, rows, 128, eps, stream);
 }
 
+uint64_t q35_kv_bytes(int mode, int n_kv, int D, int max_ctx) {
+    const uint64_t cells = (uint64_t) n_kv * max_ctx;
+    return mode == 0 ? cells * D * 2 * 2 : cells * (D + D / 32 * 2 + D / 2 + D / 32 * 2);
+}
+
 void q35_attn_prep(const float* q_full, int ldq, const float* k, const float* v, int ldk, const float* q_norm,
                    const float* k_norm, float eps, float rope_base, int n_rot, int p0, int T, int n_head, int n_kv,
-                   int D, float* q_out, uint16_t* k_cache, uint16_t* v_cache, int max_ctx, void* stream) {
+                   int D, float* q_out, const Q35Kv& kv, void* stream) {
     if (D != 256 || n_rot > D) throw std::invalid_argument("q35_attn_prep: head size 256");
     const float theta_scale = powf(rope_base, -2.0f / n_rot);
     attn_prep_kernel<<<dim3(T, n_head + n_kv), D, 0, (cudaStream_t) stream>>>(
-        q_full, ldq, k, v, ldk, q_norm, k_norm, eps, theta_scale, n_rot, p0, n_head, D, q_out, (__half*) k_cache,
-        (__half*) v_cache, max_ctx);
+        q_full, ldq, k, v, ldk, q_norm, k_norm, eps, theta_scale, n_rot, p0, n_head, D, q_out, kv);
     check("q35_attn_prep");
 }
 
@@ -500,12 +597,14 @@ int64_t q35_attn_scratch_floats(int T, int n_head, int D, int max_ctx) {
     return splits * (int64_t) T * n_head * (D + 2);
 }
 
-void q35_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int p0, int T, int n_head, int n_kv,
-              int D, int max_ctx, const float* q_full, int ldq, float* out, float* scratch, int splits, void* stream) {
+void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_kv, int D, const float* q_full,
+              int ldq, float* out, float* scratch, int splits, void* stream) {
     if (D != AD || n_head % n_kv != 0 || n_head / n_kv > 8) throw std::invalid_argument("q35_attn: geometry");
-    static const bool attr_ok = cudaFuncSetAttribute(attn_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                     (int) kAttnSmem) == cudaSuccess;
+    static const bool attr_ok =
+        cudaFuncSetAttribute(attn_tc_kernel<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kAttnSmem) == cudaSuccess &&
+        cudaFuncSetAttribute(attn_tc_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kAttnSmem) == cudaSuccess;
     if (!attr_ok) throw std::runtime_error("q35_attn: shared memory attribute");
+    const int max_ctx = kv.max_ctx;
     const int G = n_head / n_kv, rows = T * G, tiles = (rows + AR - 1) / AR;
     const int n_keys = p0 + T;
     // splits: enough blocks to fill the GPU when the rows are few
@@ -520,14 +619,23 @@ void q35_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, 
         throw std::runtime_error("q35_attn: scratch too small");
     float* part_o = scratch;
     float* part_ml = scratch + (size_t) n_split * rows * n_kv * D;
-    attn_tc_kernel<<<dim3(tiles, n_kv, n_split), AW * 32, kAttnSmem, (cudaStream_t) stream>>>(
-        q, (const __half*) k_cache, (const __half*) v_cache, p0, T, n_head, G, max_ctx, split_len,
-        1.0f / sqrtf((float) D), q_full, ldq, out, part_o, part_ml);
+    const dim3 grid(tiles, n_kv, n_split);
+    if (kv.mode == 0)
+        attn_tc_kernel<0><<<grid, AW * 32, kAttnSmem, (cudaStream_t) stream>>>(
+            q, kv, p0, T, n_head, G, max_ctx, split_len, 1.0f / sqrtf((float) D), q_full, ldq, out, part_o, part_ml);
+    else
+        attn_tc_kernel<1><<<grid, AW * 32, kAttnSmem, (cudaStream_t) stream>>>(
+            q, kv, p0, T, n_head, G, max_ctx, split_len, 1.0f / sqrtf((float) D), q_full, ldq, out, part_o, part_ml);
     check("q35_attn");
     if (n_split > 1) {
         attn_merge_kernel<<<dim3(rows, n_kv), D, 0, (cudaStream_t) stream>>>(part_o, part_ml, rows, n_split, G, n_head,
-                                                                             q_full, ldq, out, p0, split_len);
+                                                                             q_full, ldq, out, p0, split_len,
+                                                                             kv.mode == 0);
         check("q35_attn_merge");
+    }
+    if (kv.mode != 0) {
+        unrotate_gate_kernel<<<dim3(T, n_head), 256, 0, (cudaStream_t) stream>>>(out, n_head, q_full, ldq);
+        check("q35_attn_unrotate");
     }
 }
 

@@ -46,13 +46,28 @@ void q35_gdn_seq(float* state, const float* x, int ld, const float* g, const flo
 /// rms(o) * w * silu(z) per 128-wide head (`rows` heads in all, dense)
 void q35_gdn_out(const float* o, const float* z, const float* w, float* y, int rows, float eps, void* stream);
 
+/// A layer's K / V cache.  mode 0: FP16 rows ([n_kv][max_ctx][D] halves in k, v).  mode 1 (K8V4): K INT8 codes
+/// ([n_kv][max_ctx][D] bytes in k) with an FP16 scale per 32 (ks), V rotated by the orthonormal D-point Walsh-Hadamard
+/// transform then 4-bit codes, two a byte ([n_kv][max_ctx][D / 2] in v), an FP16 scale per 32 (vs); the attention's
+/// output is rotated back (H H = I).  416 bytes a head and position instead of 1024.
+struct Q35Kv {
+    void* k = nullptr;
+    void* v = nullptr;
+    uint16_t* ks = nullptr;
+    uint16_t* vs = nullptr;
+    int mode = 0;
+    int max_ctx = 0;
+};
+/// bytes of one layer's cache
+uint64_t q35_kv_bytes(int mode, int n_kv, int D, int max_ctx);
+
 /// The attention layer's per-token preparation for T tokens at positions p0 + t:
 ///   q rows (from q_full: per head [q | gate] of 2 * D, stride ldq): rms * q_norm, NeoX rope on the first n_rot dims
 ///   -> q_out (rows of n_head * D, dense);  k rows (stride ldk): rms * k_norm, rope -> K cache cell p0 + t;  v rows
 ///   (stride ldk) -> V cache cell.  Caches [n_kv][max_ctx][D] FP16.
 void q35_attn_prep(const float* q_full, int ldq, const float* k, const float* v, int ldk, const float* q_norm,
                    const float* k_norm, float eps, float rope_base, int n_rot, int p0, int T, int n_head, int n_kv,
-                   int D, float* q_out, uint16_t* k_cache, uint16_t* v_cache, int max_ctx, void* stream);
+                   int D, float* q_out, const Q35Kv& kv, void* stream);
 
 /// Scratch floats q35_attn needs for T tokens with up to max_ctx cells (the split partials).
 int64_t q35_attn_scratch_floats(int T, int n_head, int D, int max_ctx);
@@ -60,8 +75,8 @@ int64_t q35_attn_scratch_floats(int T, int n_head, int D, int max_ctx);
 /// out rows (n_head * D, dense) = softmax(q k^T / sqrt(D)) V over the causal cells; then out *= sigmoid(gate) where
 /// gate is the second half of every head's 2 * D block of q_full (stride ldq).  D must be 256, n_head / n_kv <= 8.
 /// splits: 0 = choose.
-void q35_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int p0, int T, int n_head, int n_kv,
-              int D, int max_ctx, const float* q_full, int ldq, float* out, float* scratch, int splits, void* stream);
+void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_kv, int D, const float* q_full,
+              int ldq, float* out, float* scratch, int splits, void* stream);
 
 /// y[t][r] = sum_i W[r][i] x[t][i] for T tokens: an F32 matrix (n_out rows of n_in), x rows stride ldx, y dense.
 void q35_gemv_f32_cols(const float* W, const float* x, int ldx, float* y, int n_in, int n_out, int T, void* stream);
