@@ -375,6 +375,8 @@ int main(int argc, char** argv) {
         unsigned long long seed = 0;
         bool ignore_eos = false;
         int req_draft = draft;
+        long long think_budget = 0;               // think_budget=<n> think_end=<id>: the server's reasoning budget
+        int32_t think_end = -1;
         for (;;) {
             while (*endp == ' ') ++endp;
             const char* start = endp;
@@ -395,6 +397,8 @@ int main(int argc, char** argv) {
             else if (key == "penalty_present") sp.penalty_present = fv;
             else if (key == "seed") seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
             else if (key == "ignore_eos") ignore_eos = fv != 0.0f;
+            else if (key == "think_budget") think_budget = std::atoll(tok.c_str() + eq + 1);
+            else if (key == "think_end") think_end = (int32_t) std::atol(tok.c_str() + eq + 1);
             else if (key == "draft") req_draft = std::max(0, std::min(draft, std::atoi(tok.c_str() + eq + 1)));
         }
         std::vector<int32_t> ids;
@@ -461,7 +465,14 @@ int main(int argc, char** argv) {
             const size_t take = std::min<size_t>((size_t) sp.penalty_last_n, fed.size());
             hist.assign(fed.end() - (std::ptrdiff_t) take, fed.end());
         }
+        // the reasoning budget: past it, the next token not yet fed (a round's last pick, the next anchor) becomes the
+        // end of the reasoning - as the GLM engine forces it
+        bool in_think = think_budget > 0 && think_end >= 0;
+        auto budget_force = [&](int32_t& t) {
+            if (in_think && produced >= think_budget && t != think_end) t = think_end;
+        };
         auto emit = [&](int32_t t) -> bool {        // false: the answer ends here
+            if (in_think && t == think_end) in_think = false;
             ++produced;
             std::printf("T %d\n", t);
             if (sp.penalty_last_n > 0) { hist.push_back(t); if ((int) hist.size() > sp.penalty_last_n) hist.erase(hist.begin()); }
@@ -491,7 +502,7 @@ int main(int argc, char** argv) {
         int anchor = -1;
         if (!cancelled && budget > 0) {
             if (!sample_rows(model.logits(), 1, &anchor)) failed = true;
-            else emit(anchor);                         // (a stop token sets finish)
+            else { budget_force(anchor); emit(anchor); }                         // (a stop token sets finish)
         }
         bool going = !failed && !cancelled && budget > 0 && produced < budget && finish != std::string("stop");
         // the MTP rows still to read: tokens mtp_tok at positions mtp_p0 .. with the trunk's hidden rows in d_hrows
@@ -532,6 +543,16 @@ int main(int argc, char** argv) {
             if (!sample_rows(model.logits(), W, picks)) { failed = true; break; }
             int acc = 0;
             while (acc + 1 < W && win[acc + 1] == picks[acc]) ++acc;
+            if (in_think) {   // the budget runs out inside the kept drafts: keep them up to it, then force the end
+                const long long room = std::max(0LL, think_budget - produced);
+                for (int j = 0; j < acc; ++j)
+                    if (win[j + 1] == think_end) { acc = j + 1; break; }
+                if (acc > room) { acc = (int) room; }
+                const long long before = produced;
+                produced += acc;   // (budget_force reads the count after the kept drafts)
+                budget_force(picks[acc]);
+                produced = before;
+            }
             ++rounds; drafted += W - 1; accepted += acc;
             if (K > 0 && use_df) {
                 if (!model.commit(acc + 1, err) || !model.dflash_inject(acc + 1, pos, err)) {
@@ -557,7 +578,8 @@ int main(int argc, char** argv) {
         if (failed) { model.reset(); fed.clear(); std::fflush(stdout); continue; }
         if (cancelled) finish = "cancel";
         const double decode_ms = ms_since(t_dec);
-        std::printf("DONE %lld %lld %.1f %.1f %s 0 0 %lld\n", produced, (long long) n, prompt_ms, decode_ms, finish, (long long) resume);
+        std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld\n", produced, (long long) n, prompt_ms, decode_ms, finish,
+                    accepted, drafted, (long long) resume);
         std::fflush(stdout);
         std::fprintf(stderr, "strata-dense: prompt %lld tokens = %zu reused + %lld read in %.0f ms (%.0f tok/s), %lld generated "
                      "in %.0f ms (%.1f tok/s)%s; %s %lld rounds, %lld of %lld drafts kept (%.2f tokens a round)\n",

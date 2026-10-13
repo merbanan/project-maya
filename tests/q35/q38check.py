@@ -3,7 +3,7 @@
 server on the same token ids.  usage: q38check.py [--prompt-file F] [--repeat N] [--new N] [--bin B] [--ctx C]
 [--env K=V ...] [--no-ref]"""
 import argparse, json, os, subprocess, sys, time, urllib.request
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools"))
 from strata_tokenizer import Tokenizer
 
 GGUF = "/media/per/work/llm/lucebox-hub/server/models/Qwen3.8-27B-Q4_K_M.gguf"
