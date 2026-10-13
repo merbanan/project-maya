@@ -5729,10 +5729,12 @@ bool Glm5Model::fast_gqa(int il, int64_t p, std::string& err) {
     if (kvs_ != nullptr) {   // streamed: the page's summary, the pages to attend to, those cached
         const gf::GqaStream& st = kvs_->lay[(size_t) il];
         gf::gqa_stream_summarize(kv, st, (int) p, (int) p + 1, s);
+        if (F->prof_on) F->mark("gqa_st_summ");
         gf::gqa_stream_select(F->gq, g.n_head, g.n_kv, st, (int) p + 1, kvs_->budget, kvs_->sink, kvs_->recent,
                               kvs_->sel, s);
+        if (F->prof_on) F->mark("gqa_st_select");
         gf::gqa_stream_resolve(st, (int) kvs_->slice, kvs_->sel, s);
-        if (F->prof_on) F->mark("gqa_stream");
+        if (F->prof_on) F->mark("gqa_st_resolve");
     }
     if (!gf::gqa_attn(F->gq, kv, (int) p + 1, g.n_head, F->gscr, F->attn_q, s)) {
         err = "glm fast: gqa attention";
@@ -5792,7 +5794,8 @@ bool Glm5Model::kv_stream_init(int64_t resident, std::string& err) {
     const auto al = [](size_t b) { return (b + 255) / 256 * 256; };
     const size_t summ_b = (size_t) max_pages * g.n_kv * 2 * g.head_dim * 2;
     const size_t lay_dev = al((size_t) R * page_b) + al((size_t) max_pages * 4) + 3 * al((size_t) R * 4) + al(8) + al(summ_b);
-    const size_t sel_b = 4 * al((size_t) max_sel * 4) + al(8) + al((size_t) g.n_head * max_pages * 4);
+    const size_t sel_b = 4 * al((size_t) max_sel * 4) + al(8) + al((size_t) g.n_head * max_pages * 4) +
+                         al((size_t) g.n_head * 4) + al((size_t) max_pages * 4);
     const size_t stage_b = al(lay_host);
     const size_t dev_b = NL * lay_dev + sel_b + stage_b;
     if (cudaMalloc(&K->dev, dev_b) != cudaSuccess) {
@@ -5824,6 +5827,8 @@ bool Glm5Model::kv_stream_init(int64_t resident, std::string& err) {
     K->sel.nsel = (int*) take(4);
     K->sel.nmiss = (int*) take(4);
     K->sel.ub = (float*) take((size_t) g.n_head * max_pages * 4);
+    K->sel.hm = (unsigned int*) take((size_t) g.n_head * 4);
+    K->sel.sc = (float*) take((size_t) max_pages * 4);
     K->sel.max_sel = max_sel;
     K->stage = take(lay_host);
     cudaDeviceSynchronize();
