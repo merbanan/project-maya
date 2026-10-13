@@ -1554,6 +1554,8 @@ class Service:
             glm_calls = "<arg_key>" in self.template.source
             if getattr(self.template, "hy3", False):   # Hy3: <tool_calls> then <tool_call>NAME<tool_sep>
                 prefill = "<tool_calls:opensource>\n<tool_call:opensource>" + (f"{force}<tool_sep:opensource>" if force else "")
+            elif getattr(self.template, "dsv4", False):   # DeepSeek-V4: the DSML block, then the invoke
+                prefill = "\n\n<｜DSML｜tool_calls>\n" + (f'<｜DSML｜invoke name="{force}">\n' if force else "")
             else:
                 prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
             prompt += prefill

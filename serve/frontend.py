@@ -17,6 +17,7 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,10 +51,10 @@ class ChatTemplate:
         # think block), and its own tags (`<think:opensource>`, `<tool_call:opensource>`, ...) - the parser reads
         # them through HY3_TAGS
         self.hy3 = "hy_Assistant" in self.source
-        self.tags = HY3_TAGS if self.hy3 else None
         # DeepSeek-V4: `thinking` (or enable_thinking) opens <think>, else the answer starts after </think>; its BOS
-        # comes from the template's bos_token
+        # comes from the template's bos_token; its tool calls are DSML (DsmlTranslator)
         self.dsv4 = "<｜Assistant｜>" in self.source and "DSML" in self.source
+        self.tags = HY3_TAGS if self.hy3 else "dsml" if self.dsv4 else None
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -312,6 +313,56 @@ HY3_TAGS = {
 }
 
 
+class DsmlTranslator:
+    """DeepSeek-V4's DSML tool calls rewritten to GLM's form while text streams in:
+    <｜DSML｜tool_calls><｜DSML｜invoke name="F"><｜DSML｜parameter name="K" string="..">V</｜DSML｜parameter>
+    </｜DSML｜invoke></｜DSML｜tool_calls>  ->  <tool_call>F<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>
+    (a value written string="false" is JSON; the parser types values by the tool's schema either way)"""
+    D = "｜DSML｜"
+    FIXED = {"<｜DSML｜tool_calls>": "", "</｜DSML｜tool_calls>": "", "</｜DSML｜invoke>": "</tool_call>",
+             "</｜DSML｜parameter>": "</arg_value>"}
+    OPEN = ("<｜DSML｜invoke ", "<｜DSML｜parameter ")
+
+    def __init__(self):
+        self.buf = ""
+
+    def feed(self, delta: str) -> str:
+        self.buf += delta
+        out = []
+        while True:
+            i = self.buf.find("<")
+            if i < 0:
+                out.append(self.buf)
+                self.buf = ""
+                break
+            out.append(self.buf[:i])
+            self.buf = self.buf[i:]
+            hit = next((t for t in self.FIXED if self.buf.startswith(t)), None)
+            if hit is not None:
+                out.append(self.FIXED[hit])
+                self.buf = self.buf[len(hit):]
+                continue
+            op = next((t for t in self.OPEN if self.buf.startswith(t)), None)
+            if op is not None:
+                end = self.buf.find(">")
+                if end < 0:
+                    break                       # the tag's attributes still arriving
+                attrs = dict(re.findall(r'(\w+)="([^"]*)"', self.buf[len(op):end]))
+                name = attrs.get("name", "")
+                out.append("<tool_call>" + name if op.endswith("invoke ") else "<arg_key>" + name + "</arg_key><arg_value>")
+                self.buf = self.buf[end + 1:]
+                continue
+            if any(t.startswith(self.buf) for t in list(self.FIXED) + list(self.OPEN)):
+                break                           # maybe a tag still arriving
+            out.append("<")
+            self.buf = self.buf[1:]
+        return "".join(out)
+
+    def flush(self) -> str:
+        out, self.buf = self.buf, ""
+        return out
+
+
 class TagTranslator:
     """Rewrites a model's own tags to the parser's while text streams in; a tag split across deltas is held back."""
 
@@ -430,7 +481,8 @@ class OutputParser:
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  tags: dict[str, str] | None = None):
-        self.tr = TagTranslator(tags) if tags else None   # a model's own tags (Hy3) -> the ones parsed below
+        # a model's own tags (Hy3; DeepSeek-V4's DSML) -> the ones parsed below
+        self.tr = DsmlTranslator() if tags == "dsml" else TagTranslator(tags) if tags else None
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
