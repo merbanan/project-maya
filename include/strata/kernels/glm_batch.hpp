@@ -14,6 +14,7 @@ int launch_errors();
 
 /// dst[i] = float(src[i]) for BF16 bits.
 void bf16_to_f32(const uint16_t* src, float* dst, int64_t n, cudaStream_t s);
+void f16_to_f32(const uint16_t* src, float* dst, int64_t n, cudaStream_t s);
 /// dst[i] = half(src[i]) (FP16 bits).
 void f32_to_f16(const float* src, void* dst, int64_t n, cudaStream_t s);
 /// dst[i] = half(src[i]) for BF16 bits (FP16 bits out).
@@ -120,7 +121,9 @@ void rms_rows(const float* in, const float* w, float eps, int T, int n_embd, flo
 
 /// The router per token (router_sigmoid's arithmetic: sigmoid, bias selection, stable top-k, normalised weights).
 void route(const float* logits, const float* bias, int n_expert, int k, float w_scale, bool norm_w, int T, int* ids,
-           float* w, cudaStream_t s);
+           float* w, cudaStream_t s, int score_fn = 0,
+           const int32_t* tid2eid = nullptr, const int32_t* toks = nullptr);
+/// (score_fn 1: sqrt(softplus) - DeepSeek-V4; tid2eid + toks: row t's experts are tid2eid[toks[t]] - its hash layers)
 /// Per expert: counts[e] and the stable rank (in (t, j) order) of every routed entry (rank[t*k + j]).
 void expert_count(const int* ids, int n, int n_expert, int* counts, int* rank, cudaStream_t s);
 /// dst[i] = src[i] by the SMs: dst may be pinned host memory, written over the bus without a copy engine (a small

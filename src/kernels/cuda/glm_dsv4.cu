@@ -163,51 +163,32 @@ __device__ void comp_shift4(float* st_kv, float* st_sc, int W) {
     }
 }
 
-// block 0: the raw row; block 1: the attention compressor (ratio > 0); block 2: the indexer compressor (ratio 4).
-// 512 threads.
-__global__ void __launch_bounds__(512) kv_update_kernel(const Dsv4KvArgs a, const Dsv4Layer L, const Dsv4Rope r,
-                                                        int pos) {
-    __shared__ float buf[kDsv4Hd];
-    __shared__ float red[32];
+// one position of a compressor (compressor_decode_one): its window row, and at every ratio-th position the pooled
+// row - norm, rope at pos + 1 - ratio, then FP8 (the attention's, hd 512) or Hadamard + FP4 (the indexer's, hd 128) -
+// at index (pos + 1) / ratio - 1.  512-thread blocks; every thread calls it.
+__device__ void comp_step(float* st_kv, float* st_sc, const float* kv, const float* sc, const float* ape,
+                          const float* norm, float eps, int ratio, int pos, bool idx, uint16_t* rows, const Dsv4Rope& r,
+                          float* buf, float* red) {
     const int d = threadIdx.x;
-    if (blockIdx.x == 0) {
-        float v = a.kv_raw[d];
-        const float ss = bsum(v * v, red);
-        v = v * rsqrtf(ss / (float) kDsv4Hd + a.eps) * a.kv_norm[d];
-        v = rope_tail512(v, buf, (float) pos, r, false);
-        v = fp8_448(v, red);
-        L.swa[(size_t) (pos % a.n_swa) * kDsv4Hd + d] = f2h(v);
-        return;
-    }
-    const int ratio = L.ratio;
-    const bool emit = (pos + 1) % ratio == 0;
-    const int idx = (pos + 1) / ratio - 1;
-    if (blockIdx.x == 1) {
-        const int W = ratio == 4 ? 2 * kDsv4Hd : kDsv4Hd;
-        comp_store(L.st_kv, L.st_sc, a.comp_kv, a.comp_sc, a.comp_ape, W, ratio, pos);
-        __syncthreads();
-        if (!emit) return;
-        float v = pool_dim(L.st_kv, L.st_sc, d, kDsv4Hd, ratio);
-        __syncthreads();
-        if (ratio == 4) comp_shift4(L.st_kv, L.st_sc, W);
-        const float ss = bsum(v * v, red);
-        v = v * rsqrtf(ss / (float) kDsv4Hd + a.eps) * a.comp_norm[d];
+    const int hd = idx ? kDsv4Ihd : kDsv4Hd, W = ratio == 4 ? 2 * hd : hd;
+    comp_store(st_kv, st_sc, kv, sc, ape, W, ratio, pos);
+    __syncthreads();
+    if ((pos + 1) % ratio != 0) return;
+    const int at = (pos + 1) / ratio - 1;
+    const bool on = d < hd;
+    float v = on ? pool_dim(st_kv, st_sc, d, hd, ratio) : 0.0f;
+    __syncthreads();
+    if (ratio == 4) comp_shift4(st_kv, st_sc, W);
+    const float ss = bsum(v * v, red);
+    v = on ? v * rsqrtf(ss / (float) hd + eps) * norm[d] : 0.0f;
+    if (!idx) {
         v = rope_tail512(v, buf, (float) (pos + 1 - ratio), r, false);
         v = fp8_448(v, red);
-        L.comp[(size_t) idx * kDsv4Hd + d] = f2h(v);
+        rows[(size_t) at * kDsv4Hd + d] = f2h(v);
+        __syncthreads();
         return;
     }
-    // block 2: the indexer compressor (head_dim 128, window width 256), then Hadamard and FP4
-    const int W = 2 * kDsv4Ihd;
-    comp_store(L.ist_kv, L.ist_sc, a.icomp_kv, a.icomp_sc, a.icomp_ape, W, 4, pos);
-    __syncthreads();
-    if (!emit) return;
-    const bool on = d < kDsv4Ihd;
-    float v = on ? pool_dim(L.ist_kv, L.ist_sc, d, kDsv4Ihd, 4) : 0.0f;
-    __syncthreads();
-    comp_shift4(L.ist_kv, L.ist_sc, W);
-    const float ss = bsum(v * v, red);
-    if (on) buf[d] = v * rsqrtf(ss / (float) kDsv4Ihd + a.eps) * a.icomp_norm[d];
+    if (on) buf[d] = v;
     __syncthreads();
     // rope: dims 64..127 of the 128
     if (on && d >= kDsv4Ihd - kDsv4Rot && ((d - (kDsv4Ihd - kDsv4Rot)) & 1) == 0) {
@@ -233,8 +214,37 @@ __global__ void __launch_bounds__(512) kv_update_kernel(const Dsv4KvArgs a, cons
         const float am = fmaxf(wmax(fabsf(x)), 7.052966104933725e-38f);
         const float scale = ldexpf(1.0f, (int) ceilf(log2f(am / 6.0f)));
         x = e2m1_rt(fminf(fmaxf(x / scale, -6.0f), 6.0f)) * scale;
-        L.icomp[(size_t) idx * kDsv4Ihd + d] = f2h(x);
+        rows[(size_t) at * kDsv4Ihd + d] = f2h(x);
     }
+    __syncthreads();
+}
+
+// a raw K/V row (norm, rope at pos, FP8) - 512 threads, thread d
+__device__ float raw_row(float v, const float* w, float eps, int pos, const Dsv4Rope& r, float* buf, float* red) {
+    const float ss = bsum(v * v, red);
+    v = v * rsqrtf(ss / (float) kDsv4Hd + eps) * w[threadIdx.x];
+    v = rope_tail512(v, buf, (float) pos, r, false);
+    return fp8_448(v, red);
+}
+
+// block 0: the raw row; block 1: the attention compressor (ratio > 0); block 2: the indexer compressor (ratio 4).
+// 512 threads.
+__global__ void __launch_bounds__(512) kv_update_kernel(const Dsv4KvArgs a, const Dsv4Layer L, const Dsv4Rope r,
+                                                        int pos) {
+    __shared__ float buf[kDsv4Hd];
+    __shared__ float red[32];
+    const int d = threadIdx.x;
+    if (blockIdx.x == 0) {
+        const float v = raw_row(a.kv_raw[d], a.kv_norm, a.eps, pos, r, buf, red);
+        L.swa[(size_t) (pos % a.n_swa) * kDsv4Hd + d] = f2h(v);
+        return;
+    }
+    if (blockIdx.x == 1)
+        comp_step(L.st_kv, L.st_sc, a.comp_kv, a.comp_sc, a.comp_ape, a.comp_norm, a.eps, L.ratio, pos, false, L.comp,
+                  r, buf, red);
+    else
+        comp_step(L.ist_kv, L.ist_sc, a.icomp_kv, a.icomp_sc, a.icomp_ape, a.icomp_norm, a.eps, 4, pos, true, L.icomp,
+                  r, buf, red);
 }
 
 __global__ void __launch_bounds__(1024) qr_norm_kernel(const float* qr, const float* w, float eps, int n, float* out) {
@@ -478,6 +488,308 @@ __global__ void __launch_bounds__(1024) hc_head_kernel(const float* R, const uin
     for (int e = t; e < n_embd; e += 1024) x[e] = x[e] * i2 * norm_w[e];
 }
 
+// ================================================================ the prompt path: a sub-batch of T rows
+// qr = rms_norm(qr_raw) * w per row, as F32 and FP16 (T blocks of 1024)
+__global__ void __launch_bounds__(1024) rows_qr_kernel(const float* qr_raw, const float* w, float eps, int n, float* qr,
+                                                      uint16_t* qr16) {
+    __shared__ float red[32];
+    const size_t o = (size_t) blockIdx.x * n;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += qr_raw[o + i] * qr_raw[o + i];
+    ss = bsum(ss, red);
+    const float inv = rsqrtf(ss / (float) n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = qr_raw[o + i] * inv * w[i];
+        qr[o + i] = v;
+        qr16[o + i] = f2h(v);
+    }
+}
+// the raw K/V rows of the sub-batch (T blocks of 512): norm, rope, FP8 -> raw16
+__global__ void __launch_bounds__(512) rows_kv_kernel(const float* kv_raw, const float* w, float eps, int p0, Dsv4Rope r,
+                                                     uint16_t* raw16) {
+    __shared__ float buf[kDsv4Hd];
+    __shared__ float red[32];
+    const int t = blockIdx.x, d = threadIdx.x;
+    const float v = raw_row(kv_raw[(size_t) t * kDsv4Hd + d], w, eps, p0 + t, r, buf, red);
+    raw16[(size_t) t * kDsv4Hd + d] = f2h(v);
+}
+// a compressor over the sub-batch, position after position (one block of 512): the decode's comp_step on each row
+__global__ void __launch_bounds__(512) rows_comp_kernel(const float* kv, const float* sc, int T, int p0, const float* ape,
+                                                       const float* norm, float eps, float* st_kv, float* st_sc,
+                                                       int ratio, bool idx, uint16_t* rows, Dsv4Rope r) {
+    __shared__ float buf[kDsv4Hd];
+    __shared__ float red[32];
+    const int W = ratio == 4 ? 2 * (idx ? kDsv4Ihd : kDsv4Hd) : (idx ? kDsv4Ihd : kDsv4Hd);
+    for (int t = 0; t < T; ++t)
+        comp_step(st_kv, st_sc, kv + (size_t) t * W, sc + (size_t) t * W, ape, norm, eps, ratio, p0 + t, idx, rows, r,
+                  buf, red);
+}
+// the indexer's q of row t, head h (T x 64 blocks of 128): rope at p0 + t, Hadamard, FP4 - in place
+__global__ void __launch_bounds__(kDsv4Ihd) rows_idx_q_kernel(float* q, int n_head, int p0, Dsv4Rope r) {
+    __shared__ float buf[kDsv4Ihd];
+    const int d = threadIdx.x, t = blockIdx.x / n_head;
+    float* qh = q + (size_t) blockIdx.x * kDsv4Ihd;
+    buf[d] = qh[d];
+    __syncthreads();
+    if (d >= kDsv4Ihd - kDsv4Rot && ((d - (kDsv4Ihd - kDsv4Rot)) & 1) == 0) {
+        float x0 = buf[d], x1 = buf[d + 1];
+        rope_pair(x0, x1, (d - (kDsv4Ihd - kDsv4Rot)) >> 1, (float) (p0 + t), r, false);
+        buf[d] = x0;
+        buf[d + 1] = x1;
+    }
+    __syncthreads();
+    for (int st = 1; st < kDsv4Ihd; st <<= 1) {
+        if (d < kDsv4Ihd / 2) {
+            const int b = (d / st) * 2 * st + d % st;
+            const float x0 = buf[b], x1 = buf[b + st];
+            buf[b] = x0 + x1;
+            buf[b + st] = x0 - x1;
+        }
+        __syncthreads();
+    }
+    float x = buf[d] * 0.08838834764831845f;
+    const float am = fmaxf(wmax(fabsf(x)), 7.052966104933725e-38f);
+    const float scale = ldexpf(1.0f, (int) ceilf(log2f(am / 6.0f)));
+    qh[d] = e2m1_rt(fminf(fmaxf(x / scale, -6.0f), 6.0f)) * scale;
+}
+// the indexer's scores of row t over its visible pooled rows ((p0 + t + 1) / 4 of them): grid (T, row blocks of
+// kIdxRowsB), 256 threads; 64 heads
+constexpr int kIdxRowsB = 256;
+__global__ void __launch_bounds__(256) rows_idx_score_kernel(const float* q, const float* w, const uint16_t* k, int p0,
+                                                            float wscale, float* score, int ld) {
+    __shared__ float sq[64][kDsv4Ihd + 1];
+    __shared__ float sk[kIdxRows][kDsv4Ihd];
+    __shared__ float sp[kIdxRows][64 + 1];
+    const int t = blockIdx.x, tid = threadIdx.x;
+    const int n_vis = (p0 + t + 1) / 4, c_lo = blockIdx.y * kIdxRowsB;
+    if (c_lo >= n_vis) return;
+    const int c_hi = min(n_vis, c_lo + kIdxRowsB);
+    const float* qt = q + (size_t) t * 64 * kDsv4Ihd;
+    for (int i = tid; i < 64 * kDsv4Ihd; i += 256) sq[i / kDsv4Ihd][i % kDsv4Ihd] = qt[i];
+    const int h = tid & 63;
+    const float wh = w[(size_t) t * 64 + h] * wscale;
+    __syncthreads();
+    for (int c0 = c_lo; c0 < c_hi; c0 += kIdxRows) {
+        for (int i = tid; i < kIdxRows * kDsv4Ihd; i += 256) {
+            const int r = i / kDsv4Ihd;
+            sk[r][i % kDsv4Ihd] = c0 + r < c_hi ? h2f(k[(size_t) (c0 + r) * kDsv4Ihd + i % kDsv4Ihd]) : 0.0f;
+        }
+        __syncthreads();
+        for (int r = tid >> 6; r < kIdxRows; r += 4) {
+            float sv = 0.0f;
+#pragma unroll 8
+            for (int i = 0; i < kDsv4Ihd; ++i) sv += sq[h][i] * sk[r][i];
+            sp[r][h] = fmaxf(sv, 0.0f) * wh;
+        }
+        __syncthreads();
+        const int lane = tid & 31, wp = tid >> 5;
+        for (int r = wp; r < kIdxRows; r += 8) {
+            const float v = wsum(sp[r][lane] + sp[r][lane + 32]);
+            if (lane == 0 && c0 + r < c_hi) score[(size_t) t * ld + c0 + r] = v;
+        }
+        __syncthreads();
+    }
+}
+// the top k of row t's visible scores (T blocks of 1024): all of them when there are k or fewer
+__global__ void __launch_bounds__(1024) rows_topk_kernel(const float* score, int ld, int p0, int k, int* sel) {
+    const int t = blockIdx.x, n = (p0 + t + 1) / 4;
+    int* out = sel + (size_t) t * k;
+    if (n <= k) {
+        for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = i;
+        return;
+    }
+    __shared__ unsigned int hist[2048];
+    __shared__ uint32_t s_prefix, s_mask;
+    __shared__ int s_need, s_out;
+    const float* sc = score + (size_t) t * ld;
+    const int tid = threadIdx.x;
+    if (tid == 0) {
+        s_prefix = 0u;
+        s_mask = 0u;
+        s_need = k;
+    }
+    __syncthreads();
+    const int shifts[3] = {21, 10, 0}, bits[3] = {11, 11, 10};
+    for (int pass = 0; pass < 3; ++pass) {
+        const int sh = shifts[pass], nb = 1 << bits[pass];
+        for (int i = tid; i < nb; i += 1024) hist[i] = 0u;
+        __syncthreads();
+        const uint32_t pre = s_prefix, msk = s_mask;
+        for (int i = tid; i < n; i += 1024) {
+            const uint32_t key = okey(sc[i]);
+            if ((key & msk) == pre) atomicAdd(&hist[(key >> sh) & (uint32_t) (nb - 1)], 1u);
+        }
+        __syncthreads();
+        if (tid == 0) {
+            int need = s_need, b = nb - 1;
+            for (; b > 0; --b) {
+                if ((int) hist[b] >= need) break;
+                need -= (int) hist[b];
+            }
+            s_need = need;
+            s_prefix = pre | ((uint32_t) b << sh);
+            s_mask = msk | ((uint32_t) (nb - 1) << sh);
+        }
+        __syncthreads();
+    }
+    const uint32_t thr = s_prefix;
+    if (tid == 0) s_out = 0;
+    __syncthreads();
+    for (int i = tid; i < n; i += 1024)
+        if (okey(sc[i]) > thr) out[atomicAdd(&s_out, 1)] = i;
+    __syncthreads();
+    if (tid == 0) {
+        int o = s_out, need = s_need;
+        for (int i = 0; i < n && need > 0; ++i)
+            if (okey(sc[i]) == thr) {
+                out[o++] = i;
+                --need;
+            }
+    }
+}
+// the attention of row t's 64 heads (one block of 512 a row): q (raw, per-head norm + rope here) over the raw window
+// (the ring below p0, raw16 from p0 on) and the visible pooled rows (sel: row t's k picks when more than k are visible,
+// else all of them; HCA: all), online softmax with the sinks, the output's rope undone -> out16 (n_head x 512)
+constexpr int kAttRows = 16, kQS = kDsv4Hd + 8;
+__global__ void __launch_bounds__(512) rows_attn_kernel(const float* q, const float* sinks, const uint16_t* ring,
+                                                       const uint16_t* raw16, const uint16_t* comp, int n_swa, int p0,
+                                                       int ratio, const int* sel, int k, Dsv4Rope r, float eps,
+                                                       uint16_t* out16) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    __half* sq = (__half*) smem;                                   // 64 x kQS
+    __half* srow = sq + 64 * kQS;                                  // kAttRows x kQS
+    float* sp = (float*) (srow + kAttRows * kQS);                  // 64 x kAttRows
+    float* sm = sp + 64 * kAttRows;                                // 64 running max
+    float* sl = sm + 64;                                           // 64 running sum
+    float* scr = sl + 64;                                          // 64 corrections
+    const int t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, wp = tid >> 5;
+    const int pos = p0 + t;
+    // q: per head (warp wp: heads wp, wp + 16, wp + 32, wp + 48) RMS norm, the tail's rope, FP16
+    for (int h = wp; h < 64; h += 16) {
+        const float* qh = q + ((size_t) t * 64 + h) * kDsv4Hd;
+        float v[16];
+        float ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            v[j] = qh[lane + 32 * j];
+            ss += v[j] * v[j];
+        }
+        ss = wsum(ss);
+        const float inv = rsqrtf(ss / (float) kDsv4Hd + eps);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) v[j] *= inv;
+#pragma unroll
+        for (int j = 14; j < 16; ++j) {   // dims 448..511: pair (2 i, 2 i + 1) on lanes 2 i', 2 i' + 1
+            const float o = __shfl_xor_sync(0xffffffffu, v[j], 1);
+            float x0 = (lane & 1) ? o : v[j], x1 = (lane & 1) ? v[j] : o;
+            rope_pair(x0, x1, (lane + 32 * (j - 14)) >> 1, (float) pos, r, false);
+            v[j] = (lane & 1) ? x1 : x0;
+        }
+#pragma unroll
+        for (int j = 0; j < 16; ++j) sq[h * kQS + lane + 32 * j] = __float2half_rn(v[j]);
+    }
+    if (tid < 64) {
+        sm[tid] = sinks[tid];   // the sink starts the softmax: exp(sink - max) in the denominator
+        sl[tid] = 1.0f;
+    }
+    const int n_raw = min(pos + 1, n_swa);
+    const int n_vis = ratio > 0 ? (pos + 1) / ratio : 0;
+    const int n_cmp = sel != nullptr ? min(n_vis, k) : n_vis;
+    const int n_all = n_raw + n_cmp;
+    const int hh = tid >> 3, dl = tid & 7;   // the output: head hh, dims dl + 8 j
+    float acc[64];
+#pragma unroll
+    for (int j = 0; j < 64; ++j) acc[j] = 0.0f;
+    const float scale = rsqrtf((float) kDsv4Hd);
+    for (int i0 = 0; i0 < n_all; i0 += kAttRows) {
+        __syncthreads();
+        // the tile's rows into shared memory (64 uint4 a row)
+        for (int i = tid; i < kAttRows * 64; i += 512) {
+            const int rr = i >> 6, c = i & 63, ii = i0 + rr;
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (ii < n_all) {
+                const uint16_t* src;
+                if (ii < n_raw) {
+                    const int pp = pos - n_raw + 1 + ii;
+                    src = pp >= p0 ? raw16 + (size_t) (pp - p0) * kDsv4Hd : ring + (size_t) (pp % n_swa) * kDsv4Hd;
+                } else {
+                    const int cc = ii - n_raw;
+                    src = comp + (size_t) (sel != nullptr && n_vis > k ? sel[(size_t) t * k + cc] : cc) * kDsv4Hd;
+                }
+                v = ((const uint4*) src)[c];
+            }
+            *(uint4*) (srow + rr * kQS + c * 8) = v;
+        }
+        __syncthreads();
+        // the scores: thread (head hh, rows dl and dl + 8)
+#pragma unroll
+        for (int rq = 0; rq < 2; ++rq) {
+            const int rr = dl + 8 * rq;
+            const __half2* a2 = (const __half2*) (sq + hh * kQS);
+            const __half2* b2 = (const __half2*) (srow + rr * kQS);
+            float sv = 0.0f;
+#pragma unroll 8
+            for (int i = 0; i < kDsv4Hd / 2; ++i) {
+                const float2 a = __half22float2(a2[i]), b = __half22float2(b2[i]);
+                sv += a.x * b.x + a.y * b.y;
+            }
+            sp[hh * kAttRows + rr] = i0 + rr < n_all ? sv * scale : -INFINITY;
+        }
+        __syncthreads();
+        // the online softmax per head (warp wp: heads 4 wp .. 4 wp + 3; lanes < kAttRows the rows)
+        for (int h = 4 * wp; h < 4 * wp + 4; ++h) {
+            const float v = lane < kAttRows ? sp[h * kAttRows + lane] : -INFINITY;
+            const float mt = wmax(v);
+            const float mo = sm[h], mn = fmaxf(mo, mt);
+            const float p = lane < kAttRows && v > -INFINITY ? expf(v - mn) : 0.0f;
+            const float ps = wsum(p);
+            if (lane < kAttRows) sp[h * kAttRows + lane] = p;
+            __syncwarp();
+            if (lane == 0) {
+                const float c = expf(mo - mn);
+                scr[h] = c;
+                sl[h] = sl[h] * c + ps;
+                sm[h] = mn;
+            }
+        }
+        __syncthreads();
+        const float c = scr[hh];
+#pragma unroll
+        for (int j = 0; j < 64; ++j) acc[j] *= c;
+        for (int rr = 0; rr < kAttRows; ++rr) {
+            const float p = sp[hh * kAttRows + rr];
+            if (p == 0.0f) continue;
+            const __half* rv = srow + rr * kQS + dl;
+#pragma unroll
+            for (int j = 0; j < 64; ++j) acc[j] += p * __half2float(rv[8 * j]);
+        }
+    }
+    __syncthreads();
+    const float il = 1.0f / sl[hh];
+#pragma unroll
+    for (int j = 0; j < 64; ++j) acc[j] *= il;
+    // the output's rope undone: dims 448..511 = j 56..63; pair (2 i, 2 i + 1): dl even / odd of the same head
+#pragma unroll
+    for (int j = 56; j < 64; ++j) {
+        const float o = __shfl_xor_sync(0xffffffffu, acc[j], 1);
+        float x0 = (dl & 1) ? o : acc[j], x1 = (dl & 1) ? acc[j] : o;
+        const int d = dl + 8 * j;
+        rope_pair(x0, x1, (d - (kDsv4Hd - kDsv4Rot)) >> 1, (float) pos, r, true);
+        acc[j] = (dl & 1) ? x1 : x0;
+    }
+    uint16_t* o = out16 + ((size_t) t * 64 + hh) * kDsv4Hd;
+#pragma unroll
+    for (int j = 0; j < 64; ++j) o[dl + 8 * j] = f2h(acc[j]);
+}
+// the sub-batch's last n_swa raw rows into the ring
+__global__ void rows_ring_kernel(const uint16_t* raw16, uint16_t* ring, int n_swa, int p0, int T) {
+    const int first = max(0, T - n_swa), t = first + blockIdx.x;
+    if (t >= T) return;
+    const int pos = p0 + t;
+    for (int c = threadIdx.x; c < kDsv4Hd / 8; c += blockDim.x)
+        ((uint4*) (ring + (size_t) (pos % n_swa) * kDsv4Hd))[c] = ((const uint4*) (raw16 + (size_t) t * kDsv4Hd))[c];
+}
+
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) std::fprintf(stderr, "glm_dsv4 %s: %s\n", what, cudaGetErrorString(e));
@@ -531,6 +843,66 @@ void dsv4_hc_head(const float* R, const uint16_t* fn, const float* scale, const 
     hc_head_kernel<<<1, 1024, 0, s>>>(R, fn, scale, base, hc_eps, norm_w, eps, n_embd, x);
     quantize_q8_1(x, xq, n_embd, s);
     check("hc_head");
+}
+
+// ---- the prompt path
+void dsv4_rows_qr(const float* qr_raw, const float* w, float eps, int T, int n, float* qr, uint16_t* qr16,
+                  cudaStream_t s) {
+    if (T <= 0) return;
+    rows_qr_kernel<<<T, 1024, 0, s>>>(qr_raw, w, eps, n, qr, qr16);
+    check("rows_qr");
+}
+void dsv4_rows_kv(const float* kv_raw, const float* w, float eps, int T, int p0, const Dsv4Rope& rope, uint16_t* raw16,
+                  cudaStream_t s) {
+    if (T <= 0) return;
+    rows_kv_kernel<<<T, 512, 0, s>>>(kv_raw, w, eps, p0, rope, raw16);
+    check("rows_kv");
+}
+void dsv4_rows_comp(const float* kv, const float* sc, int T, int p0, const float* ape, const float* norm, float eps,
+                    const Dsv4Layer& L, const Dsv4Rope& rope, bool indexer, cudaStream_t s) {
+    if (T <= 0 || L.ratio == 0) return;
+    if (indexer)
+        rows_comp_kernel<<<1, 512, 0, s>>>(kv, sc, T, p0, ape, norm, eps, L.ist_kv, L.ist_sc, 4, true, L.icomp, rope);
+    else
+        rows_comp_kernel<<<1, 512, 0, s>>>(kv, sc, T, p0, ape, norm, eps, L.st_kv, L.st_sc, L.ratio, false, L.comp, rope);
+    check("rows_comp");
+}
+void dsv4_rows_indexer(float* q, const float* w, int n_head, const Dsv4Layer& L, int T, int p0, int top_k,
+                       const Dsv4Rope& rope, float* score, int ld, int* sel, cudaStream_t s) {
+    if (T <= 0) return;
+    if (n_head != 64) {
+        std::fprintf(stderr, "glm_dsv4 indexer: %d heads (64 only)\n", n_head);
+        return;
+    }
+    const int max_vis = (p0 + T) / 4;
+    rows_idx_q_kernel<<<T * n_head, kDsv4Ihd, 0, s>>>(q, n_head, p0, rope);
+    if (max_vis > top_k)
+        rows_idx_score_kernel<<<dim3(T, (max_vis + kIdxRowsB - 1) / kIdxRowsB), 256, 0, s>>>(
+            q, w, L.icomp, p0, 1.0f / std::sqrt((float) (kDsv4Ihd * n_head)), score, ld);
+    rows_topk_kernel<<<T, 1024, 0, s>>>(score, ld, p0, top_k, sel);
+    check("rows_indexer");
+}
+void dsv4_rows_attn(const float* q, const float* sinks, const Dsv4Layer& L, const uint16_t* raw16, int n_swa, int p0,
+                    int T, const int* sel, int k, const Dsv4Rope& rope, float eps, int n_head, uint16_t* out16,
+                    cudaStream_t s) {
+    if (T <= 0) return;
+    if (n_head != 64) {
+        std::fprintf(stderr, "glm_dsv4 attention: %d heads (64 only)\n", n_head);
+        return;
+    }
+    const size_t smem = (size_t) (64 + kAttRows) * kQS * 2 + (size_t) (64 * kAttRows + 3 * 64) * 4;
+    static bool opted = false;
+    if (!opted) {
+        cudaFuncSetAttribute(rows_attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        opted = true;
+    }
+    rows_attn_kernel<<<T, 512, smem, s>>>(q, sinks, L.swa, raw16, L.comp, n_swa, p0, L.ratio, sel, k, rope, eps, out16);
+    check("rows_attn");
+}
+void dsv4_rows_ring(const uint16_t* raw16, const Dsv4Layer& L, int n_swa, int p0, int T, cudaStream_t s) {
+    if (T <= 0) return;
+    rows_ring_kernel<<<std::min(T, n_swa), 64, 0, s>>>(raw16, L.swa, n_swa, p0, T);
+    check("rows_ring");
 }
 
 }  // namespace strata::kernels::glmf

@@ -948,7 +948,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         if (split_load_ != nullptr) split_load_->wait(part_);
         // the batched prompt path: its sizes (it borrows the pool's tail, see below).  (deepseek4: none yet - its
         // prompts run through the token path)
-        if (!g.dsv4() && !prefill_setup(err)) return false;
+        if (!prefill_setup(err)) return false;
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         {
@@ -4014,6 +4014,24 @@ void Glm5Model::kv_trim(int64_t keep) {
     (void) back;
 }
 
+gf::Dsv4Layer Glm5Model::d4_layer(int il) const {
+    gf::Dsv4Layer L;
+    const int r = g_.ratio(il);
+    L.ratio = r;
+    L.swa = (uint16_t*) (state_ + d4_swa_[(size_t) il]);
+    if (r > 0) {
+        L.comp = (uint16_t*) (state_ + d4_comp_[(size_t) il]);
+        L.st_kv = state_ + d4_st_[(size_t) il];
+        L.st_sc = L.st_kv + d4_st_floats(il) / 2;
+    }
+    if (r == 4) {
+        L.icomp = (uint16_t*) (state_ + d4_icomp_[(size_t) il]);
+        L.ist_kv = state_ + d4_ist_[(size_t) il];
+        L.ist_sc = L.ist_kv + 8 * 2 * g_.idx_key;
+    }
+    return L;
+}
+
 // ---- deepseek4: one attention mixer (glm_dsv4.hpp): the projections of x (f32) / xq (q8_1), the q LoRA's middle,
 // the cache update, the indexer's pick (ratio 4, more pooled rows than its top k), the attention, the grouped output
 bool Glm5Model::fast_dsv4(int il, int64_t p, std::string& err) {
@@ -4045,19 +4063,7 @@ bool Glm5Model::fast_dsv4(int il, int64_t p, std::string& err) {
                    g.idx_heads * g.idx_key};
     if (!gf::mv(j, nj, s)) { err = "glm fast: deepseek4 q"; return false; }
     if (F->prof_on) F->mark("d4_q_mv");
-    gf::Dsv4Layer L;
-    L.ratio = r;
-    L.swa = (uint16_t*) (state_ + d4_swa_[(size_t) il]);
-    if (r > 0) {
-        L.comp = (uint16_t*) (state_ + d4_comp_[(size_t) il]);
-        L.st_kv = state_ + d4_st_[(size_t) il];
-        L.st_sc = L.st_kv + d4_st_floats(il) / 2;
-    }
-    if (r == 4) {
-        L.icomp = (uint16_t*) (state_ + d4_icomp_[(size_t) il]);
-        L.ist_kv = state_ + d4_ist_[(size_t) il];
-        L.ist_sc = L.ist_kv + 8 * 2 * g.idx_key;
-    }
+    const gf::Dsv4Layer L = d4_layer(il);
     const gf::Dsv4Rope& rope = F->d4_rope[(size_t) il];
     const gf::Dsv4KvArgs a{F->d4_kv, Ly.kv_a_norm, F->d4_ckv, F->d4_csc, Ly.c_ape, Ly.c_norm,
                            F->d4_ickv, F->d4_icsc, Ly.ic_ape, Ly.ic_norm, g.norm_eps, g.n_swa};

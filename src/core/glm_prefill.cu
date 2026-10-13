@@ -208,6 +208,39 @@ GqaBufs carve_gqa(Carve& c, size_t T, const Glm5Geometry& g) {
     return b;
 }
 
+// deepseek4's attention for a sub-batch (glm_dsv4.hpp): the projections, the raw rows, the indexer's scores and
+// picks, the heads' output, the grouped output's low rank
+struct D4Bufs {
+    float *qr_raw, *qr, *kv_raw, *q, *ckv, *csc, *ickv, *icsc, *iw, *iq, *score, *low;
+    uint16_t *qr16, *raw16, *out16, *low16;
+    int* sel;
+    int ld;
+};
+D4Bufs carve_dsv4(Carve& c, size_t T, const Glm5Geometry& g, int max_vis) {
+    D4Bufs b{};
+    const size_t QL = (size_t) g.q_lora, HD = (size_t) g.head_dim, QH = (size_t) g.n_head * HD,
+                 IQ = (size_t) g.idx_heads * g.idx_key, LO = (size_t) g.o_groups * g.o_lora;
+    b.ld = (std::max(1, max_vis) + 3) / 4 * 4;
+    b.qr_raw = c.take<float>(T * QL);
+    b.qr = c.take<float>(T * QL);
+    b.qr16 = c.take<uint16_t>(T * QL);
+    b.kv_raw = c.take<float>(T * HD);
+    b.raw16 = c.take<uint16_t>(T * HD);
+    b.q = c.take<float>(T * QH);
+    b.ckv = c.take<float>(T * 2 * HD);
+    b.csc = c.take<float>(T * 2 * HD);
+    b.ickv = c.take<float>(T * 2 * (size_t) g.idx_key);
+    b.icsc = c.take<float>(T * 2 * (size_t) g.idx_key);
+    b.iw = c.take<float>(T * (size_t) g.idx_heads);
+    b.iq = c.take<float>(T * IQ);
+    b.score = c.take<float>(T * (size_t) b.ld);
+    b.sel = c.take<int>(T * (size_t) g.idx_top_k);
+    b.out16 = c.take<uint16_t>(T * QH);
+    b.low = c.take<float>(T * LO);
+    b.low16 = c.take<uint16_t>(T * LO);
+    return b;
+}
+
 struct DenseBufs {
     float *dg, *du;
     uint16_t* dh16;
@@ -288,6 +321,7 @@ int mixer_sub(size_t T, const Glm5Geometry& g, bool kda, bool dsa, bool dense, b
         if (dsa) { Carve d; carve_dsa(d, (size_t) t2, g, max_pools); need = std::max(need, d.off); }
         if (dense) { Carve d; carve_dense(d, (size_t) t2, g); need = std::max(need, d.off); }
         if (g.gqa()) { Carve q; carve_gqa(q, (size_t) t2, g); need = std::max(need, q.off); }
+        if (g.dsv4()) { Carve q; carve_dsv4(q, (size_t) t2, g, max_pools); need = std::max(need, q.off); }
         if (need > room) break;
         ts = t2;
     }
@@ -325,6 +359,7 @@ struct Glm5Model::PrefillState {
     size_t borrow_bytes = 0, ws_bytes = 0, gbuf_bytes = 0;
     bool lent = false;
     bool has_kda = false, has_dsa = false, has_dense = false, has_moe = false;
+    int32_t* tok_d = nullptr;        // deepseek4: the chunk's token ids (its hash-routed layers), T of them
     uint8_t* region = nullptr;       // the pool's lendable tail
     size_t region_bytes = 0;
     int T_bound = 0;                 // the chunk the pointers are carved for (<= T)
@@ -534,7 +569,13 @@ bool Glm5Model::prefill_setup(std::string& err) {
     };
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
-        if (Ly.gqa) {
+        if (Ly.dsv4) {
+            deq_ok(Ly.q_a, "attn_q_a", il);
+            deq_ok(Ly.q_b, "attn_q_b", il);
+            deq_ok(Ly.kv_a, "attn_kv", il);
+            deq_ok(Ly.o_a, "attn_output_a", il);
+            deq_ok(Ly.o_b, "attn_output_b", il);
+        } else if (Ly.gqa) {
             deq_ok(Ly.q, "attn_q", il);
             deq_ok(Ly.k, "attn_k", il);
             deq_ok(Ly.v, "attn_v", il);
@@ -549,7 +590,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
             deq_ok(Ly.q_b, "attn_q_b", il);
             deq_ok(Ly.kv_a, "attn_kv_a", il);
         }
-        deq_ok(Ly.out, "attn_output", il);
+        if (!Ly.dsv4) deq_ok(Ly.out, "attn_output", il);
         if (Ly.moe) {
             has_moe = true;
             deq_ok(Ly.sh_gate, "ffn_gate_shexp", il);
@@ -585,6 +626,14 @@ bool Glm5Model::prefill_setup(std::string& err) {
     if (const char* v = getenv("STRATA_GLM_PREFILL_SUB"))
         S->sub_env = std::clamp(std::atoi(v), 16, 8192);
     S->prof = getenv("STRATA_GLM_PREFILL_PROF") != nullptr;
+    if (g.dsv4() && cudaMalloc(&S->tok_d, (size_t) std::min<int64_t>(max_ctx_, 65536) * sizeof(int32_t)) != cudaSuccess) {
+        cudaGetLastError();
+        S->tok_d = nullptr;
+        std::fprintf(stderr, "glm prefill: CUDA%d the token ids did not allocate - token by token\n", dev_);
+        pf_ = nullptr;
+        delete S;
+        return true;
+    }
     S->gstride = gstride;
 
     // ---- sizes: the chunk T from the budget (per device)
@@ -866,6 +915,7 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     if (has_dsa) { Carve d; carve_dsa(d, ts, g, max_pools); uni = std::max(uni, d.off); }
     if (has_dense) { Carve d; carve_dense(d, ts, g); uni = std::max(uni, d.off); }
     if (g.gqa()) { Carve q; carve_gqa(q, ts, g); uni = std::max(uni, q.off); }
+    if (g.dsv4()) { Carve q; carve_dsv4(q, ts, g, max_pools); uni = std::max(uni, q.off); }
     if (has_moe) { Carve m; carve_moe(m, T, (size_t) (sub_env > 0 ? sub_env : kSub), g); uni = std::max(uni, m.off); }
     // the NextN block's cache fill (the last half) carves 4 n_embd + 1.5 n_embd rows of its own
     if (mtp) uni = std::max(uni, T * (size_t) (6 * g.n_embd + (g.gqa() ? 2 * g.n_kv * g.head_dim : g.kv_lora) +
@@ -1203,6 +1253,7 @@ void Glm5Model::prefill_destroy() {
     cudaSetDevice(dev_);
     if (fast_ && fast_->cs) cudaStreamSynchronize(fast_->cs);
     if (fast_ && fast_->copy) cudaStreamSynchronize(fast_->copy);
+    if (S->tok_d != nullptr) cudaFree(S->tok_d);
     if (S->prof && !S->pacc.empty()) {
         double tot = 0;
         for (auto& kv : S->pacc) tot += kv.second;
@@ -1274,6 +1325,18 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     "sgemm");
         }
     };
+    // ... the same with an FP16 W (deepseek4's compressors, indexer, router, mHC mixes): F32 products as the token path
+    const auto sgemm_f16 = [&](const uint16_t* W, int N, int Kd, const float* X, int ldx, float* Y, int ldy, int Tn,
+                               float alpha) {
+        const int rows = (int) std::max<int64_t>(1, std::min<int64_t>(N, S->w32_elems / Kd));
+        for (int r0 = 0; r0 < N; r0 += rows) {
+            const int n = std::min(rows, N - r0);
+            gb::f16_to_f32(W + (size_t) r0 * Kd, S->w32, (int64_t) n * Kd, s);
+            blas_ck(cublasSgemm(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, Tn, Kd, &alpha, S->w32, Kd, X, ldx, &zero, Y + r0,
+                                ldy),
+                    "sgemm f16");
+        }
+    };
     // Y[t][N] = X16[t][K] . deq(W)[N][K]^T (tensor cores, F32 accumulate); beta = 1 adds to Y.  A BF16 weight (a
     // projection the GGUF keeps unquantized) is narrowed to FP16 the same way
     const auto hgemm_q = [&](const WSlot& w, int N, int Kd, const uint16_t* X16, int ldx, float* Y, int ldy, int Tn,
@@ -1315,7 +1378,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     const auto hc_read = [&](const float* block_out, const uint16_t* fn, const float* scale, const float* base,
                              const float* norm) {
         gb::hc_update(block_out, S->R, S->post, S->comb, S->ss, T, E, s);
-        sgemm_bf16(fn, 24, 4 * E, S->R, 4 * E, S->mix, 24, T, 1.0f);
+        if (g.dsv4()) sgemm_f16(fn, 24, 4 * E, S->R, 4 * E, S->mix, 24, T, 1.0f);
+        else sgemm_bf16(fn, 24, 4 * E, S->R, 4 * E, S->mix, 24, T, 1.0f);
         gb::HcFinishArgs h;
         h.mix = S->mix;
         h.ss = S->ss;
@@ -1590,7 +1654,57 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             const float* xs = S->x + (size_t) t0 * E;
             const uint16_t* x16 = S->x16 + (size_t) t0 * E;
             float* mixer = S->mixer + (size_t) t0 * E;
-            if (Ly.gqa) {
+            if (Ly.dsv4) {
+                // deepseek4 (glm_dsv4.hpp): the projections, the raw rows, the compressors in order, the indexer's
+                // picks, the attention over the window and the pooled rows, the ring, the grouped output
+                Carve c{S->uni};
+                D4Bufs B = carve_dsv4(c, (size_t) tn, g, S->max_pools);
+                const int pt = (int) (p0 + t0), r = g.ratio(il), HD = g.head_dim, W = r == 4 ? 2 * HD : HD,
+                          IW = 2 * g.idx_key, QH = g.n_head * HD;
+                const gf::Dsv4Rope& rope = F->d4_rope[(size_t) il];
+                const gf::Dsv4Layer L = d4_layer(il);
+                hgemm_q(Ly.q_a, g.q_lora, E, x16, E, B.qr_raw, g.q_lora, tn, 0.0f);
+                hgemm_q(Ly.kv_a, HD, E, x16, E, B.kv_raw, HD, tn, 0.0f);
+                if (r > 0) {
+                    sgemm_f16(Ly.c_kv, W, E, xs, E, B.ckv, W, tn, 1.0f);
+                    sgemm_f16(Ly.c_gate, W, E, xs, E, B.csc, W, tn, 1.0f);
+                }
+                if (r == 4) {
+                    sgemm_f16(Ly.ic_kv, IW, E, xs, E, B.ickv, IW, tn, 1.0f);
+                    sgemm_f16(Ly.ic_gate, IW, E, xs, E, B.icsc, IW, tn, 1.0f);
+                    sgemm_f16(Ly.idx_proj, g.idx_heads, E, xs, E, B.iw, g.idx_heads, tn, 1.0f);
+                }
+                gf::dsv4_rows_qr(B.qr_raw, Ly.q_a_norm, g.norm_eps, tn, g.q_lora, B.qr, B.qr16, s);
+                hgemm_q(Ly.q_b, QH, g.q_lora, B.qr16, g.q_lora, B.q, QH, tn, 0.0f);
+                if (r == 4) sgemm_f16(Ly.idx_q_b, g.idx_heads * g.idx_key, g.q_lora, B.qr, g.q_lora, B.iq,
+                                      g.idx_heads * g.idx_key, tn, 1.0f);
+                S->mark("d4_proj", s);
+                gf::dsv4_rows_kv(B.kv_raw, Ly.kv_a_norm, g.norm_eps, tn, pt, rope, B.raw16, s);
+                if (r > 0) gf::dsv4_rows_comp(B.ckv, B.csc, tn, pt, Ly.c_ape, Ly.c_norm, g.norm_eps, L, rope, false, s);
+                const int* sel = nullptr;
+                if (r == 4) {
+                    gf::dsv4_rows_comp(B.ickv, B.icsc, tn, pt, Ly.ic_ape, Ly.ic_norm, g.norm_eps, L, rope, true, s);
+                    gf::dsv4_rows_indexer(B.iq, B.iw, g.idx_heads, L, tn, pt, g.idx_top_k, rope, B.score, B.ld, B.sel, s);
+                    sel = B.sel;
+                }
+                S->mark("d4_index", s);
+                gf::dsv4_rows_attn(B.q, Ly.sinks, L, B.raw16, g.n_swa, pt, tn, sel, g.idx_top_k, rope, g.norm_eps,
+                                   g.n_head, B.out16, s);
+                gf::dsv4_rows_ring(B.raw16, L, g.n_swa, pt, tn, s);
+                S->mark("d4_attn", s);
+                if (!skip_output) {
+                    const int GD = g.n_head / g.o_groups * HD, LO = g.o_groups * g.o_lora;
+                    const size_t wrow = gf::row_bytes(Ly.o_a.type, GD);
+                    for (int gr = 0; gr < g.o_groups; ++gr) {
+                        WSlot wa = Ly.o_a;
+                        wa.q = (const uint8_t*) Ly.o_a.q + (size_t) gr * g.o_lora * wrow;
+                        hgemm_q(wa, g.o_lora, GD, B.out16 + (size_t) gr * GD, QH, B.low + (size_t) gr * g.o_lora, LO, tn,
+                                0.0f);
+                    }
+                    gb::f32_to_f16(B.low, B.low16, (int64_t) tn * LO, s);
+                    hgemm_q(Ly.o_b, E, LO, B.low16, LO, mixer, E, tn, 0.0f);
+                }
+            } else if (Ly.gqa) {
                 // hy_v3: q / k / v GEMMs, the norms + rope with every row's K / V into the cache, then each row's causal
                 // attention over the cache (the rows before it in this sub-batch included), the output GEMM
                 Carve c{S->uni};
@@ -1774,7 +1888,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             }
         }
 
-        S->mark(Ly.gqa ? "gqa" : Ly.recr ? "kda" : "dsa", s);
+        S->mark(Ly.dsv4 ? "dsv4" : Ly.gqa ? "gqa" : Ly.recr ? "kda" : "dsa", s);
         if (skip_output) continue;   // every KDA/DSA cache update above still ran; these output rows feed nothing
         dump_row("mixer-" + std::to_string(il), S->mixer, E);
         if (Ly.gqa) res_read(S->mixer, Ly.ffn_norm);
@@ -1828,9 +1942,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             blas_ck(cublasSgemm(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, NE, T, E, &one, Ly.router32, E, S->x, E, &zero,
                                 M.logits, NE),
                     "router");
+        else if (Ly.router16)         // deepseek4: FP16
+            sgemm_f16(Ly.router, NE, E, S->x, E, M.logits, NE, T, 1.0f);
         else
             sgemm_bf16(Ly.router, NE, E, S->x, E, M.logits, NE, T, 1.0f);
-        gb::route(M.logits, Ly.router_bias, NE, K, g.w_scale, g.norm_w != 0, T, M.ids, M.rw, s);
+        gb::route(M.logits, Ly.router_bias, NE, K, g.w_scale, g.norm_w != 0, T, M.ids, M.rw, s, g.dsv4() ? 1 : 0,
+                  Ly.tid2eid, Ly.tid2eid != nullptr ? S->tok_d : nullptr);
         gb::expert_count(M.ids, T * K, NE, M.counts, M.rank, s);
         gb::copy_i32(M.counts, S->h_counts, NE, s);   // (not a copy: the engine may be busy with x, x_down)
         S->mark("route", s);
@@ -2771,6 +2888,13 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         }
         // the embedding lands in x (free until the first layer's gates write it) and fans out to the 4 streams
         cudaMemcpyAsync(S->x, S->emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, fast_->cs);
+        // (deepseek4: the chunk's ids for its hash-routed layers - every part, the ids are small)
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+            if (m->pf_ != nullptr && m->pf_->tok_d != nullptr) {
+                cudaSetDevice(m->dev_);
+                cudaMemcpy(m->pf_->tok_d, tokens.data() + i, (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice);
+            }
+        cudaSetDevice(dev_);
         if (g.gqa())   // one residual stream
             cudaMemcpyAsync(S->R, S->x, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToDevice, fast_->cs);
         else

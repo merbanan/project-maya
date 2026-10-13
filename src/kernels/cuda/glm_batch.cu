@@ -1640,7 +1640,8 @@ __device__ void topk_argmax(float* sel, int E, int k, int* out, float* s_bv, int
 
 __global__ void __launch_bounds__(256) route_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
                                                     int E, int k, float w_scale, int norm_w, int* __restrict__ ids,
-                                                    float* __restrict__ w) {
+                                                    float* __restrict__ w, int score_fn, const int32_t* tid2eid,
+                                                    const int32_t* toks) {
     const int t = blockIdx.x, tid = threadIdx.x;
     __shared__ float s_p[512], s_sel[512];
     __shared__ int s_ids[8];
@@ -1650,13 +1651,21 @@ __global__ void __launch_bounds__(256) route_kernel(const float* __restrict__ lo
     if (tid == 0) bad = 0;
     __syncthreads();
     for (int e = tid; e < E; e += blockDim.x) {
-        const float p = 1.0f / (1.0f + expf(-logits[(size_t) t * E + e]));
+        const float l = logits[(size_t) t * E + e];
+        // sigmoid (GLM, Hy3) or sqrt(softplus) (DeepSeek-V4)
+        const float p = score_fn == 1 ? sqrtf(l > 20.0f ? l : l < -20.0f ? expf(l) : log1pf(expf(l)))
+                                      : 1.0f / (1.0f + expf(-l));
         s_p[e] = p;
         s_sel[e] = bias ? p + bias[e] : p;
-        if (!isfinite(logits[(size_t) t * E + e]) || !isfinite(s_sel[e])) atomicExch(&bad, 1);
+        if (!isfinite(l) || !isfinite(s_sel[e])) atomicExch(&bad, 1);
     }
     __syncthreads();
-    topk_argmax(s_sel, E, k, s_ids, s_bv, s_bi);
+    if (tid2eid != nullptr) {   // DeepSeek-V4's hash layers: the token's experts, the same probabilities
+        if (tid < k) s_ids[tid] = tid2eid[(size_t) toks[t] * k + tid];
+        __syncthreads();
+    } else {
+        topk_argmax(s_sel, E, k, s_ids, s_bv, s_bi);
+    }
     if (tid == 0) {
         for (int i = 0; i < k; ++i) bad |= s_ids[i] < 0 || s_ids[i] >= E;
         if (bad) {
@@ -1780,6 +1789,16 @@ __global__ void moe_combine_kernel(const float* __restrict__ out, const int* __r
 }  // namespace
 
 int launch_errors() { return g_errors.load(std::memory_order_relaxed); }
+
+__global__ void f16_to_f32_kernel(const uint16_t* __restrict__ src, float* __restrict__ dst, int64_t n) {
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        dst[i] = __half2float(__ushort_as_half(src[i]));
+}
+void f16_to_f32(const uint16_t* src, float* dst, int64_t n, cudaStream_t s) {
+    if (n <= 0) return;
+    f16_to_f32_kernel<<<(int) std::min<int64_t>(4096, (n + 255) / 256), 256, 0, s>>>(src, dst, n);
+    check("f16_to_f32");
+}
 
 void bf16_to_f32(const uint16_t* src, float* dst, int64_t n, cudaStream_t s) {
     if (n <= 0) return;
@@ -2056,9 +2075,9 @@ void rms_rows(const float* in, const float* w, float eps, int T, int n_embd, flo
 }
 
 void route(const float* logits, const float* bias, int n_expert, int k, float w_scale, bool norm_w, int T, int* ids,
-           float* w, cudaStream_t s) {
+           float* w, cudaStream_t s, int score_fn, const int32_t* tid2eid, const int32_t* toks) {
     if (T <= 0) return;
-    route_kernel<<<T, 256, 0, s>>>(logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, ids, w);
+    route_kernel<<<T, 256, 0, s>>>(logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, ids, w, score_fn, tid2eid, toks);
     check("route");
 }
 

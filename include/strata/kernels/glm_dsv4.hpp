@@ -74,4 +74,27 @@ void dsv4_attn(const float* q, const float* sinks, const Dsv4Layer& L, int n_swa
 void dsv4_hc_head(const float* R, const uint16_t* fn, const float* scale, const float* base, float hc_eps,
                   const float* norm_w, float eps, int n_embd, float* x, void* xq, cudaStream_t s);
 
+// ---- the prompt path: a sub-batch of T rows at positions p0 .. p0 + T - 1 (glm_prefill.cu)
+/// qr = rms_norm(qr_raw) * w per row (n wide), F32 and FP16.
+void dsv4_rows_qr(const float* qr_raw, const float* w, float eps, int T, int n, float* qr, uint16_t* qr16,
+                  cudaStream_t s);
+/// The raw K/V rows (norm, rope, FP8) -> raw16 (T x 512 FP16); the ring takes them after the attention.
+void dsv4_rows_kv(const float* kv_raw, const float* w, float eps, int T, int p0, const Dsv4Rope& rope, uint16_t* raw16,
+                  cudaStream_t s);
+/// A compressor over the rows in order (the attention's, or with `indexer` the indexer's): kv / sc are its
+/// projections (T x width), the pooled rows land in the layer's caches.
+void dsv4_rows_comp(const float* kv, const float* sc, int T, int p0, const float* ape, const float* norm, float eps,
+                    const Dsv4Layer& L, const Dsv4Rope& rope, bool indexer, cudaStream_t s);
+/// The indexer's picks per row (q: T x n_head x 128 raw, w: T x n_head prescaled - both in place where noted): sel
+/// (T x top_k) row t's top_k of its (p0 + t + 1) / 4 visible pooled rows, or all of them; score: T x ld scratch.
+void dsv4_rows_indexer(float* q, const float* w, int n_head, const Dsv4Layer& L, int T, int p0, int top_k,
+                       const Dsv4Rope& rope, float* score, int ld, int* sel, cudaStream_t s);
+/// The attention per row (q raw, T x n_head x 512) over the raw window and the visible pooled rows (sel: the
+/// indexer's, nullptr: all) -> out16 (T x n_head x 512 FP16).
+void dsv4_rows_attn(const float* q, const float* sinks, const Dsv4Layer& L, const uint16_t* raw16, int n_swa, int p0,
+                    int T, const int* sel, int k, const Dsv4Rope& rope, float eps, int n_head, uint16_t* out16,
+                    cudaStream_t s);
+/// The sub-batch's last n_swa raw rows into the layer's ring.
+void dsv4_rows_ring(const uint16_t* raw16, const Dsv4Layer& L, int n_swa, int p0, int T, cudaStream_t s);
+
 }  // namespace strata::kernels::glmf

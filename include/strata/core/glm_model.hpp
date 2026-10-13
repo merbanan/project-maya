@@ -28,6 +28,8 @@
 #include <cuda_runtime.h>
 #include <condition_variable>
 #include <functional>
+#include "strata/kernels/glm_dsv4.hpp"
+
 #include <map>
 #include <set>
 #include <memory>
@@ -243,6 +245,7 @@ private:
     // windows (kv then scores) and the indexer compressor's; -1 none
     std::vector<int64_t> d4_swa_, d4_comp_, d4_icomp_, d4_st_, d4_ist_;
     int64_t d4_st_floats(int il) const;           // a layer's compressor window floats (kv + scores)
+    strata::kernels::glmf::Dsv4Layer d4_layer(int il) const;   // a layer's caches and windows as the kernels take them
     void d4_reset_scores();                       // the windows' scores to -inf (the empty window)
     // hy_v3's position-major K / V records (glm_fast.hpp GqaKv): a record's bytes, each layer's offset inside it, the
     // first position of region b - the expert pool's lendable tail (xpool), lent to the cache as the context grows
