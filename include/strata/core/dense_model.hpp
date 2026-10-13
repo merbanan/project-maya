@@ -95,6 +95,12 @@ public:
     bool step(int32_t token, bool want_logits, std::string& err) {
         return forward(&token, 1, false, want_logits ? kLast : kNone, err);
     }
+    /// Checkpoints (pinned host memory): the recurrent state at position() - every GDN layer's state and conv history,
+    /// and the DFlash2 drafter's context ring - into slot `slot`; restore() puts it back and sets the position.  The
+    /// K/V caches are position-indexed and stay valid for the prefix, so they are not copied.
+    bool ckpt_save(int slot, std::string& err);
+    bool ckpt_restore(int slot, int64_t pos, std::string& err);
+    uint64_t ckpt_bytes() const;
     /// Blocks until everything queued has run.
     bool sync(std::string& err);
 

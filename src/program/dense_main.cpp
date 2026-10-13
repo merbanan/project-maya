@@ -293,10 +293,17 @@ int main(int argc, char** argv) {
     std::vector<int32_t> stop_ids;
     if (cfg.eos_id >= 0) stop_ids.push_back(cfg.eos_id);
     try {
-        strata::GgufFile g(gguf);
+        strata::GgufFile g(gguf, 1u << 20);
         if (const auto* toks = g.get("tokenizer.ggml.tokens"))
             for (size_t i = 0; i < toks->items.size(); ++i)
                 if (toks->items[i].s == "<|im_end|>" || toks->items[i].s == "<|endoftext|>") stop_ids.push_back((int32_t) i);
+    } catch (const std::exception&) {}
+    int32_t im_start = -1;   // the chat template's message header: prompts are checkpointed at its last occurrence
+    try {
+        strata::GgufFile g(gguf, 1u << 20);
+        if (const auto* toks = g.get("tokenizer.ggml.tokens"))
+            for (size_t i = 0; i < toks->items.size(); ++i)
+                if (toks->items[i].s == "<|im_start|>") { im_start = (int32_t) i; break; }
     } catch (const std::exception&) {}
     std::sort(stop_ids.begin(), stop_ids.end());
     stop_ids.erase(std::unique(stop_ids.begin(), stop_ids.end()), stop_ids.end());
@@ -368,6 +375,21 @@ int main(int argc, char** argv) {
     // edited, a tool's output quoted - the tokens that followed are proposed instead of the learned drafter's
     const int lookup_min = std::getenv("STRATA_DENSE_LOOKUP_MIN") ? std::atoi(std::getenv("STRATA_DENSE_LOOKUP_MIN")) : 12;
     strata::spec::SuffixDrafter lookup(std::max(3, lookup_min), 64);
+    // prefix checkpoints (FreeToken's anchors, lithos-metal's prefix checkpoints): the recurrent state at the start of
+    // a prompt's last message header, in pinned host memory; a later prompt that shares that prefix but not the rest
+    // of the history (an agent dropped the reasoning, rewrote a tool call) restores it instead of reading from 0
+    const int n_ckpt = std::getenv("STRATA_DENSE_CKPTS") ? std::max(0, std::atoi(std::getenv("STRATA_DENSE_CKPTS"))) : 8;
+    struct Ckpt { int64_t len = -1; uint64_t hash = 0, used = 0; };
+    std::vector<Ckpt> ckpts((size_t) n_ckpt);
+    uint64_t ckpt_clock = 0;
+    auto prefix_hash = [](const std::vector<int32_t>& v, int64_t n) {
+        uint64_t h = 1469598103934665603ull;
+        for (int64_t i = 0; i < n; ++i) { h ^= (uint32_t) v[(size_t) i]; h *= 1099511628211ull; }
+        return h;
+    };
+    if (n_ckpt > 0)
+        std::fprintf(stderr, "strata-dense: %d prefix checkpoints of %.0f MiB (pinned host memory, on first use), "
+                     "at the last header %d\n", n_ckpt, model.ckpt_bytes() / 1048576.0, im_start);
     std::vector<int32_t> fed;                      // every token the state has consumed, in order
     uint64_t draw_counter = 0;
     std::string line;
@@ -426,6 +448,25 @@ int main(int argc, char** argv) {
         // ---- what of the state can be kept (the MTP cache follows the trunk: the same positions are valid)
         size_t resume = 0;
         if (!fed.empty() && fed.size() < ids.size() && std::equal(fed.begin(), fed.end(), ids.begin())) resume = fed.size();
+        bool restored = false;
+        if (resume == 0 && !fed.empty() && n_ckpt > 0) {
+            // the K/V cache holds fed's tokens: a checkpoint inside the common prefix of fed and the prompt is valid
+            size_t cp = 0;
+            while (cp < fed.size() && cp + 1 < ids.size() && fed[cp] == ids[cp]) ++cp;
+            int best = -1;
+            for (int c = 0; c < n_ckpt; ++c)
+                if (ckpts[(size_t) c].len > 0 && (size_t) ckpts[(size_t) c].len <= cp &&
+                    (best < 0 || ckpts[(size_t) c].len > ckpts[(size_t) best].len) &&
+                    ckpts[(size_t) c].hash == prefix_hash(ids, ckpts[(size_t) c].len))
+                    best = c;
+            std::fprintf(stderr, "strata-dense: history diverges at %zu of %zu; checkpoint %d\n", cp, fed.size(), best);
+            if (best >= 0 && model.ckpt_restore(best, ckpts[(size_t) best].len, err)) {
+                resume = (size_t) ckpts[(size_t) best].len;
+                fed.resize(resume);
+                ckpts[(size_t) best].used = ++ckpt_clock;
+                restored = true;
+            }
+        }
         if (resume == 0) { model.reset(); fed.clear(); }
         if (resume == 0 || lookup.size() != resume) {   // (the lookup history is the prompt and the answer so far)
             lookup.reset();
@@ -440,8 +481,13 @@ int main(int argc, char** argv) {
         bool cancelled = false, failed = false;
         const auto t_prompt = Clock::now();
         const int ch = model.chunk();
+        int64_t anchor_at = -1;   // the last message header (a checkpoint), when it is still to be read
+        if (n_ckpt > 0 && im_start >= 0)
+            for (int64_t j = n - 1; j > (int64_t) resume; --j)
+                if (ids[(size_t) j] == im_start) { anchor_at = j; break; }
         for (int64_t i = (int64_t) resume; i < n && !failed;) {
-            const int T = (int) std::min<int64_t>(ch, n - i);
+            int T = (int) std::min<int64_t>(ch, n - i);
+            if (anchor_at > i && anchor_at < i + T) T = (int) (anchor_at - i);   // a chunk ends at the header
             const bool last = i + T == n;
             if (!model.forward(ids.data() + i, T, false, last ? strata::core::DenseModel::kLast : strata::core::DenseModel::kNone, err)) {
                 std::printf("ERR %s\n", err.c_str()); failed = true; break;
@@ -459,6 +505,22 @@ int main(int argc, char** argv) {
             }
             fed.insert(fed.end(), ids.begin() + i, ids.begin() + i + T);
             i += T;
+            if (i == anchor_at) {
+                const uint64_t h = prefix_hash(ids, i);
+                int slot = -1;
+                for (int c = 0; c < n_ckpt && slot < 0; ++c)
+                    if (ckpts[(size_t) c].len == i && ckpts[(size_t) c].hash == h) slot = -2;   // (already there)
+                if (slot == -1) {
+                    slot = 0;
+                    for (int c = 1; c < n_ckpt; ++c)
+                        if (ckpts[(size_t) c].used < ckpts[(size_t) slot].used) slot = c;
+                    if (model.ckpt_save(slot, err)) {
+                        ckpts[(size_t) slot] = {i, h, ++ckpt_clock};
+                        std::fprintf(stderr, "strata-dense: checkpoint %d at position %lld\n", slot, (long long) i);
+                    }
+                    else { std::fprintf(stderr, "strata-dense: %s\n", err.c_str()); ckpts[(size_t) slot].len = -1; }
+                }
+            }
             if (!model.sync(err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
             const double ms = ms_since(t_prompt);
             std::printf("PP %lld %lld %.0f %.1f\n", (long long) i, (long long) n, ms,
@@ -606,9 +668,9 @@ int main(int argc, char** argv) {
         std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld\n", produced, (long long) n, prompt_ms, decode_ms, finish,
                     accepted, drafted, (long long) resume);
         std::fflush(stdout);
-        std::fprintf(stderr, "strata-dense: prompt %lld tokens = %zu reused + %lld read in %.0f ms (%.0f tok/s), %lld generated "
+        std::fprintf(stderr, "strata-dense: prompt %lld tokens = %zu reused%s + %lld read in %.0f ms (%.0f tok/s), %lld generated "
                      "in %.0f ms (%.1f tok/s)%s; %s %lld rounds (%lld by lookup), %lld of %lld drafts kept (%.2f tokens a round)\n",
-                     (long long) n, resume, (long long) (n - (long long) resume), prompt_ms,
+                     (long long) n, resume, restored ? " (checkpoint)" : "", (long long) (n - (long long) resume), prompt_ms,
                      prompt_ms > 0 ? 1000.0 * (n - (long long) resume) / prompt_ms : 0.0, produced, decode_ms,
                      decode_ms > 0 ? 1000.0 * produced / decode_ms : 0.0, cancelled ? " (cancelled)" : "",
                      use_df ? "DFlash2" : "MTP", rounds, lookup_rounds, accepted, drafted, rounds ? (double) (accepted + rounds) / rounds : 0.0);

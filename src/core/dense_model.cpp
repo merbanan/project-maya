@@ -147,6 +147,7 @@ struct DenseModel::Impl {
     Layer mtp;                                      // blk.<n_layer>: the nextn block (attn == true when loaded)
     Dflash df;
     std::unique_ptr<strata::GgufFile> df_file;
+    std::vector<uint8_t*> ckpt;                      // pinned host checkpoint slots (allocated on first use)
     std::vector<void*> allocations;                 // everything cudaMalloc'ed here, freed in the destructor
     std::vector<void*> host_allocs;                 // weights that did not fit in VRAM: mapped pinned host memory
     uint64_t budget = UINT64_MAX;                   // bytes of weights that may go to VRAM
@@ -434,6 +435,7 @@ DenseModel::~DenseModel() {
     if (impl_->stream) cudaStreamSynchronize(impl_->stream);
     for (void* p : impl_->allocations) cudaFree(p);
     for (void* p : impl_->host_allocs) cudaFreeHost(p);
+    for (uint8_t* p : impl_->ckpt) if (p) cudaFreeHost(p);
     if (impl_->stream) cudaStreamDestroy(impl_->stream);
 }
 
@@ -1155,6 +1157,68 @@ bool DenseModel::dflash_draft(int32_t anchor, int K, std::vector<int32_t>& out, 
         err = std::string("dflash: ") + e.what();
         return false;
     }
+}
+
+uint64_t DenseModel::ckpt_bytes() const {
+    const Impl& I = *impl_;
+    const uint64_t sb = (uint64_t) cfg_.ssm_state * cfg_.ssm_v_heads * cfg_.ssm_state * 4;
+    const uint64_t cb = (uint64_t) cfg_.conv_channels() * (cfg_.ssm_d_conv - 1) * 4;
+    uint64_t n = 0;
+    for (const Layer& L : I.layers)
+        if (!L.attn) n += sb + cb;
+    if (I.df.on) n += (uint64_t) I.df.n_layer * 2 * I.df.window * I.df.n_kv * 128 * 2 + (uint64_t) I.df.window * 8;
+    return n;
+}
+
+namespace {
+// every buffer of the recurrent state, in a fixed order: (device pointer, bytes)
+std::vector<std::pair<void*, uint64_t>> ckpt_parts(DenseModel::Impl& I, const DenseConfig& c) {
+    std::vector<std::pair<void*, uint64_t>> v;
+    const uint64_t sb = (uint64_t) c.ssm_state * c.ssm_v_heads * c.ssm_state * 4;
+    const uint64_t cb = (uint64_t) c.conv_channels() * (c.ssm_d_conv - 1) * 4;
+    for (Layer& L : I.layers)
+        if (!L.attn) { v.push_back({L.state, sb}); v.push_back({L.conv_state, cb}); }
+    if (I.df.on) {
+        const uint64_t rb = (uint64_t) I.df.window * I.df.n_kv * 128 * 2;
+        for (DfLayer& L : I.df.layers) { v.push_back({L.Kr, rb}); v.push_back({L.Vr, rb}); }
+        v.push_back({I.df.ring_pos, (uint64_t) I.df.window * 8});
+    }
+    return v;
+}
+}  // namespace
+
+bool DenseModel::ckpt_save(int slot, std::string& err) {
+    Impl& I = *impl_;
+    if (slot < 0 || pending_) { err = "dense model: checkpoint slot / pending verify"; return false; }
+    if ((int) I.ckpt.size() <= slot) I.ckpt.resize((size_t) slot + 1, nullptr);
+    if (!I.ckpt[(size_t) slot] &&
+        cudaHostAlloc((void**) &I.ckpt[(size_t) slot], ckpt_bytes(), cudaHostAllocDefault) != cudaSuccess) {
+        I.ckpt[(size_t) slot] = nullptr;
+        err = "dense model: no pinned memory for a checkpoint";
+        return false;
+    }
+    uint8_t* h = I.ckpt[(size_t) slot];
+    for (auto& [p, b] : ckpt_parts(I, cfg_)) {
+        cudaMemcpyAsync(h, p, b, cudaMemcpyDeviceToHost, I.stream);
+        h += b;
+    }
+    return sync(err);
+}
+
+bool DenseModel::ckpt_restore(int slot, int64_t pos, std::string& err) {
+    Impl& I = *impl_;
+    if (slot < 0 || slot >= (int) I.ckpt.size() || !I.ckpt[(size_t) slot] || pos < 0 || pos > max_context_) {
+        err = "dense model: no such checkpoint";
+        return false;
+    }
+    const uint8_t* h = I.ckpt[(size_t) slot];
+    for (auto& [p, b] : ckpt_parts(I, cfg_)) {
+        cudaMemcpyAsync(p, h, b, cudaMemcpyHostToDevice, I.stream);
+        h += b;
+    }
+    pos_ = pos;
+    pending_ = 0;
+    return sync(err);
 }
 
 }  // namespace strata::core
