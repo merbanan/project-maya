@@ -246,7 +246,8 @@ int main(int argc, char** argv) {
     std::string gguf;
     long long context = 32768;
     bool serve = false;
-    int draft = -1, chunk = 512;            // MTP drafts a round (-1: STRATA_DENSE_DRAFT, else 3; 0: off), prompt chunk
+    int draft = -1, chunk = 512;            // drafts a round (-1: STRATA_DENSE_DRAFT, else 3 / DFlash2 7; 0: off), prompt chunk
+    std::string dflash;                     // a DFlash2 drafter GGUF (else STRATA_DENSE_DFLASH): it drafts, not the MTP block
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -258,6 +259,7 @@ int main(int argc, char** argv) {
         else if (a == "--context" || a == "-c") context = std::atoll(next("--context"));
         else if (a == "--draft" || a == "--mtp-draft") draft = std::atoi(next("--draft"));
         else if (a == "--chunk") chunk = std::atoi(next("--chunk"));
+        else if (a == "--dflash") dflash = next("--dflash");
         else if (a == "--help" || a == "-h") { usage(); return 0; }
         // the flags setup passes to `strata` (--gpu-layers, --cache, ...) mean nothing here and are not an error
     }
@@ -273,9 +275,16 @@ int main(int argc, char** argv) {
         return 1;
     }
     const auto& cfg = model.config();
-    if (draft < 0) draft = std::getenv("STRATA_DENSE_DRAFT") ? std::atoi(std::getenv("STRATA_DENSE_DRAFT")) : 3;
-    draft = std::max(0, std::min(draft, 7));
-    if (!model.has_mtp()) draft = 0;
+    if (dflash.empty() && std::getenv("STRATA_DENSE_DFLASH")) dflash = std::getenv("STRATA_DENSE_DFLASH");
+    if (!dflash.empty() && !model.dflash_load(dflash, err)) {
+        std::fprintf(stderr, "strata-dense: %s\n", err.c_str());
+        std::printf("ERR %s\n", err.c_str());
+        return 1;
+    }
+    const bool use_df = model.has_dflash();
+    if (draft < 0) draft = std::getenv("STRATA_DENSE_DRAFT") ? std::atoi(std::getenv("STRATA_DENSE_DRAFT")) : (use_df ? 7 : 3);
+    draft = std::max(0, std::min(draft, use_df ? model.dflash_max() : 7));
+    if (!use_df && !model.has_mtp()) draft = 0;
     cudaStream_t cs = (cudaStream_t) model.stream();
 
     // the ids that end an answer, from the model's own vocabulary
@@ -419,7 +428,9 @@ int main(int argc, char** argv) {
             if (!model.forward(ids.data() + i, T, false, last ? strata::core::DenseModel::kLast : strata::core::DenseModel::kNone, err)) {
                 std::printf("ERR %s\n", err.c_str()); failed = true; break;
             }
-            if (K > 0) {
+            if (K > 0 && use_df) {
+                if (!model.dflash_inject(T, i, err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
+            } else if (K > 0) {
                 const int rows = last ? T - 1 : T;   // row t pairs with token i + t + 1
                 if (rows > 0 && !model.mtp_forward(ids.data() + i + 1, model.hidden_norm(), i, rows, false, err)) {
                     std::printf("ERR %s\n", err.c_str()); failed = true; break;
@@ -492,7 +503,11 @@ int main(int argc, char** argv) {
             int k = (int) std::min<long long>(K, std::min<long long>(budget - produced, model.max_context() - pos - 1));
             k = std::max(0, k);
             std::vector<int32_t> win = {anchor};
-            if (k > 0) {
+            if (k > 0 && use_df) {
+                std::vector<int32_t> d;
+                if (!model.dflash_draft(anchor, k, d, err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
+                win.insert(win.end(), d.begin(), d.end());
+            } else if (k > 0) {
                 // the drafts: the MTP block over the pending rows (the last one's logits), then one row a draft
                 if (!model.mtp_forward(mtp_tok.data(), d_hrows, mtp_p0, (int) mtp_tok.size(), false, err)) {
                     std::printf("ERR %s\n", err.c_str()); failed = true; break;
@@ -518,7 +533,11 @@ int main(int argc, char** argv) {
             int acc = 0;
             while (acc + 1 < W && win[acc + 1] == picks[acc]) ++acc;
             ++rounds; drafted += W - 1; accepted += acc;
-            if (K > 0) {
+            if (K > 0 && use_df) {
+                if (!model.commit(acc + 1, err) || !model.dflash_inject(acc + 1, pos, err)) {
+                    std::printf("ERR %s\n", err.c_str()); failed = true; break;
+                }
+            } else if (K > 0) {
                 if (!model.commit(acc + 1, err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
                 // the MTP block's next rows: the kept window's tokens after the anchor and the new anchor, with the
                 // trunk's hidden rows of the anchor .. the last kept draft
@@ -541,11 +560,11 @@ int main(int argc, char** argv) {
         std::printf("DONE %lld %lld %.1f %.1f %s 0 0 %lld\n", produced, (long long) n, prompt_ms, decode_ms, finish, (long long) resume);
         std::fflush(stdout);
         std::fprintf(stderr, "strata-dense: prompt %lld tokens = %zu reused + %lld read in %.0f ms (%.0f tok/s), %lld generated "
-                     "in %.0f ms (%.1f tok/s)%s; MTP %lld rounds, %lld of %lld drafts kept (%.2f tokens a round)\n",
+                     "in %.0f ms (%.1f tok/s)%s; %s %lld rounds, %lld of %lld drafts kept (%.2f tokens a round)\n",
                      (long long) n, resume, (long long) (n - (long long) resume), prompt_ms,
                      prompt_ms > 0 ? 1000.0 * (n - (long long) resume) / prompt_ms : 0.0, produced, decode_ms,
                      decode_ms > 0 ? 1000.0 * produced / decode_ms : 0.0, cancelled ? " (cancelled)" : "",
-                     rounds, accepted, drafted, rounds ? (double) (accepted + rounds) / rounds : 0.0);
+                     use_df ? "DFlash2" : "MTP", rounds, accepted, drafted, rounds ? (double) (accepted + rounds) / rounds : 0.0);
     }
     cudaFree(d_next);
     cudaFree(d_hist);

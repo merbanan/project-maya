@@ -113,6 +113,16 @@ public:
     float* mtp_logits() const;
     const float* mtp_hidden() const;
 
+    // ---- the DFlash2 drafter (a separate GGUF, arch qwen35-dflash-draft): K drafts in one pass of its 5 layers
+    /// Loads the drafter; from then on every forward pass keeps the target's hidden rows the drafter reads.
+    bool dflash_load(const std::string& path, std::string& err);
+    bool has_dflash() const;
+    int dflash_max() const;            ///< the most drafts a pass makes (its block size - 1)
+    /// The last forward's rows 0 .. n - 1 (positions p0 ..) into the drafter's context ring.
+    bool dflash_inject(int n, int64_t p0, std::string& err);
+    /// K drafts after `anchor` (the token at position(), not yet fed); out gets them (host).
+    bool dflash_draft(int32_t anchor, int K, std::vector<int32_t>& out, std::string& err);
+
     struct Impl;
 
 private:

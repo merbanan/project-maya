@@ -6,6 +6,7 @@
 #include "strata/kernels/dense_kernels.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/q35_dflash.hpp"
 #include "strata/kernels/q35_kernels.hpp"
 #include "strata/prefill/gemm.hpp"
 
@@ -21,6 +22,7 @@
 #include <map>
 #include <regex>
 #include <set>
+#include <thread>
 
 namespace strata::core {
 namespace {
@@ -65,7 +67,70 @@ struct Layer {
     float *enorm = nullptr, *hnorm = nullptr, *head_norm = nullptr;
 };
 
+struct DfLayer {
+    float *attn_norm = nullptr, *ffn_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr;
+    float *attn_base = nullptr, *ffn_base = nullptr;   // [side][tap][E]
+    QMat q, k, v, o, attn_conv, ffn_conv, gate, up, down;
+    uint16_t *Kr = nullptr, *Vr = nullptr;            // the context ring, [ring][n_kv * 128] FP16
+};
+
+struct Dflash {
+    bool on = false;
+    int n_layer = 0, n_head = 0, n_kv = 0, block = 0, taps = 0, group = 0, rank = 0, top_k = 0, window = 2048;
+    int mask_tok = 0, n_cand = 0;                     // candidates come from ids [0, n_cand)
+    float eps = 1e-6f, theta = 1e7f;
+    std::vector<int> target_layers;
+    QMat fc, hproj;
+    float *hidden_norm = nullptr, *out_norm = nullptr;
+    uint16_t *pred = nullptr, *succ = nullptr;        // selector codebooks, FP16 rows of rank
+    std::vector<DfLayer> layers;
+    int64_t* ring_pos = nullptr;
+    // buffers
+    float *feat = nullptr, *h = nullptr, *dyn = nullptr, *a = nullptr, *hf = nullptr, *logits = nullptr, *gate = nullptr;
+    float* cand_v = nullptr;
+    int* cand_i = nullptr;
+    int* tok = nullptr;
+    float* conf = nullptr;
+    void* topk_scratch = nullptr;
+};
+
 std::string upper_type(uint32_t t) { return strata::ggml_type_name(t); }
+
+uint16_t f32_to_f16(float f) {   // round to nearest even (normal range; subnormals flush, overflow saturates)
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    const int32_t e = (int32_t) ((x >> 23) & 0xff) - 127 + 15;
+    const uint32_t m = x & 0x7fffffu;
+    if (e <= 0) return (uint16_t) sign;
+    if (e >= 31) return (uint16_t) (sign | 0x7bffu);
+    uint32_t h = sign | ((uint32_t) e << 10) | (m >> 13);
+    const uint32_t rest = m & 0x1fffu;
+    if (rest > 0x1000u || (rest == 0x1000u && (h & 1u))) ++h;
+    return (uint16_t) h;
+}
+
+// F16 rows (n_out of n_in) -> Q8_0 blocks (ggml's quantize_row_q8_0_ref), on the host, a few threads
+std::vector<uint8_t> f16_to_q8_0(const uint16_t* src, int64_t n_in, int64_t n_out) {
+    std::vector<uint8_t> out((size_t) (n_in / 32) * n_out * 34);
+    const int64_t nb = n_in / 32 * n_out;
+    const int nt = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    std::vector<std::thread> th;
+    for (int t = 0; t < nt; ++t)
+        th.emplace_back([&, t] {
+            for (int64_t b = t; b < nb; b += nt) {
+                float v[32], amax = 0.0f;
+                for (int i = 0; i < 32; ++i) { v[i] = strata::fp16_to_fp32(src[b * 32 + i]); amax = std::max(amax, std::fabs(v[i])); }
+                const float d = amax / 127.0f, id = d ? 1.0f / d : 0.0f;
+                uint8_t* o = out.data() + b * 34;
+                const uint16_t dh = f32_to_f16(d);
+                std::memcpy(o, &dh, 2);
+                for (int i = 0; i < 32; ++i) o[2 + i] = (uint8_t) (int8_t) std::lround(v[i] * id);
+            }
+        });
+    for (auto& x : th) x.join();
+    return out;
+}
 
 // A tensor of one GGUF file, found by name across the shards.
 struct Found {
@@ -80,6 +145,8 @@ struct DenseModel::Impl {
     std::map<std::string, Found> index;
     std::vector<Layer> layers;
     Layer mtp;                                      // blk.<n_layer>: the nextn block (attn == true when loaded)
+    Dflash df;
+    std::unique_ptr<strata::GgufFile> df_file;
     std::vector<void*> allocations;                 // everything cudaMalloc'ed here, freed in the destructor
     std::vector<void*> host_allocs;                 // weights that did not fit in VRAM: mapped pinned host memory
     uint64_t budget = UINT64_MAX;                   // bytes of weights that may go to VRAM
@@ -595,7 +662,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
 
         // ---- 5. activations and scratch
         const uint64_t R = (uint64_t) I.chunk, f = 4;
-        const int max_in = std::max({E, cfg_.n_ff, V, H * D, 2 * E});
+        const int max_in = std::max({E, cfg_.n_ff, V, H * D, 2 * E, 5 * E});   // (5 E: the DFlash2 drafter's fc)
         bool ok = I.alloc(&I.q8_1, native_q8_1_bytes(max_in, kMaxCols), err, "q8_1 scratch") &&
                   I.alloc(&I.xh, R * max_in * 2, err, "fp16 activations") &&
                   I.alloc(&I.x, R * E * f, err, "x") && I.alloc(&I.xn, R * E * f, err, "xn") &&
@@ -755,6 +822,11 @@ bool DenseModel::forward(const int32_t* tokens, int T, bool verify, int want, st
             q35_add(I.x, I.mix, (int64_t) T * E, s);
             ffn(I, cfg_, L, I.x, T);
             I.stage("ffn", s);
+            if (I.df.on)   // the drafter's features: the residual after its target layers, in their order
+                for (size_t j = 0; j < I.df.target_layers.size(); ++j)
+                    if (I.df.target_layers[j] == l)
+                        cudaMemcpy2DAsync(I.df.feat + j * E, I.df.target_layers.size() * E * 4, I.x, (size_t) E * 4,
+                                          (size_t) E * 4, T, cudaMemcpyDeviceToDevice, s);
         }
         // the final norm of every row (the MTP block reads them), then the logits asked for
         q35_rms_rows(I.x, E, I.output_norm, I.hn, nullptr, T, E, eps, s);
@@ -828,6 +900,235 @@ bool DenseModel::mtp_forward(const int32_t* toks, const float* hidden, int64_t p
         return true;
     } catch (const std::exception& e) {
         err = std::string("dense model: ") + e.what();
+        return false;
+    }
+}
+
+bool DenseModel::has_dflash() const { return impl_->df.on; }
+int DenseModel::dflash_max() const { return impl_->df.on ? impl_->df.block - 1 : 0; }
+
+bool DenseModel::dflash_load(const std::string& path, std::string& err) {
+    Impl& I = *impl_;
+    Dflash& F = I.df;
+    try {
+        I.df_file.reset(new strata::GgufFile(path));
+        const strata::GgufFile& G = *I.df_file;
+        const auto* arch = G.get("general.architecture");
+        if (!arch || arch->s != "qwen35-dflash-draft") {
+            err = "dflash: " + path + " is not a qwen35-dflash-draft GGUF";
+            return false;
+        }
+        const std::string a = arch->s + ".";
+        auto num = [&](const std::string& k, double def) -> double {
+            const auto* v = G.get(a + k);
+            return v ? v->num() : def;
+        };
+        const int E = cfg_.n_embd;
+        if ((int) num("embedding_length", 0) != E || (int) num("vocab_size", cfg_.n_vocab) != cfg_.n_vocab) {
+            err = "dflash: the drafter's hidden size / vocabulary do not match the model";
+            return false;
+        }
+        F.n_layer = (int) num("block_count", 0);
+        F.n_head = (int) num("attention.head_count", 0);
+        F.n_kv = (int) num("attention.head_count_kv", 0);
+        F.block = (int) num("dflash.block_size", 8);
+        F.taps = (int) num("dflash.dflash2.conv_kernel_size", 0);
+        F.group = (int) num("dflash.dflash2.conv_group_size", 16);
+        F.rank = (int) num("dflash.dflash2.selector_rank", 0);
+        F.top_k = (int) num("dflash.dflash2.selector_top_k", 16);
+        F.mask_tok = (int) num("dflash.mask_token_id", -1);
+        F.eps = (float) num("attention.layer_norm_rms_epsilon", 1e-6);
+        F.theta = (float) num("rope.freq_base", 1e7);
+        F.window = (int) num("attention.sliding_window", 2048);
+        if (const char* e = std::getenv("STRATA_DENSE_DFLASH_CTX")) F.window = std::max(64, std::atoi(e));
+        F.n_cand = std::min(cfg_.n_vocab, (int) num("dflash.candidate_vocab", 248077));
+        if (const auto* tl = G.get(a + "dflash.target_layer_ids"))
+            for (const auto& it : tl->items) F.target_layers.push_back((int) it.u);
+        if (F.n_layer < 1 || F.n_head < 1 || F.n_kv < 1 || F.taps != 2 || F.rank < 32 || F.rank > 1024 ||
+            F.rank % 32 || F.top_k < 1 || F.top_k > 32 || F.mask_tok < 0 || F.target_layers.empty() ||
+            F.block < 2 || F.block > 9 || (int) num("attention.key_length", 128) != 128) {
+            err = "dflash: unsupported drafter geometry (DFlash2 with a selector, head size 128, block 2..9)";
+            return false;
+        }
+        for (int l : F.target_layers)
+            if (l < 0 || l >= cfg_.n_layer) { err = "dflash: a target layer outside the model"; return false; }
+        const int NF = (int) F.target_layers.size();
+        uint64_t total = 0;
+        auto find = [&](const std::string& n) -> const strata::TensorInfo* { return G.find(n); };
+        auto f32 = [&](const std::string& n, uint64_t want, float** out) {
+            const auto* t = find(n);
+            if (!t) { err = "dflash: missing " + n; return false; }
+            Found f{&G, t};
+            return I.upload_floats(&f, n, want, out, err);
+        };
+        // an F16 / BF16 / F32 matrix -> Q8_0 on the device (the GEMVs and GEMMs take Q8_0); a quantized one as is
+        auto mat = [&](const std::string& n, int n_in, int n_out, QMat& out) {
+            const auto* t = find(n);
+            if (!t || t->shape.size() != 2 || t->shape[0] != (uint64_t) n_in || t->shape[1] != (uint64_t) n_out) {
+                err = "dflash: " + n + " missing or not " + std::to_string(n_in) + " x " + std::to_string(n_out);
+                return false;
+            }
+            if (t->type != kF16) {
+                Found f{&G, t};
+                return I.upload_mat(&f, n, n_in, n_out, out, total, err);
+            }
+            const std::vector<uint8_t> q = f16_to_q8_0((const uint16_t*) G.tensor_data(*t), n_in, n_out);
+            void* dev = nullptr;
+            if (!I.alloc(&dev, q.size(), err, n.c_str())) return false;
+            cudaMemcpy(dev, q.data(), q.size(), cudaMemcpyHostToDevice);
+            out = QMat{dev, 8, n_in, n_out};
+            total += q.size();
+            return true;
+        };
+        const int qd = F.n_head * 128, kvd = F.n_kv * 128, cdyn = 2 * F.taps * (E / F.group);
+        if (!mat("dflash.fc.weight", NF * E, E, F.fc) || !mat("dflash.selector.hproj.weight", E, F.rank, F.hproj) ||
+            !f32("dflash.hidden_norm.weight", E, &F.hidden_norm) || !f32("output_norm.weight", E, &F.out_norm))
+            return false;
+        for (const char* n : {"dflash.selector.pred_cb", "dflash.selector.succ_cb"}) {
+            const auto* t = find(n);
+            if (!t || t->type != kF16 || t->shape.size() != 2 || t->shape[0] != (uint64_t) F.rank ||
+                t->shape[1] != (uint64_t) cfg_.n_vocab) {
+                err = std::string("dflash: ") + n + " missing or not F16 " + std::to_string(F.rank) + " x vocabulary";
+                return false;
+            }
+            uint16_t*& dst = std::string(n).find("pred") != std::string::npos ? F.pred : F.succ;
+            const size_t b = (size_t) F.rank * cfg_.n_vocab * 2;
+            if (!I.alloc(&dst, b, err, n)) return false;
+            cudaMemcpy(dst, G.tensor_data(*t), b, cudaMemcpyHostToDevice);
+            total += b;
+        }
+        F.layers.assign((size_t) F.n_layer, DfLayer{});
+        for (int il = 0; il < F.n_layer; ++il) {
+            DfLayer& L = F.layers[(size_t) il];
+            const std::string P = "blk." + std::to_string(il) + ".";
+            if (!f32(P + "attn_norm.weight", E, &L.attn_norm) || !f32(P + "ffn_norm.weight", E, &L.ffn_norm) ||
+                !f32(P + "attn_q_norm.weight", 128, &L.q_norm) || !f32(P + "attn_k_norm.weight", 128, &L.k_norm) ||
+                !f32(P + "attn_conv.base", (uint64_t) 2 * F.taps * E, &L.attn_base) ||
+                !f32(P + "ffn_conv.base", (uint64_t) 2 * F.taps * E, &L.ffn_base) ||
+                !mat(P + "attn_q.weight", E, qd, L.q) || !mat(P + "attn_k.weight", E, kvd, L.k) ||
+                !mat(P + "attn_v.weight", E, kvd, L.v) || !mat(P + "attn_output.weight", qd, E, L.o) ||
+                !mat(P + "attn_conv.proj.weight", E, cdyn, L.attn_conv) ||
+                !mat(P + "ffn_conv.proj.weight", E, cdyn, L.ffn_conv) ||
+                !mat(P + "ffn_gate.weight", E, cfg_.n_ff, L.gate) || !mat(P + "ffn_up.weight", E, cfg_.n_ff, L.up) ||
+                !mat(P + "ffn_down.weight", cfg_.n_ff, E, L.down))
+                return false;
+            const uint64_t rb = (uint64_t) F.window * kvd * 2;
+            if (!I.alloc(&L.Kr, rb, err, "dflash ring") || !I.alloc(&L.Vr, rb, err, "dflash ring")) return false;
+            total += 2 * rb;
+        }
+        const uint64_t R = (uint64_t) I.chunk, W = (uint64_t) F.block;
+        if (!I.alloc(&F.ring_pos, (uint64_t) F.window * 8, err, "dflash ring") ||
+            !I.alloc(&F.feat, R * NF * E * 4, err, "dflash features") || !I.alloc(&F.h, W * E * 4, err, "dflash") ||
+            !I.alloc(&F.dyn, W * cdyn * 4, err, "dflash") || !I.alloc(&F.a, W * E * 4, err, "dflash") ||
+            !I.alloc(&F.hf, W * E * 4, err, "dflash") ||
+            !I.alloc(&F.logits, W * cfg_.n_vocab * 4, err, "dflash logits") ||
+            !I.alloc(&F.gate, W * F.rank * 4, err, "dflash") ||
+            !I.alloc(&F.cand_v, W * F.top_k * 4, err, "dflash") || !I.alloc(&F.cand_i, W * F.top_k * 4, err, "dflash") ||
+            !I.alloc(&F.tok, W * 4, err, "dflash") || !I.alloc(&F.conf, W * 4, err, "dflash") ||
+            !I.alloc(&F.topk_scratch, (uint64_t) q35_df_topk_scratch((int) W, F.top_k), err, "dflash"))
+            return false;
+        cudaMemset(F.ring_pos, 0xff, (size_t) F.window * 8);   // -1: no position
+        if (cudaDeviceSynchronize() != cudaSuccess) { err = "dflash: upload failed"; return false; }
+        F.on = true;
+        std::fprintf(stderr, "strata-dense: DFlash2 drafter %s: %d layers, block %d, %.2f GiB (Q8_0), window %d, "
+                     "target layers", path.c_str(), F.n_layer, F.block, total / 1073741824.0, F.window);
+        for (int l : F.target_layers) std::fprintf(stderr, " %d", l);
+        std::fprintf(stderr, "\n");
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("dflash: ") + e.what();
+        return false;
+    }
+}
+
+bool DenseModel::dflash_inject(int n, int64_t p0, std::string& err) {
+    Impl& I = *impl_;
+    Dflash& F = I.df;
+    if (!F.on || n <= 0) return true;
+    cudaStream_t s = I.stream;
+    const int E = cfg_.n_embd, NF = (int) F.target_layers.size(), kvd = F.n_kv * 128;
+    try {
+        // c = rms(fc . features, hidden_norm); per layer K = rope(rms_head(Wk c) * k_norm) at the row's position, V = Wv c
+        I.prep(F.feat, NF * E, n);
+        I.mm(F.fc, I.mix);
+        q35_rms_rows(I.mix, E, F.hidden_norm, I.xn, nullptr, n, E, F.eps, s);
+        I.prep(I.xn, E, n);
+        for (DfLayer& L : F.layers) {
+            I.mm(L.k, I.kcur);
+            I.mm(L.v, I.vcur);
+            q35_df_head_norm_rope(I.kcur, n, F.n_kv, L.k_norm, F.eps, p0, F.theta, s);
+            // rows beyond the window would overwrite each other's slots: keep the last `window`
+            const int skip = std::max(0, n - F.window);
+            q35_df_ring_store(I.kcur + (size_t) skip * kvd, I.vcur + (size_t) skip * kvd, n - skip, kvd, p0 + skip,
+                              F.window, L.Kr, L.Vr, F.ring_pos, s);
+        }
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("dflash: ") + e.what();
+        return false;
+    }
+}
+
+bool DenseModel::dflash_draft(int32_t anchor, int K, std::vector<int32_t>& out, std::string& err) {
+    Impl& I = *impl_;
+    Dflash& F = I.df;
+    out.clear();
+    if (!F.on || K < 1) return true;
+    K = std::min(K, F.block - 1);
+    const int W = K + 1, E = cfg_.n_embd, kvd = F.n_kv * 128, qd = F.n_head * 128;
+    const int cdyn = 2 * F.taps * (E / F.group);
+    const int64_t P0 = pos_;
+    cudaStream_t s = I.stream;
+    try {
+        // h = emb([anchor, mask x K])
+        for (int t = 0; t < W; ++t)
+            dequant_f32(I.embd.type, I.embd.dev, t == 0 ? anchor : F.mask_tok, 1, E, F.h + (size_t) t * E, s);
+        for (DfLayer& L : F.layers) {
+            // attention, wrapped in the attention conv
+            q35_rms_rows(F.h, E, L.attn_norm, I.xn, nullptr, W, E, F.eps, s);
+            I.prep(I.xn, E, W);
+            I.mm(L.attn_conv, F.dyn);
+            q35_df_conv(I.xn, F.dyn, cdyn, L.attn_base, 0, W, E, F.taps, F.group, F.a, s);
+            I.prep(F.a, E, W);
+            I.mm(L.q, I.q_full);
+            I.mm(L.k, I.kcur);
+            I.mm(L.v, I.vcur);
+            q35_df_head_norm_rope(I.q_full, W, F.n_head, L.q_norm, F.eps, P0, F.theta, s);
+            q35_df_head_norm_rope(I.kcur, W, F.n_kv, L.k_norm, F.eps, P0, F.theta, s);
+            q35_df_attn(I.q_full, L.Kr, L.Vr, F.ring_pos, I.kcur, I.vcur, W, F.n_head, F.n_kv, P0, F.window,
+                        F.window, I.attn, s);
+            I.prep(I.attn, qd, W);
+            I.mm(L.o, I.mix);
+            q35_df_conv(I.mix, F.dyn, cdyn, L.attn_base, 1, W, E, F.taps, F.group, F.a, s);
+            q35_add(F.h, F.a, (int64_t) W * E, s);
+            // the MLP, wrapped in the MLP conv
+            q35_rms_rows(F.h, E, L.ffn_norm, I.xn, nullptr, W, E, F.eps, s);
+            I.prep(I.xn, E, W);
+            I.mm(L.ffn_conv, F.dyn);
+            q35_df_conv(I.xn, F.dyn, cdyn, L.ffn_base, 0, W, E, F.taps, F.group, F.a, s);
+            I.prep(F.a, E, W);
+            I.mm(L.gate, I.ffn_g);
+            I.mm(L.up, I.ffn_u);
+            dense_swiglu(I.ffn_g, I.ffn_u, I.ffn_h, (int64_t) W * cfg_.n_ff, s);
+            I.prep(I.ffn_h, cfg_.n_ff, W);
+            I.mm(L.down, I.mix);
+            q35_df_conv(I.mix, F.dyn, cdyn, L.ffn_base, 1, W, E, F.taps, F.group, F.a, s);
+            q35_add(F.h, F.a, (int64_t) W * E, s);
+        }
+        (void) kvd;
+        q35_rms_rows(F.h, E, F.out_norm, F.hf, nullptr, W, E, F.eps, s);
+        // the mask rows' candidates through the target's head, their gates, the walk
+        I.prep(F.hf + E, E, K);
+        I.mm(I.head, F.logits);
+        q35_df_topk(F.logits, cfg_.n_vocab, F.n_cand, K, F.top_k, F.cand_i, F.cand_v, F.topk_scratch, s);
+        I.mm(F.hproj, F.gate);
+        q35_df_walk(F.cand_i, F.cand_v, F.gate, F.top_k, F.rank, F.pred, F.succ, anchor, K, F.tok, F.conf, s);
+        out.resize((size_t) K);
+        cudaMemcpyAsync(out.data(), F.tok, (size_t) K * 4, cudaMemcpyDeviceToHost, s);
+        if (cudaStreamSynchronize(s) != cudaSuccess) { err = "dflash: draft failed"; return false; }
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("dflash: ") + e.what();
         return false;
     }
 }
