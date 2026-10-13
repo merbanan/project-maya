@@ -51,6 +51,9 @@ class ChatTemplate:
         # them through HY3_TAGS
         self.hy3 = "hy_Assistant" in self.source
         self.tags = HY3_TAGS if self.hy3 else None
+        # DeepSeek-V4: `thinking` (or enable_thinking) opens <think>, else the answer starts after </think>; its BOS
+        # comes from the template's bos_token
+        self.dsv4 = "<｜Assistant｜>" in self.source and "DSML" in self.source
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -63,6 +66,12 @@ class ChatTemplate:
             off = kwargs.pop("enable_thinking", True) is False
             level = kwargs.pop("reasoning_effort", None)
             kwargs["reasoning_effort"] = "low" if off else level if level in ("low", "high") else "max"
+        elif self.dsv4:
+            level = kwargs.pop("reasoning_effort", None)
+            on = kwargs.pop("enable_thinking", None)
+            kwargs["thinking"] = (on is not False) and level not in (None, "none", "off", "no_think") if on is None \
+                else bool(on)
+            kwargs.setdefault("bos_token", "<｜begin▁of▁sentence｜>")
         elif kwargs.get("reasoning_effort") in QWEN_EFFORT:
             kwargs["reasoning_effort"] = QWEN_EFFORT[kwargs["reasoning_effort"]]
         out = self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,

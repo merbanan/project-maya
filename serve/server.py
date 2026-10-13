@@ -1225,7 +1225,8 @@ class Service:
         # GLM ends an assistant turn with the next role's token (<|user|> / <|observation|>): the engine stops on it,
         # and it must not reach the answer's text either
         self.stop_ids = set(_special_ids(IM_END) + _special_ids("<|endoftext|>") + _special_ids("<|user|>") +
-                            _special_ids("<|observation|>") + _special_ids("<｜hy_eos:opensource｜>"))
+                            _special_ids("<|observation|>") + _special_ids("<｜hy_eos:opensource｜>") +
+                            _special_ids("<｜end▁of▁sentence｜>"))
         # ... and a model that spells a role marker out of ordinary pieces ('<|', 'user', '|>') has ended its turn just
         # the same: the text stops there.  Only markers that are special tokens in this vocabulary count.
         self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>") if _special_ids(s)]
@@ -1613,6 +1614,8 @@ class Service:
             # Hy3: thinking is on exactly when the prompt leaves the think block open (its template closes it for
             # no_think, its default - also when the client names no level)
             thinking = prompt.endswith("<think:opensource>")
+        elif getattr(self.template, "dsv4", False):   # DeepSeek-V4: likewise with its <think>
+            thinking = prompt.endswith("<think>")
         return ids, thinking, max_new
 
     def count_tokens(self, req: dict) -> dict:

@@ -181,6 +181,11 @@ public:
     uint64_t slot_save(const std::string& path, std::string& err);
     bool slot_load(const std::string& path, int64_t n_pos, std::string& err);
     std::vector<std::pair<int64_t, int64_t>> slot_gqa_runs(int64_t n) const;   // hy_v3: the K / V rows of n positions
+    // deepseek4: the snapshot's runs (per layer the raw ring and the compressor windows - the pooled rows of earlier
+    // positions never change) and a slot's pooled rows of n positions; (state_ offset, floats)
+    std::vector<std::pair<int64_t, int64_t>> d4_snap_runs() const;
+    std::vector<std::pair<int64_t, int64_t>> slot_d4_runs(int64_t n) const;
+    int64_t d4_snap_floats() const;
     /// Runs the engine's sampler on the last forward's logits and returns the picked token id
     /// (-1 + err on failure).  Handles the device bookkeeping: with a split the logits (and the
     /// sampler buffer) live on the tail half's device, where peer reads are not available.

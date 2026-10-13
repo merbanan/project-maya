@@ -4964,9 +4964,55 @@ void Glm5Model::snap_pool_copy(bool restore) {
     }
 }
 
+std::vector<std::pair<int64_t, int64_t>> Glm5Model::d4_snap_runs() const {
+    std::vector<std::pair<int64_t, int64_t>> r;
+    if (!g_.dsv4()) return r;
+    for (int il = l0_; il < l1_; ++il) {
+        r.push_back({d4_swa_[(size_t) il], (int64_t) g_.n_swa * g_.head_dim / 2});
+        if (d4_st_[(size_t) il] >= 0) r.push_back({d4_st_[(size_t) il], d4_st_floats(il)});
+        if (d4_ist_[(size_t) il] >= 0) r.push_back({d4_ist_[(size_t) il], (int64_t) 2 * 8 * 2 * g_.idx_key});
+    }
+    return r;
+}
+int64_t Glm5Model::d4_snap_floats() const {
+    int64_t n = 0;
+    for (const auto& r : d4_snap_runs()) n += r.second;
+    return n;
+}
+std::vector<std::pair<int64_t, int64_t>> Glm5Model::slot_d4_runs(int64_t n) const {
+    std::vector<std::pair<int64_t, int64_t>> r;
+    if (!g_.dsv4()) return r;
+    for (int il = l0_; il < l1_; ++il) {
+        const int ratio = g_.ratio(il);
+        if (ratio == 0) continue;
+        r.push_back({d4_comp_[(size_t) il], (n / ratio * g_.head_dim + 1) / 2});
+        if (ratio == 4) r.push_back({d4_icomp_[(size_t) il], (n / 4 * g_.idx_key + 1) / 2});
+    }
+    return r;
+}
+
 bool Glm5Model::snapshot_save() {
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr) return false;
+        if (m->g_.dsv4()) {   // deepseek4: the rings and windows, back to back
+            const int64_t nf = m->d4_snap_floats();
+            cudaSetDevice(m->dev_);
+            if (m->snap_ == nullptr && cudaMalloc(&m->snap_, (size_t) nf * sizeof(float)) != cudaSuccess) {
+                cudaGetLastError();
+                m->snap_ = nullptr;
+                cudaSetDevice(dev_);
+                return false;
+            }
+            int64_t at = 0;
+            for (const auto& r : m->d4_snap_runs()) {
+                cudaMemcpyAsync(m->snap_ + at, m->state_ + r.first, (size_t) r.second * sizeof(float),
+                                cudaMemcpyDeviceToDevice, m->fast_->cs);
+                at += r.second;
+            }
+            m->snap_pos_ = pos_;
+            cudaStreamSynchronize(m->fast_->cs);
+            continue;
+        }
         const Glm5Geometry& g = m->g_;
         const size_t run = (size_t) g.d_inner() * g.kda_head_dim + (size_t) 3 * g.d_inner() * (g.d_conv - 1);
         int n_rec = 0;
@@ -5001,6 +5047,18 @@ bool Glm5Model::snapshot_restore() {
         if (m->fast_ == nullptr || m->snap_pos_ < 0) return false;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         const Glm5Geometry& g = m->g_;
+        if (g.dsv4()) {
+            cudaSetDevice(m->dev_);
+            int64_t at = 0;
+            for (const auto& r : m->d4_snap_runs()) {
+                cudaMemcpyAsync(m->state_ + r.first, m->snap_ + at, (size_t) r.second * sizeof(float),
+                                cudaMemcpyDeviceToDevice, m->fast_->cs);
+                at += r.second;
+            }
+            cudaStreamSynchronize(m->fast_->cs);
+            m->pos_ = m->snap_pos_;
+            continue;
+        }
         const size_t run = (size_t) g.d_inner() * g.kda_head_dim + (size_t) 3 * g.d_inner() * (g.d_conv - 1);
         cudaSetDevice(m->dev_);
         int k = 0;
@@ -5098,6 +5156,8 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
                                   m->dsa_ig_, m->dsa_pool_, n);
         const auto gruns = m->slot_gqa_runs(n);   // hy_v3's K / V rows
         runs.insert(runs.end(), gruns.begin(), gruns.end());
+        const auto druns = m->slot_d4_runs(n);    // deepseek4's pooled rows
+        runs.insert(runs.end(), druns.begin(), druns.end());
         const int32_t hdr[4] = {m->l0_, m->l1_, n_rec, (int32_t) runs.size()};
         put(hdr, sizeof(hdr));
         put(&run, 8);
@@ -5108,6 +5168,7 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
         t_sync += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tq).count();
         std::vector<std::pair<const float*, int64_t>> src;
         if (n_rec > 0) src.push_back({m->snap_, (int64_t) n_rec * run});
+        if (g.dsv4()) src.push_back({m->snap_, m->d4_snap_floats()});
         const int64_t pool_rows = (int64_t) m->dsa_layers().size() * 2 * (g.idx_kpool - 1) * g.idx_key;
         if (pool_rows > 0) src.push_back({m->snap_pool_, pool_rows});
         for (const auto& r : runs) src.push_back({m->state_ + r.first, r.second});
@@ -5174,6 +5235,8 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
                                   m->dsa_ig_, m->dsa_pool_, n);
         const auto gruns = m->slot_gqa_runs(n);   // hy_v3's K / V rows
         runs.insert(runs.end(), gruns.begin(), gruns.end());
+        const auto druns = m->slot_d4_runs(n);    // deepseek4's pooled rows
+        runs.insert(runs.end(), druns.begin(), druns.end());
         int32_t hdr[4] = {};
         int64_t frun = 0;
         if (!get(hdr, sizeof(hdr)) || !get(&frun, 8) || hdr[0] != m->l0_ || hdr[1] != m->l1_ || hdr[2] != n_rec ||
@@ -5202,8 +5265,17 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
             err = "the snapshot did not allocate";
             return false;
         }
+        if (g.dsv4() && m->snap_ == nullptr &&
+            cudaMalloc(&m->snap_, (size_t) m->d4_snap_floats() * sizeof(float)) != cudaSuccess) {
+            cudaGetLastError();
+            m->snap_ = nullptr;
+            cudaSetDevice(dev_);
+            err = "the snapshot did not allocate";
+            return false;
+        }
         std::vector<std::pair<float*, int64_t>> dst;
         if (n_rec > 0) dst.push_back({m->snap_, (int64_t) n_rec * run});
+        if (g.dsv4()) dst.push_back({m->snap_, m->d4_snap_floats()});
         const int64_t pool_rows = (int64_t) m->dsa_layers().size() * 2 * (g.idx_kpool - 1) * g.idx_key;
         if (pool_rows > 0) {
             if (m->snap_pool_ == nullptr && cudaMalloc(&m->snap_pool_, (size_t) pool_rows * sizeof(float)) != cudaSuccess) {
