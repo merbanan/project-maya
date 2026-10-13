@@ -516,17 +516,29 @@ __global__ void __launch_bounds__(256) attn_kernel(const float* q, const float* 
         den += w;
     }
     den = bsum(den, red) + expf(sinks[h] - mx);
-    // the output: thread t dims t and t + 256
-    float o0 = 0.0f, o1 = 0.0f;
-    for (int i = 0; i < n_all; ++i) {
+    // the output: a warp every 8th row (lane l dims l + 32 j, the loads coalesced), the 8 partial sums added in
+    // shared memory - the rows were one serial chain of loads a thread before
+    __syncthreads();   // (sc complete)
+    float acc[kDsv4Hd / 32];
+#pragma unroll
+    for (int j = 0; j < kDsv4Hd / 32; ++j) acc[j] = 0.0f;
+    for (int i = wp; i < n_all; i += 8) {
         const uint16_t* kr = row(i);
         const float w = sc[i];
-        o0 += w * h2f(kr[t]);
-        o1 += w * h2f(kr[t + 256]);
+#pragma unroll
+        for (int j = 0; j < kDsv4Hd / 32; ++j) acc[j] += w * h2f(kr[lane + 32 * j]);
     }
+    float* part = sc + ((n_all + 31) & ~31);   // 8 x kDsv4Hd floats after the scores (dynamic shared memory)
+#pragma unroll
+    for (int j = 0; j < kDsv4Hd / 32; ++j) part[wp * kDsv4Hd + lane + 32 * j] = acc[j];
+    __syncthreads();
     const float id = 1.0f / den;
-    so[t] = o0 * id;
-    so[t + 256] = o1 * id;
+    for (int d = t; d < kDsv4Hd; d += 256) {
+        float v = 0.0f;
+#pragma unroll
+        for (int w8 = 0; w8 < 8; ++w8) v += part[w8 * kDsv4Hd + d];
+        so[d] = v * id;
+    }
     __syncthreads();
     if (t < kDsv4Rot / 2) {   // the output's rope undone (the tail)
         const int d = kDsv4Hd - kDsv4Rot + 2 * t;
@@ -867,7 +879,7 @@ void dsv4_indexer(float* q, const float* w, int n_head, const Dsv4Layer& L, int 
 void dsv4_attn(const float* q, const float* sinks, const Dsv4Layer& L, int n_swa, int pos, const int* sel, int n_sel,
                const Dsv4Rope& rope, float eps, int n_head, float* out, cudaStream_t s) {
     const int n_all = std::min(pos + 1, n_swa) + n_sel;
-    const size_t smem = (size_t) n_all * sizeof(float);
+    const size_t smem = (size_t) (((n_all + 31) & ~31) + 8 * kDsv4Hd) * sizeof(float);   // scores + the warps' sums
     static size_t opted = 48 * 1024;
     if (smem > opted) {
         cudaFuncSetAttribute(attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) std::min<size_t>(smem, 90 * 1024));
