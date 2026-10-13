@@ -315,6 +315,8 @@ struct GqaSelBufs {             // one decode step's selection (shared by the la
     int* mslot = nullptr;
     int* nmiss = nullptr;
     float* ub = nullptr;        // [n_head][max_pages]
+    unsigned int* hm = nullptr; // [n_head]: each head's best bound (order-preserving keys), reset per selection
+    float* sc = nullptr;        // [max_pages]: the pages' scores
     int max_sel = 0;
 };
 /// the summaries of the pages holding positions [pos_lo, pos_hi) from the K rows of src (a plain view: host memory or

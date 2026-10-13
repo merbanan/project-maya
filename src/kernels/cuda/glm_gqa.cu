@@ -886,6 +886,23 @@ __global__ void __launch_bounds__(kD) gqa_summ_kernel(GqaKv src, GqaStream st, i
     o[kD + t] = __float2half(hi > lo ? mx : 0.0f);
 }
 
+// ... the decode's one new position: its row folded into its page's min / max (the page's first position starts them)
+// - O(1) where the kernel above re-reads the whole page (a 64-position page: ~50 us a layer, 4 ms a token on 80 layers)
+__global__ void __launch_bounds__(kD) gqa_summ_one_kernel(GqaKv src, GqaStream st, int pos) {
+    __shared__ float scb[2][64];
+    const int kvh = blockIdx.x, t = threadIdx.x;
+    load_cbs(scb, src.kk, src.vk, t, kD);
+    __syncthreads();
+    const Rows K = k_rows(src, scb[0]);
+    float x[4];
+    K.load4(pos, kvh, t & ~3, x[0], x[1], x[2], x[3]);
+    const float v = x[t & 3];
+    __half* o = (__half*) st.summ + ((size_t) (pos / kGqaPage) * src.n_kv + kvh) * 2 * kD;
+    const bool first = pos % kGqaPage == 0;
+    o[t] = __float2half(first ? v : fminf(__half2float(o[t]), v));
+    o[kD + t] = __float2half(first ? v : fmaxf(__half2float(o[kD + t]), v));
+}
+
 // every query head's bound per page: grid (n_kv, pages / 128), 128 threads (thread = page) -> ub[head][page]
 __global__ void __launch_bounds__(128) gqa_sel_ub_kernel(const float* __restrict__ q, int n_head, int n_kv,
                                                          GqaStream st, int np, float* __restrict__ ub) {
@@ -947,45 +964,146 @@ __global__ void __launch_bounds__(kSelT) gqa_sel_pick_kernel(const float* __rest
         sc[p] = v;
         lo = fminf(lo, v);
     }
-    // the threshold: the largest x with count(score >= x) >= total (scores of unforced pages are <= 0)
-    __shared__ float red[kSelT / 32];
-    lo = wmax(-lo);
-    if (lane == 0) red[w] = lo;
-    __syncthreads();
-    if (t < 32) {
-        float v = t < kSelT / 32 ? red[t] : 0.0f;
-        v = wmax(v);
-        if (t == 0) red[0] = v;
-    }
-    __syncthreads();
-    float a = -red[0] - 1.0f, b = 0.0f;   // count(>= a) = np >= total; count(>= b) may be < total
-    for (int it = 0; it < 40; ++it) {
-        const float mid = 0.5f * (a + b);
-        int c = 0;
-        for (int p = t; p < np; p += kSelT) c += sc[p] >= mid;
-        if (t == 0) cnt = 0;
-        __syncthreads();
-        atomicAdd(&cnt, c);
-        __syncthreads();
-        if (cnt >= total) a = mid; else b = mid;
-        __syncthreads();
-    }
+    // the total best pages: page p is taken when fewer than total pages rank above it (higher score, or the same score
+    // at a lower index) - each thread counts for its pages over the scores in shared memory (np <= ~2K at 128K
+    // context: a few us; the 40-step bisection it replaces took ~70 us a layer, a single-thread radix scan more)
     if (t == 0) cnt = 0;
     __syncthreads();
-    for (int p = t; p < np; p += kSelT)
-        if (sc[p] >= a) {
+    for (int p = t; p < np; p += kSelT) {
+        const float v = sc[p];
+        int above = 0;
+        for (int q2 = 0; q2 < np && above < total; ++q2) {
+            const float u = sc[q2];
+            above += u > v || (u == v && q2 < p);
+        }
+        if (above < total) {
             const int k = atomicAdd(&cnt, 1);
             if (k < max_sel) sel[k] = p;
         }
+    }
+    (void) lo;
     __syncthreads();
     if (t == 0) *nsel = min(cnt, max_sel);
+}
+
+// ---- the selection as three short kernels (the two above, one block for the pick, took 85 us a layer at 406 pages and
+// 340 at 1460 - 7-27 ms a token on 80 layers): reset, the bounds with each head's best, the pick over many blocks
+__device__ __forceinline__ unsigned int sel_key(float f) {
+    const unsigned int u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+__device__ __forceinline__ float sel_val(unsigned int k) {
+    return __uint_as_float((k & 0x80000000u) ? (k & 0x7fffffffu) : ~k);
+}
+__global__ void gqa_sel_init_kernel(unsigned int* hm, int* nsel, int n_head) {
+    if ((int) threadIdx.x < n_head) hm[threadIdx.x] = 0u;   // (below every float's key)
+    if (threadIdx.x == 0) *nsel = 0;
+}
+// the bounds: grid (n_kv, pages / 32), 32 G threads (thread: page t / G of the block's 32, head t % G); the 32 pages'
+// summaries staged in shared memory (coalesced); ub[head][page], and each head's best into hm
+__global__ void __launch_bounds__(32 * kMaxGroup) gqa_sel_ub2_kernel(const float* __restrict__ q, int n_head, int n_kv,
+                                                                    GqaStream st, int np, float* __restrict__ ub,
+                                                                    unsigned int* __restrict__ hm) {
+    __shared__ float sq[kMaxGroup][kD + 1];   // (+1: a warp's 8 heads read the same dimension in 8 banks)
+    __shared__ __half ss[32][2 * kD + 2];     // (+1 word: the 4 pages a warp reads at once fall in different banks)
+    __shared__ float sbest[32 * kMaxGroup / 32][kMaxGroup];
+    const int kvh = blockIdx.x, G = n_head / n_kv, t = threadIdx.x, nt = 32 * G, p0 = blockIdx.y * 32;
+    for (int i = t; i < G * kD; i += nt) sq[i / kD][i % kD] = q[(size_t) kvh * G * kD + i];
+    for (int i = t; i < 32 * kD; i += nt) {   // (half2 units: 32 pages x 128)
+        const int pp = i / kD, c = i % kD;
+        __half2 v = __floats2half2_rn(0.0f, 0.0f);
+        if (p0 + pp < np) v = ((const __half2*) st.summ)[((size_t) (p0 + pp) * n_kv + kvh) * kD + c];
+        *(__half2*) &ss[pp][2 * c] = v;
+    }
+    __syncthreads();
+    const int pp = t / G, g = t % G, page = p0 + pp;
+    float acc = 0.0f;
+    const __half2* sm = (const __half2*) ss[pp];
+#pragma unroll 4
+    for (int d2 = 0; d2 < kD / 2; ++d2) {
+        const float2 mn = __half22float2(sm[d2]), mx = __half22float2(sm[kD / 2 + d2]);
+        const float q0 = sq[g][2 * d2], q1 = sq[g][2 * d2 + 1];
+        acc += fmaxf(q0 * mn.x, q0 * mx.x) + fmaxf(q1 * mn.y, q1 * mx.y);
+    }
+    if (page < np) ub[(size_t) (kvh * G + g) * np + page] = acc;
+    // each head's best of the block's pages: over the warp's pages (lanes g, g + G, ...), then the warps, one atomic
+    // a head (the atomics per page and head serialised on 64 addresses: ~20 us of this kernel)
+    float best = page < np ? acc : -INFINITY;
+    for (int o = G; o < 32; o <<= 1) best = fmaxf(best, __shfl_xor_sync(0xffffffffu, best, o));
+    if ((t & 31) < G) sbest[t >> 5][g] = best;
+    __syncthreads();
+    if (t < G) {
+        float m = -INFINITY;
+        for (int w = 0; w < nt / 32; ++w) m = fmaxf(m, sbest[w][t]);
+        atomicMax(&hm[kvh * G + t], sel_key(m));
+    }
+}
+// the pages' scores: the max over the heads of the bound less the head's best (the first sink and the last recent pages
+// forced) - grid pages / 256
+__global__ void __launch_bounds__(256) gqa_sel_score_kernel(const float* __restrict__ ub,
+                                                            const unsigned int* __restrict__ hm, int n_head, int np,
+                                                            int sink, int recent, float* __restrict__ sc) {
+    __shared__ float shm[64];
+    const int t = threadIdx.x, p = blockIdx.x * 256 + t;
+    if (t < n_head && t < 64) shm[t] = sel_val(hm[t]);
+    __syncthreads();
+    if (p >= np) return;
+    float v;
+    if (p < sink || p >= np - recent) {
+        v = 3.0e38f;
+    } else {
+        v = -INFINITY;
+        for (int h = 0; h < n_head; ++h) v = fmaxf(v, ub[(size_t) h * np + p] - shm[h & 63]);
+    }
+    sc[p] = v;
+}
+// the pick: grid pages / 32, 256 threads - every block reads all the scores into shared memory, ranks its 32 pages
+// (eight threads a page) and appends those that fewer than `total` pages outrank (higher score, or equal at a lower
+// index)
+__global__ void __launch_bounds__(256) gqa_sel_pick2_kernel(const float* __restrict__ scg, int np, int total,
+                                                            int* __restrict__ sel, int* __restrict__ nsel, int max_sel) {
+    extern __shared__ float sc[];   // [np]
+    const int t = threadIdx.x;
+    for (int p = t; p < np; p += 256) sc[p] = scg[p];
+    __syncthreads();
+    const int p = blockIdx.x * 32 + (t >> 3), part = t & 7;
+    int above = 0;
+    if (p < np) {
+        const float v = sc[p];
+        for (int q2 = part; q2 < np; q2 += 8) {
+            const float u = sc[q2];
+            above += u > v || (u == v && q2 < p);
+        }
+    }
+    above += __shfl_xor_sync(0xffffffffu, above, 1);
+    above += __shfl_xor_sync(0xffffffffu, above, 2);
+    above += __shfl_xor_sync(0xffffffffu, above, 4);
+    if (p < np && part == 0 && above < total) {
+        const int k = atomicAdd(nsel, 1);
+        if (k < max_sel) sel[k] = p;
+    }
+}
+__global__ void gqa_sel_all_kernel(int np, int* sel, int* nsel) {
+    for (int p = threadIdx.x; p < np; p += blockDim.x) sel[p] = p;
+    if (threadIdx.x == 0) *nsel = np;
 }
 
 // one block of 1024: the selected pages already cached are marked used by this step (and referenced); the others are
 // claimed CLOCK's victims (never a slot this step uses) -> miss / mslot / nmiss for the copy below
 __global__ void __launch_bounds__(1024) gqa_resolve_kernel(GqaStream st, GqaSelBufs b) {
+    // the slots' tables in shared memory while CLOCK sweeps them (thread 0's steps were global round trips: ~50 us a
+    // layer); written back at the end
+    extern __shared__ int sm_tab[];   // [3][R]: epoch, reference bit, page
+    int* s_epoch = sm_tab;
+    int* s_ref = sm_tab + st.R;
+    int* s_page = sm_tab + 2 * st.R;
     __shared__ int s_ep, s_nm;
     const int t = threadIdx.x;
+    for (int i = t; i < st.R; i += 1024) {
+        s_epoch[i] = st.sepoch[i];
+        s_ref[i] = st.sref[i];
+        s_page[i] = st.spage[i];
+    }
     if (t == 0) {
         s_ep = ++st.ctl[1];
         s_nm = 0;
@@ -995,44 +1113,47 @@ __global__ void __launch_bounds__(1024) gqa_resolve_kernel(GqaStream st, GqaSelB
     for (int i = t; i < ns; i += 1024) {
         const int p = b.sel[i], sl = st.ptab[p];
         if (sl >= 0) {
-            st.sepoch[sl] = ep;
-            st.sref[sl] = 1;
+            s_epoch[sl] = ep;
+            s_ref[sl] = 1;
         } else {
             b.miss[atomicAdd(&s_nm, 1)] = p;
         }
     }
     __syncthreads();
-    if (t != 0) return;
-    int hand = st.ctl[0];
-    for (int k = 0; k < s_nm; ++k) {
-        int sl = -1;
-        for (int step = 0; step < 4 * st.R; ++step) {
-            const int c = hand;
-            hand = hand + 1 == st.R ? 0 : hand + 1;
-            if (st.sepoch[c] == ep) continue;
-            if (st.sref[c]) {
-                st.sref[c] = 0;
-                continue;
+    if (t == 0) {
+        int hand = st.ctl[0], k = 0;
+        for (; k < s_nm; ++k) {
+            int sl = -1;
+            for (int step = 0; step < 4 * st.R; ++step) {
+                const int c = hand;
+                hand = hand + 1 == st.R ? 0 : hand + 1;
+                if (s_epoch[c] == ep) continue;
+                if (s_ref[c]) {
+                    s_ref[c] = 0;
+                    continue;
+                }
+                sl = c;
+                break;
             }
-            sl = c;
-            break;
+            if (sl < 0) break;   // (cannot happen: R exceeds the largest selection)
+            const int old = s_page[sl];
+            if (old >= 0) st.ptab[old] = -1;
+            const int p = b.miss[k];
+            s_page[sl] = p;
+            st.ptab[p] = sl;
+            s_epoch[sl] = ep;
+            s_ref[sl] = 1;
+            b.mslot[k] = sl;
         }
-        if (sl < 0) {   // (cannot happen: R exceeds the largest selection)
-            *b.nmiss = k;
-            st.ctl[0] = hand;
-            return;
-        }
-        const int old = st.spage[sl];
-        if (old >= 0) st.ptab[old] = -1;
-        const int p = b.miss[k];
-        st.spage[sl] = p;
-        st.ptab[p] = sl;
-        st.sepoch[sl] = ep;
-        st.sref[sl] = 1;
-        b.mslot[k] = sl;
+        st.ctl[0] = hand;
+        *b.nmiss = k;
     }
-    st.ctl[0] = hand;
-    *b.nmiss = s_nm;
+    __syncthreads();
+    for (int i = t; i < st.R; i += 1024) {
+        st.sepoch[i] = s_epoch[i];
+        st.sref[i] = s_ref[i];
+        st.spage[i] = s_page[i];
+    }
 }
 
 // grid max_sel, 256 threads: block k copies miss k's page (kGqaPage records of slice bytes) from host memory
@@ -1741,22 +1862,45 @@ void gqa_stream_summarize(const GqaKv& src, const GqaStream& st, int pos_lo, int
     GqaKv v = src;
     v.ptab = nullptr;
     v.sel = nullptr;
-    gqa_summ_kernel<<<dim3(p1 - p0, src.n_kv), kD, 0, s>>>(v, st, p0, pos_hi);
+    if (pos_hi - pos_lo == 1)   // (the decode: rounding the summary through FP16 once a position, as the full re-read did)
+        gqa_summ_one_kernel<<<src.n_kv, kD, 0, s>>>(v, st, pos_lo);
+    else
+        gqa_summ_kernel<<<dim3(p1 - p0, src.n_kv), kD, 0, s>>>(v, st, p0, pos_hi);
     check("gqa_stream_summarize");
 }
 
 void gqa_stream_select(const float* q, int n_head, int n_kv, const GqaStream& st, int n_pos, int budget_pages,
                        int sink_pages, int recent_pages, const GqaSelBufs& b, cudaStream_t s) {
     const int np = (n_pos + kGqaPage - 1) / kGqaPage;
-    if (np > sink_pages + recent_pages + budget_pages)
+    const int total = std::min(np, sink_pages + recent_pages + budget_pages);
+    static const bool old_sel = getenv("STRATA_GLM_KV_SEL1") != nullptr;   // (A/B: the one-block kernels)
+    if (total >= np) {
+        gqa_sel_all_kernel<<<1, 1024, 0, s>>>(np, b.sel, b.nsel);
+    } else if (old_sel || b.hm == nullptr || b.sc == nullptr || n_head > 64 || n_head / n_kv > 16) {
         gqa_sel_ub_kernel<<<dim3(n_kv, (np + 127) / 128), 128, 0, s>>>(q, n_head, n_kv, st, np, b.ub);
-    gqa_sel_pick_kernel<<<1, kSelT, (size_t) np * sizeof(float), s>>>(b.ub, n_head, np, budget_pages, sink_pages,
-                                                                     recent_pages, b.sel, b.nsel, b.max_sel);
+        gqa_sel_pick_kernel<<<1, kSelT, (size_t) np * sizeof(float), s>>>(b.ub, n_head, np, budget_pages, sink_pages,
+                                                                         recent_pages, b.sel, b.nsel, b.max_sel);
+    } else {
+        gqa_sel_init_kernel<<<1, 64, 0, s>>>(b.hm, b.nsel, n_head);
+        gqa_sel_ub2_kernel<<<dim3(n_kv, (np + 31) / 32), 32 * (n_head / n_kv), 0, s>>>(q, n_head, n_kv, st, np, b.ub,
+                                                                                         b.hm);
+        gqa_sel_score_kernel<<<(np + 255) / 256, 256, 0, s>>>(b.ub, b.hm, n_head, np, sink_pages, recent_pages, b.sc);
+        gqa_sel_pick2_kernel<<<(np + 31) / 32, 256, (size_t) np * sizeof(float), s>>>(b.sc, np, total, b.sel, b.nsel,
+                                                                                     b.max_sel);
+    }
     check("gqa_stream_select");
 }
 
 void gqa_stream_resolve(const GqaStream& st, int slice, const GqaSelBufs& b, cudaStream_t s) {
-    gqa_resolve_kernel<<<1, 1024, 0, s>>>(st, b);
+    const size_t tab = (size_t) 3 * st.R * sizeof(int);
+    if (tab > 48 * 1024) {
+        static bool opted = false;
+        if (!opted) {
+            cudaFuncSetAttribute(gqa_resolve_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) std::min<size_t>(tab, 96 * 1024));
+            opted = true;
+        }
+    }
+    gqa_resolve_kernel<<<1, 1024, tab, s>>>(st, b);
     gqa_page_copy_kernel<<<b.max_sel, 256, 0, s>>>(st, b, slice);
     check("gqa_stream_resolve");
 }
