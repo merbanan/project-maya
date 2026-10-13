@@ -4,10 +4,12 @@
 #include "strata/kernels/glm_dsv4.hpp"
 
 #include <cuda_fp16.h>
+#include <mma.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 
 namespace strata::kernels::glmf {
 namespace {
@@ -315,6 +317,55 @@ __global__ void __launch_bounds__(256) idx_score_kernel(const float* q, const fl
     }
 }
 
+// The same on the tensor cores: q and the pooled keys are FP4 codes times a power of two, exact in FP16, so the
+// products are exact and only the F32 summation order differs.  Block: 4 warps of 16 rows; a warp stages its rows
+// (4-byte loads: the rows are only 4-byte aligned in the state), S (16 rows x 64 heads) = K . Q^T by WMMA, then
+// relu * w summed over the heads, a row per lane pair... a warp reduction a row.
+constexpr int kTcRows = 64, kTcLdK = kDsv4Ihd + 8, kTcLdS = 64 + 4;
+__global__ void __launch_bounds__(128) idx_score_tc_kernel(const float* q, const float* w, const uint16_t* k,
+                                                           int n_comp, float wscale, float* score) {
+    using namespace nvcuda;
+    __shared__ __align__(32) __half sq[64 * kTcLdK];
+    static_assert(16 * kTcLdK * 2 == 16 * kTcLdS * 4, "a warp's key tile and score tile share their buffer");
+    __shared__ __align__(32) unsigned char buf[4][16 * kTcLdK * 2];   // the warp's K rows, then its S rows
+    const int t = threadIdx.x, lane = t & 31, wp = t >> 5;
+    for (int i = t; i < 64 * kDsv4Ihd; i += 128) sq[(i / kDsv4Ihd) * kTcLdK + i % kDsv4Ihd] = __float2half(q[i]);
+    const int r0 = blockIdx.x * kTcRows + wp * 16;
+    __half* K = (__half*) buf[wp];
+    float* S = (float*) buf[wp];
+    const uint32_t* k32 = (const uint32_t*) k;
+    for (int i = lane; i < 16 * kDsv4Ihd / 2; i += 32) {   // 16 rows x 64 words
+        const int r = i / (kDsv4Ihd / 2), wd = i % (kDsv4Ihd / 2);
+        const uint32_t v = r0 + r < n_comp ? k32[(size_t) (r0 + r) * (kDsv4Ihd / 2) + wd] : 0u;
+        *(uint32_t*) (K + r * kTcLdK + 2 * wd) = v;
+    }
+    __syncthreads();
+    if (r0 >= n_comp) return;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+#pragma unroll
+    for (int n = 0; n < 4; ++n) wmma::fill_fragment(acc[n], 0.0f);
+#pragma unroll
+    for (int kk = 0; kk < kDsv4Ihd / 16; ++kk) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+        wmma::load_matrix_sync(fa, K + kk * 16, kTcLdK);
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+            wmma::load_matrix_sync(fb, sq + (n * 16) * kTcLdK + kk * 16, kTcLdK);
+            wmma::mma_sync(acc[n], fa, fb, acc[n]);
+        }
+    }
+    __syncwarp();   // (every lane's K fragments are loaded)
+#pragma unroll
+    for (int n = 0; n < 4; ++n) wmma::store_matrix_sync(S + n * 16, acc[n], kTcLdS, wmma::mem_row_major);
+    __syncwarp();
+    const float w0 = w[lane] * wscale, w1 = w[lane + 32] * wscale;
+    for (int r = 0; r < 16 && r0 + r < n_comp; ++r) {
+        const float v = wsum(fmaxf(S[r * kTcLdS + lane], 0.0f) * w0 + fmaxf(S[r * kTcLdS + lane + 32], 0.0f) * w1);
+        if (lane == 0) score[r0 + r] = v;
+    }
+}
+
 // the top k of n scores (any order): a radix select on the order-preserving keys (3 passes of 11 / 11 / 10 bits), then
 // every key above the threshold and the lowest-indexed equal ones.  One block of 1024 threads.
 __device__ __forceinline__ uint32_t okey(float f) {
@@ -344,18 +395,35 @@ __global__ void __launch_bounds__(1024) topk_kernel(const float* score, int n, i
             if ((key & msk) == pre) atomicAdd(&hist[(key >> sh) & (uint32_t) (nb - 1)], 1u);
         }
         __syncthreads();
-        if (t == 0) {   // from the top bin down: the bin where the count reaches s_need
-            int need = s_need, b = nb - 1;
-            for (; b > 0; --b) {
-                if ((int) hist[b] >= need) break;
-                need -= (int) hist[b];
+        // from the top bin down, the bin where the count reaches s_need: suffix sums of the bins (a block scan over
+        // the bins in descending order, two a thread), then the one thread whose bin crosses it
+        {
+            __shared__ int s_suf[1024];
+            const int per = nb / 1024;   // 2 or 1 bins a thread (nb 2048 / 1024)
+            int c = 0;
+            for (int j = 0; j < per; ++j) c += (int) hist[nb - 1 - (t * per + j)];
+            s_suf[t] = c;
+            __syncthreads();
+            for (int off = 1; off < 1024; off <<= 1) {
+                const int v = t >= off ? s_suf[t - off] : 0;
+                __syncthreads();
+                s_suf[t] += v;
+                __syncthreads();
             }
-            s_bin = b;
-            s_need = need;
-            s_prefix = pre | ((uint32_t) b << sh);
-            s_mask = msk | ((uint32_t) (nb - 1) << sh);
+            const int need0 = s_need;
+            int above = s_suf[t] - c;   // the keys in the bins above this thread's
+            for (int j = 0; j < per; ++j) {
+                const int b = nb - 1 - (t * per + j), h = (int) hist[b];
+                if (above < need0 && above + h >= need0) {   // (exactly one bin; bin 0 takes the rest)
+                    s_bin = b;
+                    s_need = need0 - above;
+                    s_prefix = pre | ((uint32_t) b << sh);
+                    s_mask = msk | ((uint32_t) (nb - 1) << sh);
+                }
+                above += h;
+            }
+            __syncthreads();
         }
-        __syncthreads();
     }
     // the threshold key is s_prefix; s_need of the keys equal to it are taken (the lowest indices)
     const uint32_t thr = s_prefix;
@@ -367,15 +435,24 @@ __global__ void __launch_bounds__(1024) topk_kernel(const float* score, int n, i
     for (int i = t; i < n; i += 1024)
         if (okey(score[i]) > thr) sel[atomicAdd(&s_out, 1)] = i;
     __syncthreads();
-    // the equal ones in index order: one thread (they are few unless the scores tie at large scale)
-    if (t == 0) {
-        int o = s_out, need = s_need;
-        for (int i = 0; i < n && need > 0; ++i)
-            if (okey(score[i]) == thr) {
-                sel[o++] = i;
-                --need;
-            }
+    // the equal ones in index order: a thread a contiguous chunk, a block prefix sum of their counts, then each thread
+    // writes the ones that still fit (was one thread over all n: most of the indexer's time)
+    __shared__ int s_cnt[1024];
+    const int chunk = (n + 1023) / 1024, lo = t * chunk, hi = min(n, lo + chunk);
+    int cnt = 0;
+    for (int i = lo; i < hi; ++i) cnt += okey(score[i]) == thr;
+    s_cnt[t] = cnt;
+    __syncthreads();
+    for (int off = 1; off < 1024; off <<= 1) {   // inclusive scan
+        const int v = t >= off ? s_cnt[t - off] : 0;
+        __syncthreads();
+        s_cnt[t] += v;
+        __syncthreads();
     }
+    int before = s_cnt[t] - cnt;
+    const int need = s_need, base = s_out;
+    for (int i = lo; i < hi && before < need; ++i)
+        if (okey(score[i]) == thr) sel[base + before++] = i;
 }
 
 // ---- the attention: one block a head (256 threads), the scores in dynamic shared memory
@@ -819,8 +896,13 @@ void dsv4_indexer(float* q, const float* w, int n_head, const Dsv4Layer& L, int 
         return;
     }
     idx_q_kernel<<<n_head, kDsv4Ihd, 0, s>>>(q, rope, pos);
-    idx_score_kernel<<<(n_comp + kIdxRows - 1) / kIdxRows, 256, 0, s>>>(
-        q, w, L.icomp, n_comp, 1.0f / std::sqrt((float) (kDsv4Ihd * n_head)), score);
+    static const bool scalar = getenv("STRATA_DSV4_IDX_SCALAR") != nullptr;   // (the F32 kernel, for comparison)
+    if (scalar)
+        idx_score_kernel<<<(n_comp + kIdxRows - 1) / kIdxRows, 256, 0, s>>>(
+            q, w, L.icomp, n_comp, 1.0f / std::sqrt((float) (kDsv4Ihd * n_head)), score);
+    else
+        idx_score_tc_kernel<<<(n_comp + kTcRows - 1) / kTcRows, 128, 0, s>>>(
+            q, w, L.icomp, n_comp, 1.0f / std::sqrt((float) (kDsv4Ihd * n_head)), score);
     topk_kernel<<<1, 1024, 0, s>>>(score, n_comp, top_k, sel);
     check("indexer");
 }
