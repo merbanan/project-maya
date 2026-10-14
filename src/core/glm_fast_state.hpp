@@ -263,6 +263,7 @@ struct Glm5Model::FastState {
     size_t arena_bytes = 0;
     // activations (device)
     float *x = nullptr, *mixer = nullptr, *ffn = nullptr, *pre = nullptr, *post = nullptr, *comb = nullptr;
+    float* defer_post = nullptr;   // STRATA_GLM_DEFER_CPU: the deferred layer's FFN-side post weights (8 floats)
     float* part = nullptr;
     unsigned int* counter = nullptr;
     void* xq = nullptr;
