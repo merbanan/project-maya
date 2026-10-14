@@ -959,6 +959,20 @@ static int glm_pack_generate(const Options& o) {
         std::signal(SIGTERM, SIG_IGN);
         std::signal(SIGINT, SIG_IGN);
         std::signal(SIGPIPE, SIG_IGN);
+#if defined(__linux__)
+        // a server that dies while the engine still starts (it installs its SIGTERM handler, which ends the engine
+        // with QUIT, only once the engine is up) took ~40 s to free the GPU: the engine loaded and warmed its tiers
+        // before it read its input and saw the server gone.  A watchdog ends it once its parent process is gone (the
+        // parent changes: reparented).  Not PR_SET_PDEATHSIG: that follows the parent THREAD, and the server restarts a
+        // dead engine from a request's thread, which ends.
+        const pid_t parent = getppid();
+        std::thread([parent] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                if (getppid() != parent) std::_Exit(1);
+            }
+        }).detach();
+#endif
     }
 #endif
     strata::core::Glm5Model model;
