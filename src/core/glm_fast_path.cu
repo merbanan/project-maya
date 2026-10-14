@@ -168,6 +168,31 @@ static std::vector<std::pair<int, std::vector<int>>> cpu_groups() {
     return out;
 }
 
+// this process's CPUs by L3 cache (a Ryzen's CCDs on one NUMA node): {index, CPUs}, empty without the sysfs entries
+static std::vector<std::pair<int, std::vector<int>>> cpu_l3_groups() {
+    std::vector<std::pair<int, std::vector<int>>> out;
+#ifdef __linux__
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof set, &set) != 0) return out;
+    std::vector<std::string> seen;
+    for (int c = 0; c < CPU_SETSIZE; ++c) {
+        if (!CPU_ISSET(c, &set)) continue;
+        std::string list;
+        std::ifstream("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/cache/index3/shared_cpu_list") >> list;
+        if (list.empty()) return {};
+        const auto it = std::find(seen.begin(), seen.end(), list);
+        if (it == seen.end()) {
+            seen.push_back(list);
+            out.push_back({(int) out.size(), {c}});
+        } else {
+            out[(size_t) (it - seen.begin())].second.push_back(c);
+        }
+    }
+#endif
+    return out;
+}
+
 // a CPU's physical core (package, core id): its SMT siblings share it
 static std::pair<int, int> cpu_core(int cpu) {
     int pkg = cpu, core = cpu;
@@ -2494,8 +2519,11 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         const char* v = getenv("STRATA_GLM_WIN_LANES");
         return v == nullptr ? 2 : std::atoi(v);
     }();
+    // STRATA_GLM_WIN_L3=1: one NUMA node of several L3 domains (a Ryzen's two CCDs) - the lanes a domain each
+    static const bool win_l3 = getenv("STRATA_GLM_WIN_L3") != nullptr && std::atoi(getenv("STRATA_GLM_WIN_L3")) != 0;
     if (!shared && n_parts_ == 1 && dflash_on_ && win_lanes != 0) {
-        const auto groups = cpu_groups();
+        auto groups = cpu_groups();
+        if (win_l3 && groups.size() < 2) groups = cpu_l3_groups();   // (the GPU's lane: the first domain)
         if (groups.size() >= 2 && groups[0].first >= 0) {
             const int gn = gpu_numa_node(dev_);
             size_t a = 0;
@@ -4409,6 +4437,16 @@ bool Glm5Model::fast_boundary(std::string& err) {
         constexpr uint32_t bg_ratio = 2;
         bool lane_all = F->cpu_plan != 0ull;   // the CPU lane takes every RAM-tier expert of a route
         for (int f = 1; f <= g.n_exp_used && lane_all; ++f) lane_all = (int) ((F->cpu_plan >> (4 * f)) & 15ull) == f;
+        // ... and so do a DFlash verify window's routes on two CPU lanes (glm_window.cu's all-CPU plan,
+        // STRATA_GLM_WIN_ALLCPU): no route promotes then, so the swaps below keep the VRAM tier following the
+        // conversation (without them a V100's Maya-S24 hit rate fell from 63-68% to 41-45% over 256 tokens)
+        static const bool win_all_cpu = [] {
+            const char* v = getenv("STRATA_GLM_WIN_ALLCPU");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        if (!lane_all && win_all_cpu && dflash_on_ && F->cpu_plan != 0ull && F->win_lane[0] != nullptr &&
+            F->win_lane[1] != nullptr)
+            lane_all = true;
         // (the refill into FREE slots runs whatever the plan: a slot a prompt's lending gave back holds nothing - a
         // split whose cards send one of 7-8 RAM-tier experts over PCIe left ~13% of VRAM empty after a long prompt;
         // the swaps below stay with the all-CPU plan, beside which the routes' own promotions do not run)
