@@ -1,0 +1,74 @@
+# Benchmarks (one Tesla V100-PCIE 32 GB)
+
+The models this fork runs, measured on one machine: a **Tesla V100-PCIE 32 GB** (sm_70, HBM2 ~900 GB/s), 2x
+Xeon, 62 GB RAM, one NVMe. Greedy decoding unless a row says otherwise; "decode" counts committed tokens a second
+over the answer, "prompt" the prompt's tokens a second. llama.cpp is the same GGUF in the llama.cpp server on the
+same GPU (`-ngl 99 -fa on`), as a reference.
+
+**Heat:** this V100 throttles under sustained load (81-83 C, SM clock 1380 -> 600-900 MHz). Numbers taken after a
+long prefill (the long-context rows) run at a lower clock than the short ones; compare within a row.
+
+Engines: `strata-dense` (branch `qwen38`) for the dense / small-MoE Qwen3.5-architecture models, the GLM fast path
+(`strata --glm-pack`) for GLM-5.3-Flash, Hy3 and DeepSeek-V4 Flash (branches `hy3`, `dsv4`).
+
+## Qwen3.8-27B (dense GDN hybrid) - unsloth Q4_K_M, `strata-dense`
+
+| Setting | Prompt (tok/s) | Decode (tok/s) | Notes |
+|---|---:|---:|---|
+| llama.cpp | 681 (1.6K) | 31.4 | |
+| no drafts | 1,017 (1.6K) / 1,063 (12K, chunk 2048) | 29.1 | one-token GEMV on the packed layout; 33.4 with the dp4a GEMV (`STRATA_DENSE_PACK=0`) |
+| MTP, 3 drafts | | 47.9 | 2.61 tokens a round |
+| MTP, 7 drafts | | 48.7 | 3.20 tokens a round |
+| **DFlash2, 7 drafts** | | **96.6** (code answer) / 69.4 (after a 1.6K prompt) | 4.47 / 3.75 tokens a round |
+| DFlash2, sampled (T 0.6, top-k 20) | | 73.9 | 3.46 tokens a round |
+| DFlash2 through `serve/server.py` (T 0.6) | | 70-90 | |
+
+Long context (needles 3/3 at every length):
+
+| Context | KV | Prompt (tok/s) | Decode, no drafts | Decode, DFlash2 |
+|---|---|---:|---:|---:|
+| 30K | FP16 | 931 | 28.5 | 75.5 |
+| 60K | FP16 | 747 | 13.6 | 49.5 |
+| 94K | FP16 | 502 | 9.1 | 34.3 |
+| 28-30K | K8V4 | 811-916 | 26.3-28.2 | |
+
+A decode step at 90K: 106 ms FP16, 65 ms K8V4 (the K/V read is ~2.5x smaller). Prefix checkpoints: the second turn
+of a 19.7K-token conversation whose history drops the first answer's reasoning reads 25 tokens (0.35 s) instead of
+19.7K (20.2 s).
+
+Verify window cost (1K context): 1 token 37.6 ms, 8 tokens 40.6 ms (`STRATA_DENSE_BENCH`).
+
+## Qwen3.6-35B-A3B (MoE GDN hybrid) - unsloth UD-Q4_K_M, `strata-dense`
+
+| Setting | Prompt (tok/s) | Decode (tok/s) | Notes |
+|---|---:|---:|---|
+| llama.cpp | 731 (1.6K) | 88.6 | |
+| no drafts | 2,333 (1.6K) / 2,075 (28K) / 1,443 (94K) | 79.5 (short) / 70.3 (28K) / 57.5 (94K) | needles 3/3 at 28K and 94K |
+| MTP, 3 drafts (unsloth `-MTP-GGUF`) | | 139.2 | 2.78 tokens a round |
+| MTP, 5 drafts | | 135.7 | 3.31 tokens a round |
+| **DFlash2, 7 drafts** (incoai/Qwen3.6-35B-A3B-DFlash2) | | **191.8** (code answer) / 151.9 (after 1.6K) | 4.83 / 4.64 tokens a round |
+| DSpark (LithosAI NVFP4) | | | not yet |
+
+## DeepSeek-V4 Flash - antirez IQ2_XXS (80.8 GB), GLM fast path (`dsv4`)
+
+| Context | Prompt (tok/s) | Decode (tok/s) | Notes |
+|---|---:|---:|---|
+| short (warm usage profile) | | 46-49 | 29.8 cold |
+| 28-30K | 500 | 22.3 | indexer 1.0 ms a token (was 9.5) |
+| 65K | ~370 | 20.7 | |
+| 93K | 312 | 19.9 | was 14.5 before the indexer top-k fix; needles 3/3 |
+
+## GLM-5.3-Flash - Maya-S24 (94.7 GB), live Maya (v1.0.30 + PR #78)
+
+| Setting | Prompt (tok/s) | Decode (tok/s) | Notes |
+|---|---:|---:|---|
+| v1.0.30 / v1.1.3 | ~290 (2K) / ~585 (8K) | 26-27 | |
+| `STRATA_GLM_TRUNK_KEEP=7` | | 28.7 | KL 0.0136 (changes the answers) |
+| at 60K, trunk keep map | | 28.4 (vs 24.4) | KL 0.0175 |
+
+## Hy3 (Hunyuan 3) - `hy3`
+
+| Context | Decode (tok/s) | Notes |
+|---|---:|---|
+| 93K | 7.84 | non-streamed KV |
+| 93K, KV streaming (16K / 32K cache) | 10.15 / 10.41 | disk reads 21-24 a token from RAM pressure |

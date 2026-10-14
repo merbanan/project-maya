@@ -88,6 +88,8 @@ struct Dflash {
     bool on = false;
     int n_layer = 0, n_head = 0, n_kv = 0, block = 0, taps = 0, group = 0, rank = 0, top_k = 0, window = 2048;
     int mask_tok = 0, n_cand = 0;                     // candidates come from ids [0, n_cand)
+    int n_ff = 0;                                     // the drafter's MLP width (its own: a MoE target's differs)
+    float *g = nullptr, *u = nullptr, *hh = nullptr;  // its MLP rows (block x n_ff)
     float eps = 1e-6f, theta = 1e7f;
     std::vector<int> target_layers;
     QMat fc, hproj;
@@ -165,6 +167,7 @@ struct DenseModel::Impl {
     int host_tensors = 0;
     cudaStream_t stream = nullptr;
     int chunk = 512;                                // the largest T of a forward pass
+    int max_in = 0;                                 // the widest input the activation conversions are sized for
     int kv_mode = 0;                                // the K / V cache: 0 FP16, 1 K8V4 (STRATA_DENSE_KV / --kv)
 
     QMat embd;                                      // token_embd, on the device (rows dequantized per token)
@@ -816,6 +819,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         // ---- 5. activations and scratch
         const uint64_t R = (uint64_t) I.chunk, f = 4;
         const int max_in = std::max({E, cfg_.n_ff, V, H * D, 2 * E, 5 * E});   // (5 E: the DFlash2 drafter's fc)
+        I.max_in = max_in;
         bool ok = I.alloc(&I.q8_1, native_q8_1_bytes(max_in, kMaxCols), err, "q8_1 scratch") &&
                   I.alloc(&I.xh, R * max_in * 2, err, "fp16 activations") &&
                   I.alloc(&I.x, R * E * f, err, "x") && I.alloc(&I.xn, R * E * f, err, "xn") &&
@@ -1182,6 +1186,7 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
             return false;
         }
         F.n_layer = (int) num("block_count", 0);
+        F.n_ff = (int) num("feed_forward_length", cfg_.n_ff);
         F.n_head = (int) num("attention.head_count", 0);
         F.n_kv = (int) num("attention.head_count_kv", 0);
         F.block = (int) num("dflash.block_size", 8);
@@ -1263,8 +1268,8 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
                 !mat(P + "attn_v.weight", E, kvd, L.v) || !mat(P + "attn_output.weight", qd, E, L.o) ||
                 !mat(P + "attn_conv.proj.weight", E, cdyn, L.attn_conv) ||
                 !mat(P + "ffn_conv.proj.weight", E, cdyn, L.ffn_conv) ||
-                !mat(P + "ffn_gate.weight", E, cfg_.n_ff, L.gate) || !mat(P + "ffn_up.weight", E, cfg_.n_ff, L.up) ||
-                !mat(P + "ffn_down.weight", cfg_.n_ff, E, L.down))
+                !mat(P + "ffn_gate.weight", E, F.n_ff, L.gate) || !mat(P + "ffn_up.weight", E, F.n_ff, L.up) ||
+                !mat(P + "ffn_down.weight", F.n_ff, E, L.down))
                 return false;
             const uint64_t rb = (uint64_t) F.window * kvd * 2;
             if (!I.alloc(&L.Kr, rb, err, "dflash ring") || !I.alloc(&L.Vr, rb, err, "dflash ring")) return false;
@@ -1281,6 +1286,23 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
             !I.alloc(&F.tok, W * 4, err, "dflash") || !I.alloc(&F.conf, W * 4, err, "dflash") ||
             !I.alloc(&F.topk_scratch, (uint64_t) q35_df_topk_scratch((int) W, F.top_k), err, "dflash"))
             return false;
+        if (!I.alloc(&F.g, W * F.n_ff * 4, err, "dflash mlp") || !I.alloc(&F.u, W * F.n_ff * 4, err, "dflash mlp") ||
+            !I.alloc(&F.hh, W * F.n_ff * 4, err, "dflash mlp"))
+            return false;
+        {   // the activation conversions sized for the widest input: the drafter's fc (taps x n_embd), its MLP
+            const int need = std::max(NF * E, F.n_ff);
+            if (need > I.max_in) {
+                for (void* old : {(void*) I.xh, (void*) I.xh8, I.q8_1}) {
+                    cudaFree(old);
+                    I.allocations.erase(std::find(I.allocations.begin(), I.allocations.end(), old));
+                }
+                I.max_in = need;
+                if (!I.alloc(&I.xh, (uint64_t) I.chunk * need * 2, err, "fp16 activations") ||
+                    !I.alloc(&I.xh8, (uint64_t) 8 * need * 2, err, "fp16 rows") ||
+                    !I.alloc(&I.q8_1, native_q8_1_bytes(need, kMaxCols), err, "q8_1 scratch"))
+                    return false;
+            }
+        }
         cudaMemset(F.ring_pos, 0xff, (size_t) F.window * 8);   // -1: no position
         if (cudaDeviceSynchronize() != cudaSuccess) { err = "dflash: upload failed"; return false; }
         F.on = true;
@@ -1361,10 +1383,10 @@ bool DenseModel::dflash_draft(int32_t anchor, int K, std::vector<int32_t>& out, 
             I.mm(L.ffn_conv, F.dyn);
             q35_df_conv(I.xn, F.dyn, cdyn, L.ffn_base, 0, W, E, F.taps, F.group, F.a, s);
             I.prep(F.a, E, W);
-            I.mm(L.gate, I.ffn_g);
-            I.mm(L.up, I.ffn_u);
-            dense_swiglu(I.ffn_g, I.ffn_u, I.ffn_h, (int64_t) W * cfg_.n_ff, s);
-            I.prep(I.ffn_h, cfg_.n_ff, W);
+            I.mm(L.gate, F.g);
+            I.mm(L.up, F.u);
+            dense_swiglu(F.g, F.u, F.hh, (int64_t) W * F.n_ff, s);
+            I.prep(F.hh, F.n_ff, W);
             I.mm(L.down, I.mix);
             q35_df_conv(I.mix, F.dyn, cdyn, L.ffn_base, 1, W, E, F.taps, F.group, F.a, s);
             q35_add(F.h, F.a, (int64_t) W * E, s);
