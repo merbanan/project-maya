@@ -132,6 +132,10 @@ At 83.5% the expected tokens a round are 1.84 / 2.53 / 3.6 / 4.9: 0.38-0.87x on 
 A gain needs a multi-row token path (dense weights read once, the CPU lane over both rows): ~1.2x at best by the
 decode split (dense ~9 ms, experts ~23 ms a token).
 
+DSv4 decode profile at 2K (35.0 ms a token): CPU-lane wait 8.3, grouped output GEMVs 5.1, attention 3.6, expert
+fetch 3.5, q_b 3.2, expert gate/up + down 4.2, router + shared 1.8, projections 1.7, route 1.5, mHC 1.6. A Q8_0 GEMV
+with 2 / 4 / 8 loads a lane in flight: 27.5 / 27.5 / 26.5 tok/s vs 28.4-28.6 - slower, not kept.
+
 ## GLM-5.3-Flash - Maya-S24 (94.7 GB), live Maya (v1.0.30 + PR #78)
 
 | Setting | Prompt (tok/s) | Decode (tok/s) | Notes |
