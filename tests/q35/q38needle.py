@@ -22,7 +22,9 @@ ap.add_argument("--arg", action="append", default=[])
 ap.add_argument("--ctx", type=int, default=0)
 ap.add_argument("--new", type=int, default=80)
 ap.add_argument("--bin", default="build/strata-dense")
+ap.add_argument("--gguf", default=GGUF)
 a = ap.parse_args()
+GGUF = a.gguf
 
 tk = T.Tokenizer.from_gguf(GGUF)
 rnd = random.Random(7)
@@ -54,8 +56,9 @@ ids = tk.encode("<|im_start|>user\n" + q + "<|im_end|>\n<|im_start|>assistant\n<
 env = dict(os.environ)
 env.update(kv.split("=", 1) for kv in a.env)
 ctx = a.ctx or (len(ids) + a.new + 64)
+errf = open("/tmp/q38needle.err", "w+")   # (a file: a pipe nobody reads fills and stops the engine)
 p = subprocess.Popen([a.bin, "--serve", "--native", GGUF, "--context", str(ctx)] + a.arg, stdin=subprocess.PIPE,
-                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+                     stdout=subprocess.PIPE, stderr=errf, text=True, env=env)
 for line in p.stdout:
     if line.startswith(("READY", "ERR")):
         break
@@ -75,7 +78,8 @@ try:
     p.wait(timeout=30)
 except subprocess.TimeoutExpired:
     p.kill()
-err = p.stderr.read()
+errf.seek(0)
+err = errf.read()
 ans = tk.decode(gen)
 ok = [k in ans for k in ("MARIGOLD-4471", "Troms", "93.62")]
 f = done.split()

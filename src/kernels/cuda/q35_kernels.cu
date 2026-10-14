@@ -606,7 +606,7 @@ void q35_attn_prep(const float* q_full, int ldq, const float* k, const float* v,
 }
 
 namespace {
-constexpr int kSplitLen = 1024;
+constexpr int kSplitLen = 128;   // the shortest split (a decode step at a short context still spreads)
 }
 
 int64_t q35_attn_scratch_floats(int T, int n_head, int D, int max_ctx) {

@@ -111,4 +111,9 @@ void q35_mmt_dequant_packed(int ggml_type, const void* packed, int K, int N, int
 void q35_mmtp(int ggml_type, const void* packed, const uint16_t* xh8, float* y, int K, int N, int M, float* part,
               void* stream);
 
+/// The MoE decode's expert GEMVs: for each pair p, y[p] (N) = W_e . x[row] with e = pair_exp[p], row = pair_row[p]:
+/// W_base the stacked experts in GGUF rows (expert e at e * expert_bytes), xh FP16 rows of K.  part: splits x P x N.
+void q35_mmt_pairs(int ggml_type, const void* W, size_t expert_bytes, const int32_t* pair_exp, const int32_t* pair_row,
+                   const uint16_t* xh, float* y, int K, int N, int P, float* part, void* stream);
+
 }  // namespace strata::kernels

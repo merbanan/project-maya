@@ -42,7 +42,8 @@ def eng_tokens(binary, ids, n_new, ctx, env, extra):
     for line in p.stdout:
         if line.startswith("READY") or line.startswith("ERR"):
             print(line.strip()); break
-    p.stdin.write(f"GEN {n_new} temperature=0 ignore_eos=1 " + ",".join(map(str, ids)) + "\n"); p.stdin.flush()
+    samp = os.environ.get("Q38_SAMPLING", "temperature=0")
+    p.stdin.write(f"GEN {n_new} {samp} ignore_eos=1 " + ",".join(map(str, ids)) + "\n"); p.stdin.flush()
     toks = []
     for line in p.stdout:
         if line.startswith("T "): toks.append(int(line.split()[1]))
@@ -63,7 +64,9 @@ def main():
     ap.add_argument("--new", type=int, default=64); ap.add_argument("--ctx", type=int, default=8192)
     ap.add_argument("--bin", default="build/strata-dense"); ap.add_argument("--env", action="append", default=[])
     ap.add_argument("--arg", action="append", default=[]); ap.add_argument("--no-ref", action="store_true")
+    ap.add_argument("--gguf", default=GGUF)
     a = ap.parse_args()
+    globals()["GGUF"] = a.gguf
     tok = Tokenizer.from_gguf(GGUF)
     text = open(a.prompt_file).read() if a.prompt_file else DEFAULT_PROMPT
     if a.repeat > 1:

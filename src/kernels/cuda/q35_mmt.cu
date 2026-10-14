@@ -261,6 +261,87 @@ __global__ void __launch_bounds__(kW * 32) mmt_kernel(const uint8_t* __restrict_
     }
 }
 
+template <int TYPE>
+__global__ void __launch_bounds__(kW * 32) mmt_pairs_kernel(const uint8_t* __restrict__ W_base, size_t row_bytes,
+                                                      size_t expert_bytes, const int32_t* __restrict__ pair_exp,
+                                                      const int32_t* __restrict__ pair_row, const __half* __restrict__ X_all,
+                                                      int K, int N, int P, int sb_per_split, float* __restrict__ out) {
+    // pair blockIdx.z: its expert's matrix, its input row (1 row: M = 1)
+    const int M = 1, pz = blockIdx.z;
+    const uint8_t* W = W_base + (size_t) pair_exp[pz] * expert_bytes;
+    const __half* X = X_all + (size_t) pair_row[pz] * K;
+    constexpr int RW = row_words<TYPE>(), ST = stride<TYPE>(), NT = kW * 32, ROWS = kW * 32;
+    constexpr int PR = (RW + 31) / 32;   // words of a row a lane carries
+    __shared__ uint32_t sw[ROWS * ST];
+    __shared__ __align__(16) __half sx[8 * kXld];
+    const int tid = threadIdx.x, lane = tid & 31, wp = tid >> 5;
+    const int nb0 = blockIdx.x * ROWS;
+    const int nsb = K / 256;
+    const int sb0 = blockIdx.y * sb_per_split, sb1 = min(nsb, sb0 + sb_per_split);
+    const int tok = (lane & 3) + ((lane >> 4) << 2);
+    float c[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t* mine = sw + wp * 32 * ST;   // the warp's 32 rows
+    const int wrow0 = nb0 + wp * 32;
+    // the warp's rows of super-block sb into registers: word wd = lane + 32 p of row r, 32 consecutive words a load
+    // (coalesced); Q6_K blocks that start 2 bytes into a word are realigned here, so the dequant reads whole words
+    uint32_t pf[32][PR];
+    auto fetch = [&](int sb) {
+#pragma unroll
+        for (int r = 0; r < 32; ++r) {
+            const uintptr_t a = (uintptr_t) (W + (size_t) min(wrow0 + r, N - 1) * row_bytes + (size_t) sb * Fmt<TYPE>::bytes);
+            const uint32_t* q = (const uint32_t*) (a & ~(uintptr_t) 3);
+#pragma unroll
+            for (int p = 0; p < PR; ++p) {
+                const int wd = lane + 32 * p;
+                pf[r][p] = wd < RW ? __ldg(q + wd) : 0u;
+            }
+        }
+    };
+    if (sb0 < sb1) fetch(sb0);
+    for (int sb = sb0; sb < sb1; ++sb) {
+        __syncthreads();
+        for (int i = tid; i < 8 * 32; i += NT) {   // X row 0 (the pair's), rows 1..7 zero
+            const int r = i / 32, cc = (i % 32) * 8;
+            *(uint4*) (sx + r * kXld + cc) = r == 0 ? __ldg((const uint4*) (X + (size_t) sb * 256 + cc)) : make_uint4(0, 0, 0, 0);
+        }
+#pragma unroll
+        for (int r = 0; r < 32; ++r) {
+            // Q6_K: a block starting 2 bytes into a word is realigned with the next word (the next lane's)
+            const bool mis = TYPE == 14 && (((uintptr_t) (W + (size_t) min(wrow0 + r, N - 1) * row_bytes +
+                                                          (size_t) sb * Fmt<TYPE>::bytes)) & 3);
+#pragma unroll
+            for (int p = 0; p < PR; ++p) {
+                uint32_t v = pf[r][p];
+                if (TYPE == 14) {
+                    uint32_t nx = __shfl_down_sync(0xffffffffu, v, 1);
+                    if (p + 1 < PR) {
+                        const uint32_t first = __shfl_sync(0xffffffffu, pf[r][p + 1 < PR ? p + 1 : p], 0);
+                        if (lane == 31) nx = first;
+                    }
+                    if (mis) v = __byte_perm(v, nx, 0x5432);
+                }
+                if (lane + 32 * p < RW) mine[r * ST + lane + 32 * p] = v;
+            }
+        }
+        __syncthreads();
+        if (sb + 1 < sb1) fetch(sb + 1);
+        sb_mma<TYPE>(mine + lane * ST, 0, sx + tok * kXld, 0, c);
+    }
+    const int n0 = nb0 + wp * 32;
+    if (n0 >= N) return;
+    // c -> out[(split * M + t) * N + n]
+    const int j = lane & 3, hi = lane >> 4, b = 4 * ((lane >> 2) & 3);
+    const int r0 = b + (j & 1) + 16 * hi, cc = b + (j & 2);
+    const int rl[2] = {r0, r0 + 2}, cl[4] = {cc, cc + 1, cc + 16, cc + 17};
+    const int ci[8][2] = {{0, 0}, {0, 1}, {1, 0}, {1, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int rlane = rl[ci[i][0]], clane = cl[ci[i][1]];
+        const int t = (rlane & 3) + ((rlane >> 4) << 2), n = n0 + clane;
+        if (t < M && n < N) out[((size_t) blockIdx.y * P + pz) * N + n] = c[i];
+    }
+}
+
 // ---- the packed layout (v100-skinny / NInfer's prepacking): rows in groups of 32; a group's super-block sb is a tile
 // of 32 blocks interleaved at 16 bytes - chunk c of lane l's block at (c * 32 + l) * 16 - so a warp's load of chunk c
 // reads 512 contiguous bytes and every lane gets its own row's words, no staging.  Blocks padded to 16 bytes (Q6_K:
@@ -518,6 +599,37 @@ void q35_mmtp(int ggml_type, const void* packed, const uint16_t* xh8, float* y, 
         const int64_t n = (int64_t) M * N;
         reduce_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(part, splits, n, y);
         check("q35_mmtp_reduce");
+    }
+}
+
+void q35_mmt_pairs(int ggml_type, const void* W, size_t expert_bytes, const int32_t* pair_exp, const int32_t* pair_row,
+                   const uint16_t* xh, float* y, int K, int N, int P, float* part, void* stream) {
+    if (P < 1 || K % 256 != 0) throw std::invalid_argument("q35_mmt_pairs: P, K a multiple of 256");
+    const int bytes = fmt_bytes(ggml_type);
+    if (!bytes) throw std::invalid_argument("q35_mmt_pairs: weight type");
+    const size_t row_bytes = (size_t) K / 256 * bytes;
+    const int nsb = K / 256, bx = (N + kW * 32 - 1) / (kW * 32);
+    int splits = std::max(1, std::min(std::min(64, std::max(1, nsb / 2)), (8 * sm_count() + bx * P - 1) / (bx * P)));
+    const int per = (nsb + splits - 1) / splits;
+    splits = (nsb + per - 1) / per;
+    float* dst = splits == 1 ? y : part;
+    if (splits > 1 && (int64_t) splits * P * N > q35_mmt_part_floats(N) * 8) throw std::runtime_error("q35_mmt_pairs: partials");
+    const dim3 grid(bx, splits, P);
+    cudaStream_t s = (cudaStream_t) stream;
+    const __half* X = (const __half*) xh;
+    const uint8_t* w = (const uint8_t*) W;
+    switch (ggml_type) {
+    case 12: mmt_pairs_kernel<12><<<grid, kW * 32, 0, s>>>(w, row_bytes, expert_bytes, pair_exp, pair_row, X, K, N, P, per, dst); break;
+    case 13: mmt_pairs_kernel<13><<<grid, kW * 32, 0, s>>>(w, row_bytes, expert_bytes, pair_exp, pair_row, X, K, N, P, per, dst); break;
+    case 14: mmt_pairs_kernel<14><<<grid, kW * 32, 0, s>>>(w, row_bytes, expert_bytes, pair_exp, pair_row, X, K, N, P, per, dst); break;
+    case 8: mmt_pairs_kernel<8><<<grid, kW * 32, 0, s>>>(w, row_bytes, expert_bytes, pair_exp, pair_row, X, K, N, P, per, dst); break;
+    default: throw std::invalid_argument("q35_mmt_pairs: weight type");
+    }
+    check("q35_mmt_pairs");
+    if (splits > 1) {
+        const int64_t n = (int64_t) P * N;
+        reduce_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(part, splits, n, y);
+        check("q35_mmt_pairs_reduce");
     }
 }
 

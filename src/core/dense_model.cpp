@@ -8,6 +8,8 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/q35_dflash.hpp"
 #include "strata/kernels/q35_kernels.hpp"
+#include "strata/kernels/q35_moe.hpp"
+#include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/gemm.hpp"
 
 #include <cuda_runtime.h>
@@ -63,6 +65,13 @@ struct Layer {
     QMat q, k, v, o;
     float *q_norm = nullptr, *k_norm = nullptr;
     Q35Kv kv;                                      // the K / V cache (FP16 or K8V4)
+    // a MoE FFN: the router (F32, n_expert rows of n_embd), the stacked experts in their GGUF rows (MMQ), the shared
+    // expert and its gate (F32 row)
+    float *router = nullptr, *sh_gate = nullptr;   // router: n_expert rows (+1: the shared expert's gate row)
+    void *exp_gate = nullptr, *exp_up = nullptr, *exp_down = nullptr;
+    int type_gate = -1, type_up = -1, type_down = -1;
+    QMat sh_gate_m, sh_up, sh_down;
+    QMat sh_gu;                                     // [gate rows | up rows] of the shared expert (one GEMV)
     // the MTP (nextn) block's own
     QMat eh_proj;
     float *enorm = nullptr, *hnorm = nullptr, *head_norm = nullptr;
@@ -177,6 +186,14 @@ struct DenseModel::Impl {
     float* attn_scratch = nullptr;
     float* conv_dummy = nullptr;
     int32_t* tok_dev = nullptr;
+    // MoE (chunk x k pairs)
+    float *moe_logits = nullptr, *moe_w = nullptr, *moe_g = nullptr, *moe_u = nullptr, *moe_y = nullptr, *moe_sh = nullptr;
+    float* moe_shl = nullptr;
+    int32_t *moe_ids = nullptr, *moe_bounds = nullptr, *moe_tok = nullptr, *moe_pos = nullptr, *moe_max = nullptr;
+    int32_t *moe_cnt = nullptr, *moe_iota = nullptr, *moe_pairtok = nullptr;
+    void* moe_xq = nullptr;
+    int32_t* moe_max_host = nullptr;   // pinned
+    std::unique_ptr<strata::prefill::mmq::Context> mmq;
     // MTP
     float *mtp_x = nullptr, *mtp_cat = nullptr, *mtp_h = nullptr, *mtp_logits = nullptr;
 
@@ -513,18 +530,24 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             err = "dense model: architecture '" + cfg_.arch + "' is not a qwen35 dense model";
             return false;
         }
-        if (g0.get(a + "expert_count") && g0.get(a + "expert_count")->u > 0) {
-            err = "dense model: this GGUF is a MoE model; run it with `strata`, not `strata-dense`";
-            return false;
-        }
         int64_t v = 0;
+        if (g0.get(a + "expert_count") && g0.get(a + "expert_count")->u > 0) {   // qwen35moe: a MoE FFN in every layer
+            if (!strata::prefill::mmq::built()) { err = "dense model: a MoE model needs the MMQ build (STRATA_GGML_DIR)"; return false; }
+            cfg_.n_expert = (int) g0.get(a + "expert_count")->u;
+            if (meta_int(g0, a + "expert_used_count", v)) cfg_.n_expert_used = (int) v;
+            if (meta_int(g0, a + "expert_feed_forward_length", v)) cfg_.n_ff_exp = (int) v;
+            if (meta_int(g0, a + "expert_shared_feed_forward_length", v)) cfg_.n_ff_shexp = (int) v;
+            if (const auto* e = g0.get(a + "expert_weights_scale")) cfg_.expert_weights_scale = (float) e->num();
+            if (cfg_.n_expert_used < 1 || cfg_.n_ff_exp < 1 || cfg_.n_expert > 1024) { err = "dense model: MoE metadata"; return false; }
+            cfg_.n_ff = std::max(cfg_.n_ff_exp, cfg_.n_ff_shexp);
+        }
         auto need = [&](const char* key, int& dst) {
             if (!meta_int(g0, a + key, v)) { err = std::string("dense model: missing ") + a + key; return false; }
             dst = (int) v;
             return true;
         };
         if (!need("block_count", cfg_.n_layer) || !need("embedding_length", cfg_.n_embd) ||
-            !need("feed_forward_length", cfg_.n_ff) || !need("attention.head_count", cfg_.n_head) ||
+            (!cfg_.n_expert && !need("feed_forward_length", cfg_.n_ff)) || !need("attention.head_count", cfg_.n_head) ||
             !need("attention.head_count_kv", cfg_.n_head_kv) || !need("attention.key_length", cfg_.head_dim) ||
             !need("rope.dimension_count", cfg_.n_rot) || !need("ssm.conv_kernel", cfg_.ssm_d_conv) ||
             !need("ssm.state_size", cfg_.ssm_state) || !need("ssm.group_count", cfg_.ssm_k_heads) ||
@@ -628,6 +651,72 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             if (!I.upload_floats(I.find(p + "attn_norm.weight"), p + "attn_norm.weight", E, &L.attn_norm, err)) return false;
             if (!I.upload_floats(I.find_any({"post_attention_norm.weight", "ffn_norm.weight"}, p), p + "post_attention_norm.weight",
                                  E, &L.post_norm, err)) return false;
+            if (cfg_.n_expert) {
+                const int NE = cfg_.n_expert, FF = cfg_.n_ff_exp;
+                {   // the router's rows, then the shared expert's gate row (one GEMV for both)
+                    float* r = nullptr;
+                    if (!I.upload_floats(I.find(p + "ffn_gate_inp.weight"), p + "ffn_gate_inp.weight", (uint64_t) NE * E, &r, err) ||
+                        !I.alloc(&L.router, (uint64_t) (NE + 1) * E * 4, err, "router"))
+                        return false;
+                    cudaMemcpy(L.router, r, (size_t) NE * E * 4, cudaMemcpyDeviceToDevice);
+                    cudaMemset(L.router + (size_t) NE * E, 0, (size_t) E * 4);
+                    cudaFree(r);
+                    I.allocations.erase(std::find(I.allocations.begin(), I.allocations.end(), (void*) r));
+                }
+                auto raw3 = [&](const char* n, int n_in, int n_out, void** dev, int& type) {
+                    const Found* f = I.find(p + n);
+                    if (!f || f->tensor->shape.size() != 3 || f->tensor->shape[0] != (uint64_t) n_in ||
+                        f->tensor->shape[1] != (uint64_t) n_out || f->tensor->shape[2] != (uint64_t) NE ||
+                        !strata::prefill::mmq::supported((int) f->tensor->type)) {
+                        err = "dense model: " + p + n + " missing, not [" + std::to_string(n_in) + ", " + std::to_string(n_out) +
+                              ", experts] or a type MMQ does not take";
+                        return false;
+                    }
+                    type = (int) f->tensor->type;
+                    const uint64_t b = strata::prefill::mmq::matrix_bytes(type, n_out, n_in) * NE;
+                    if (!I.alloc(dev, b, err, n)) return false;
+                    cudaMemcpy(*dev, f->file->tensor_data(*f->tensor), b, cudaMemcpyHostToDevice);
+                    I.dev_used += b;
+                    total += b;
+                    return true;
+                };
+                if (!raw3("ffn_gate_exps.weight", E, FF, &L.exp_gate, L.type_gate) ||
+                    !raw3("ffn_up_exps.weight", E, FF, &L.exp_up, L.type_up) ||
+                    !raw3("ffn_down_exps.weight", FF, E, &L.exp_down, L.type_down))
+                    return false;
+                if (cfg_.n_ff_shexp > 0) {
+                    const int SF = cfg_.n_ff_shexp;
+                    if (!I.upload_mat(I.find(p + "ffn_gate_shexp.weight"), p + "ffn_gate_shexp.weight", E, SF, L.sh_gate_m, total, err) ||
+                        !I.upload_mat(I.find(p + "ffn_up_shexp.weight"), p + "ffn_up_shexp.weight", E, SF, L.sh_up, total, err) ||
+                        !I.upload_mat(I.find(p + "ffn_down_shexp.weight"), p + "ffn_down_shexp.weight", SF, E, L.sh_down, total, err))
+                        return false;
+                    if (I.find(p + "ffn_gate_inp_shexp.weight")) {
+                        float* g = nullptr;
+                        if (!I.upload_floats(I.find(p + "ffn_gate_inp_shexp.weight"), p + "ffn_gate_inp_shexp.weight", E, &g, err))
+                            return false;
+                        cudaMemcpy(L.router + (size_t) NE * E, g, (size_t) E * 4, cudaMemcpyDeviceToDevice);
+                        cudaFree(g);
+                        I.allocations.erase(std::find(I.allocations.begin(), I.allocations.end(), (void*) g));
+                        L.sh_gate = L.router + (size_t) NE * E;   // (a marker: the gate logit is the router's last row)
+                    }
+                    // gate and up stacked in one packed matrix when both are packed and alike
+                    if (L.sh_gate_m.packed && L.sh_up.packed && L.sh_gate_m.type == L.sh_up.type) {
+                        const uint64_t b1 = q35_mmt_packed_bytes(L.sh_gate_m.type, E, SF);
+                        void* gu = nullptr;
+                        if (SF % 32 == 0 && I.alloc(&gu, 2 * b1, err, "shared gate/up")) {
+                            cudaMemcpy(gu, L.sh_gate_m.dev, b1, cudaMemcpyDeviceToDevice);
+                            cudaMemcpy((uint8_t*) gu + b1, L.sh_up.dev, b1, cudaMemcpyDeviceToDevice);
+                            L.sh_gu = QMat{gu, L.sh_gate_m.type, E, 2 * SF, true};
+                            for (QMat* m : {&L.sh_gate_m, &L.sh_up}) {
+                                cudaFree(m->dev);
+                                I.allocations.erase(std::find(I.allocations.begin(), I.allocations.end(), m->dev));
+                                m->dev = nullptr;
+                            }
+                        }
+                    }
+                }
+                return true;
+            }
             return I.upload_mat(I.find(p + "ffn_gate.weight"), p + "ffn_gate.weight", E, cfg_.n_ff, L.ffn_gate, total, err) &&
                    I.upload_mat(I.find(p + "ffn_up.weight"), p + "ffn_up.weight", E, cfg_.n_ff, L.ffn_up, total, err) &&
                    I.upload_mat(I.find(p + "ffn_down.weight"), p + "ffn_down.weight", cfg_.n_ff, E, L.ffn_down, total, err);
@@ -753,6 +842,28 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                   I.alloc(&I.mmt_part, (uint64_t) q35_mmt_part_floats(std::max({cfg_.n_vocab, cfg_.n_ff, H * 2 * D})) * f,
                           err, "GEMV partials");
         if (!ok) return false;
+        if (cfg_.n_expert) {   // the MoE buffers: chunk x k (token, expert) pairs
+            namespace mmq = strata::prefill::mmq;
+            const uint64_t K = (uint64_t) cfg_.n_expert_used, PR = R * K, FF = (uint64_t) cfg_.n_ff_exp;
+            ok = I.alloc(&I.moe_logits, R * (cfg_.n_expert + 1) * f, err, "moe") && I.alloc(&I.moe_w, PR * f, err, "moe") &&
+                 I.alloc(&I.moe_ids, PR * 4, err, "moe") && I.alloc(&I.moe_bounds, (uint64_t) (cfg_.n_expert + 1) * 4, err, "moe") &&
+                 I.alloc(&I.moe_tok, PR * 4, err, "moe") && I.alloc(&I.moe_pos, PR * 4, err, "moe") &&
+                 I.alloc(&I.moe_max, 4, err, "moe") && I.alloc(&I.moe_cnt, (uint64_t) (cfg_.n_expert + 1) * 4, err, "moe") &&
+                 I.alloc(&I.moe_iota, PR * 4, err, "moe") && I.alloc(&I.moe_pairtok, PR * 4, err, "moe") &&
+                 I.alloc(&I.moe_g, PR * FF * f, err, "moe") &&
+                 I.alloc(&I.moe_u, PR * FF * f, err, "moe") && I.alloc(&I.moe_y, PR * E * f, err, "moe") &&
+                 I.alloc(&I.moe_sh, R * E * f, err, "moe") && I.alloc(&I.moe_shl, R * f, err, "moe") &&
+                 I.alloc(&I.moe_xq, mmq::q8_bytes((int64_t) PR, std::max<int64_t>(E, (int64_t) FF)), err, "moe");
+            if (!ok) return false;
+            if (cudaHostAlloc((void**) &I.moe_max_host, 4, cudaHostAllocDefault) != cudaSuccess) { err = "moe: pinned"; return false; }
+            mmq::iota(I.moe_iota, (int64_t) PR, I.stream);
+            {   // pair p's token: p / k
+                std::vector<int32_t> pt((size_t) PR);
+                for (size_t i = 0; i < pt.size(); ++i) pt[i] = (int32_t) (i / K);
+                cudaMemcpy(I.moe_pairtok, pt.data(), pt.size() * 4, cudaMemcpyHostToDevice);
+            }
+            I.mmq.reset(new mmq::Context());
+        }
         if (!I.gemm.init(I.stream, (int64_t) cfg_.n_ff * E, err)) return false;
         if (const char* e = std::getenv("STRATA_DENSE_MULTI_EXACT")) native_mmvq_set_multi_exact(std::atoi(e) != 0);
         if (const char* e = std::getenv("STRATA_DENSE_MMT")) I.mmt_on = std::atoi(e) != 0;
@@ -811,11 +922,87 @@ void attn_mixer(DenseModel::Impl& I, const DenseConfig& c, Layer& L, int64_t p0,
 }
 
 // x += ffn(rms(x, post_norm)), T rows
+// the MoE FFN of T rows (xn prepared): x += sum_j w_j expert_j(xn) + sigmoid(g . xn) shared(xn)
+void moe_ffn(DenseModel::Impl& I, const DenseConfig& c, Layer& L, float* x, int T) {
+    namespace mmq = strata::prefill::mmq;
+    cudaStream_t s = I.stream;
+    const int E = c.n_embd, K = c.n_expert_used, NE = c.n_expert, FF = c.n_ff_exp, P = T * K;
+    const int NR = NE + (L.sh_gate ? 1 : 0);   // (the last row: the shared expert's gate logit)
+    q35_gemv_f32_cols(L.router, I.xn, E, I.moe_logits, E, NR, T, s);
+    q35_moe_route_ld(I.moe_logits, NR, T, NE, K, c.expert_weights_scale, I.moe_ids, I.moe_w, s);
+    const bool pairs = P <= 64 && q35_mmt_supported(L.type_gate) && q35_mmt_supported(L.type_up) &&
+                       q35_mmt_supported(L.type_down) && FF % 256 == 0;
+    if (pairs) {   // a decode / verify window: each (token, expert) pair its own GEMV, no grouping
+        q35_to_half(I.xn, I.xh, (int64_t) T * E, s);
+        if (T <= 8) {   // (the shared expert's GEMV reads the same FP16 rows)
+            cudaMemcpyAsync(I.xh8, I.xh, (size_t) T * E * 2, cudaMemcpyDeviceToDevice, s);
+            if (T < 8) cudaMemsetAsync(I.xh8 + (size_t) T * E, 0, (size_t) (8 - T) * E * 2, s);
+        }
+        I.stage("moe_route", s);
+        q35_mmt_pairs(L.type_gate, L.exp_gate, strata::prefill::mmq::matrix_bytes(L.type_gate, FF, E), I.moe_ids,
+                      I.moe_pairtok, I.xh, I.moe_g, E, FF, P, I.mmt_part, s);
+        q35_mmt_pairs(L.type_up, L.exp_up, strata::prefill::mmq::matrix_bytes(L.type_up, FF, E), I.moe_ids,
+                      I.moe_pairtok, I.xh, I.moe_u, E, FF, P, I.mmt_part, s);
+        dense_swiglu(I.moe_g, I.moe_u, I.moe_g, (int64_t) P * FF, s);
+        q35_to_half(I.moe_g, I.xh, (int64_t) P * FF, s);
+        q35_mmt_pairs(L.type_down, L.exp_down, strata::prefill::mmq::matrix_bytes(L.type_down, E, FF), I.moe_ids,
+                      I.moe_iota, I.xh, I.moe_y, FF, E, P, I.mmt_part, s);
+        I.stage("moe_experts", s);
+    } else {
+    q35_moe_group(I.moe_ids, T, K, NE, I.moe_bounds, I.moe_tok, I.moe_pos, I.moe_max, I.moe_cnt, s);
+    int max_rows = P;   // (a launch grid's bound: the pairs when few, else the busiest expert's - read back)
+    if (P > 64) {
+        cudaMemcpyAsync(I.moe_max_host, I.moe_max, 4, cudaMemcpyDeviceToHost, s);
+        cudaStreamSynchronize(s);
+        max_rows = std::max(1, *I.moe_max_host);
+    }
+    I.stage("moe_route", s);
+    // gate and up: the pairs' token rows quantized once (gate and up share a type in these files)
+    mmq::quantize(I.xn, I.moe_tok, I.moe_xq, L.type_gate, E, E, P, s);
+    mmq::Product pr;
+    pr.w = L.exp_gate; pr.type = L.type_gate; pr.w_rows = FF; pr.w_cols = E;
+    pr.expert_bytes = mmq::matrix_bytes(L.type_gate, FF, E); pr.n = NE; pr.xq = I.moe_xq; pr.bounds = I.moe_bounds;
+    pr.ids = I.moe_iota; pr.total_rows = P; pr.max_rows = max_rows; pr.dst = I.moe_g; pr.ld_dst = FF;
+    I.mmq->run(pr, s);
+    if (L.type_up != L.type_gate) mmq::quantize(I.xn, I.moe_tok, I.moe_xq, L.type_up, E, E, P, s);
+    pr.w = L.exp_up; pr.type = L.type_up; pr.expert_bytes = mmq::matrix_bytes(L.type_up, FF, E); pr.dst = I.moe_u;
+    I.mmq->run(pr, s);
+    dense_swiglu(I.moe_g, I.moe_u, I.moe_g, (int64_t) P * FF, s);
+    mmq::quantize(I.moe_g, nullptr, I.moe_xq, L.type_down, FF, FF, P, s);
+    pr.w = L.exp_down; pr.type = L.type_down; pr.w_rows = E; pr.w_cols = FF;
+    pr.expert_bytes = mmq::matrix_bytes(L.type_down, E, FF); pr.dst = I.moe_y; pr.ld_dst = E;
+    I.mmq->run(pr, s);
+    I.stage("moe_experts", s);
+    }
+    // the shared expert and its gate
+    const bool sh = L.sh_up.dev != nullptr || L.sh_gu.dev != nullptr;
+    const int SF = c.n_ff_shexp;
+    if (sh) {
+        I.prep(I.xn, E, T);
+        if (pairs && T <= 8) I.h8_ready = true;   // (xh8 already holds these rows)
+        if (L.sh_gu.dev) {   // gate and up in one GEMV: rows [g | u] per token
+            I.mm(L.sh_gu, I.ffn_g);
+            q35_swiglu_rows(I.ffn_g, I.ffn_g + SF, 2 * SF, I.ffn_h, SF, T, s);
+        } else {
+            I.mm(L.sh_gate_m, I.ffn_g);
+            I.mm(L.sh_up, I.ffn_u);
+            dense_swiglu(I.ffn_g, I.ffn_u, I.ffn_h, (int64_t) T * SF, s);
+        }
+        I.prep(I.ffn_h, SF, T);
+        I.mm(L.sh_down, I.moe_sh);
+    }
+    q35_moe_combine_ld(I.moe_y, pairs ? I.moe_iota : I.moe_pos, I.moe_w, T, K, E,
+                       sh && L.sh_gate ? I.moe_logits + NE : nullptr, NR, sh ? I.moe_sh : nullptr,
+                    x, true, s);
+    I.stage("moe_shared", s);
+}
+
 void ffn(DenseModel::Impl& I, const DenseConfig& c, Layer& L, float* x, int T) {
     const int E = c.n_embd;
     q35_rms_rows(x, E, L.post_norm, I.xn, nullptr, T, E, c.rms_eps, I.stream);
     I.prep(I.xn, E, T);
     I.stage("norm_prep", I.stream);
+    if (c.n_expert) { moe_ffn(I, c, L, x, T); return; }
     I.mm(L.ffn_gate, I.ffn_g);
     I.mm(L.ffn_up, I.ffn_u);
     I.stage("ffn_gate_up", I.stream);

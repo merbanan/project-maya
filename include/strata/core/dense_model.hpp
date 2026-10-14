@@ -53,6 +53,8 @@ struct DenseConfig {
     int n_head = 0, n_head_kv = 0, head_dim = 0, n_rot = 0;
     int ssm_d_conv = 0, ssm_state = 0, ssm_k_heads = 0, ssm_v_heads = 0;
     int n_nextn = 0;             ///< MTP (nextn) blocks stored after the trunk's layers
+    int n_expert = 0, n_expert_used = 0, n_ff_exp = 0, n_ff_shexp = 0;   ///< a MoE FFN (qwen35moe); 0: dense
+    float expert_weights_scale = 1.0f;
     float rms_eps = 1e-6f, rope_base = 1e7f;
     int32_t eos_id = -1;         ///< tokenizer.ggml.eos_token_id: the id that ends an answer
     int conv_channels() const { return 2 * ssm_state * ssm_k_heads + ssm_state * ssm_v_heads; }
