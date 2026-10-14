@@ -122,6 +122,12 @@ at every length; prompt = the engine's prompt ms/token, decode = its decode stat
 A 26K prompt's GPU time: 50.5 s -> 34.9 s (indexer 11.2 -> 2.1 s, attention 12.7 -> 6.0 s). Decode is bound by
 the RAM-tier experts (CPU lane ~14.5 ms, fetches) at every length.
 
+MTP (dsv4 0caeb94, `STRATA_DSV4_MTP=<the MTP GGUF>`, tools/d4mtp.py: the block drafts beside every greedy step, 3
+prompts x 256 tokens): **83.5%** of drafts match the trunk, 1.81 ms a draft with its experts in VRAM
+(`STRATA_GLM_VRAM_GB=27`; 19.6 ms staged), plain decode 29.6-30.9 tok/s, 27.5-28.2 with the shadow draft. A verify
+of 1 / 2 drafts costs 1.95 / 2.83 decode steps (tools/d4verify.py: every extra token brings its own RAM-tier
+experts), so speculation would give 1.84 tokens in 2.01 steps (0.92x) / 2.53 in 2.94 (0.86x): off.
+
 ## GLM-5.3-Flash - Maya-S24 (94.7 GB), live Maya (v1.0.30 + PR #78)
 
 | Setting | Prompt (tok/s) | Decode (tok/s) | Notes |
