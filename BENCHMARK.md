@@ -71,12 +71,18 @@ At 28K the block drafters' extra draft pass costs about what their longer runs g
 
 ## DeepSeek-V4 Flash - antirez IQ2_XXS (80.8 GB), GLM fast path (`dsv4`)
 
-| Context | Prompt (tok/s) | Decode (tok/s) | Notes |
+Fresh run 2026-10-14 (dsv4 6d39cfc: tensor-core prompt indexer and attention, parallel compressors), needles 3/3
+at every length; prompt = the engine's prompt ms/token, decode = its decode stat over 100 tokens.
+
+| Context | Prompt (tok/s) | Decode (tok/s) | Before (prompt / decode) |
 |---|---:|---:|---|
-| short (warm usage profile) | | 46-49 | 29.8 cold |
-| 28-30K | 500 | 22.3 | indexer 1.0 ms a token (was 9.5) |
-| 65K | ~370 | 20.7 | |
-| 93K | 312 | 19.9 | was 14.5 before the indexer top-k fix; needles 3/3 |
+| 2K | 435 | 29.1 | 29.8 cold / 46-49 warm short |
+| 28K | **770** | 25.0 | 500 / 22.3 |
+| 65K | **714** | 21.7 | ~370 / 20.7 |
+| 93K | **625** | 21.7 | 312 / 19.9 (14.5 before the indexer top-k fix) |
+
+A 26K prompt's GPU time: 50.5 s -> 34.9 s (indexer 11.2 -> 2.1 s, attention 12.7 -> 6.0 s). Decode is bound by
+the RAM-tier experts (CPU lane ~14.5 ms, fetches) at every length.
 
 ## GLM-5.3-Flash - Maya-S24 (94.7 GB), live Maya (v1.0.30 + PR #78)
 
