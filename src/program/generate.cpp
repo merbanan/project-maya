@@ -1697,6 +1697,13 @@ static int glm_pack_generate(const Options& o) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && sp.greedy && model.d4_spec_ready()) {
+            // deepseek4's MTP speculative decode (two rows a round)
+            int64_t n_spec = 0;
+            if (!model.d4_decode_spec(sp, max_new, on_token, n_spec, err)) {
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
         } else {
             for (;;) {
                 if (stop_req.load()) {

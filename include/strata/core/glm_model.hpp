@@ -437,8 +437,21 @@ public:
     // acceptance a speculative decode would see; with the verify cost of tools/d4verify.py, its speed)
     struct D4Mtp;
     D4Mtp* d4mtp_ = nullptr;
+    bool d4mtp_resident_ = false;
+    static int d4_mtp_exp_type();                          // STRATA_DSV4_MTP_EXPERTS: -1 as stored
     bool d4_mtp_load(const std::string& path, std::string& err);
     bool d4_mtp_draft(int32_t token, int64_t pos, int& draft, std::string& err);
+    // ... and the speculative decode on it (STRATA_DSV4_MTP_SPEC=1, greedy): a round runs the pending token and the
+    // block's draft through every layer as two rows (the dense weights read once, mv2), keeps both when the trunk
+    // agrees with the draft, else rolls the draft row's compressor windows back
+    struct D4Spec;
+    D4Spec* d4spec_ = nullptr;
+    bool d4_spec_ready() const;
+    bool d4_spec_alloc(std::string& err);
+    bool d4_verify2(int32_t a, int32_t d, int& ya, int& yb, std::string& err);
+    bool d4_decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
+                        int64_t& produced, std::string& err);
+    uint64_t d4_rounds_ = 0, d4_accepts_ = 0;
     uint64_t mtp_tries_ = 0, mtp_hits_ = 0;
     int mtp_pending_ = -1;
     int64_t mtp_pending_pos_ = -1;   // the position the pending draft is for

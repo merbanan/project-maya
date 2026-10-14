@@ -1005,6 +1005,29 @@ bool Glm5Model::fast_setup(std::string& err) {
                          dev_, (double) cap / 1073741824.0, (double) used / 1073741824.0, (double) room / 1073741824.0);
             avail = std::min(avail, room);
         }
+        // deepseek4 with its MTP block (STRATA_DSV4_MTP): the block's weights (its experts too) stay out of the pool
+        if (const char* mp = getenv("STRATA_DSV4_MTP"); mp != nullptr && mp[0] && g.dsv4()) {
+            std::error_code ec;
+            size_t keep = (size_t) std::filesystem::file_size(mp, ec) + ((size_t) 96 << 20);
+            if (const int et = d4_mtp_exp_type(); !ec && et >= 0) {   // the experts requantized at load
+                try {
+                    strata::GgufFile mf(mp);
+                    for (const char* n : {"mtp.0.ffn_gate_exps.weight", "mtp.0.ffn_up_exps.weight", "mtp.0.ffn_down_exps.weight"})
+                        if (const strata::TensorInfo* t = mf.find(n)) {
+                            const size_t rows = t->elements() / t->shape[0];
+                            keep -= ggml_row_size((ggml_type) t->type, (int64_t) t->shape[0]) * rows;
+                            keep += ggml_row_size((ggml_type) et, (int64_t) t->shape[0]) * rows;
+                        }
+                } catch (...) {
+                }
+            }
+            if (const char* r = getenv("STRATA_DSV4_MTP_RESERVE_GB")) keep = (size_t) (std::atof(r) * 1073741824.0);
+            if (!ec || getenv("STRATA_DSV4_MTP_RESERVE_GB")) {
+                avail = avail > keep ? avail - keep : 0;
+                std::fprintf(stderr, "glm fast: CUDA%d %.2f GB kept out of the expert pool for the MTP block\n", dev_,
+                             (double) keep / 1073741824.0);
+            }
+        }
         // a layer's slot stride: MMQ-addressable (glmfast::expert_stride), so the prompt path multiplies the pool
         // partition in place
         const auto slot_stride = [&](int il) {
@@ -1553,6 +1576,11 @@ bool Glm5Model::fast_setup(std::string& err) {
     if (const char* mp = getenv("STRATA_DSV4_MTP"); mp != nullptr && mp[0] && g.dsv4() && d4mtp_ == nullptr) {
         cudaSetDevice(dev_);
         if (!d4_mtp_load(mp, err)) return false;
+        // the speculative decode on it unless STRATA_DSV4_MTP_SPEC=0 (then: the shadow measurement) - with the
+        // block's experts in VRAM (staged a token, a draft costs more than it saves)
+        const char* v = getenv("STRATA_DSV4_MTP_SPEC");
+        if ((v == nullptr || std::atoi(v) != 0) && split_next_ == nullptr && d4mtp_resident_ && !d4_spec_alloc(err))
+            return false;
     }
     return true;
 }
@@ -4411,16 +4439,14 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         return false;
     }
     last_tok_ = FT->tok_h[0];
-    if (d4mtp_ != nullptr && split_next_ == nullptr) {
+    if (d4mtp_ != nullptr && split_next_ == nullptr && d4spec_ == nullptr) {
         // the MTP block's shadow draft: did the last one call this token, then the next one
         if (mtp_pending_ >= 0 && mtp_pending_pos_ == p + 1) {
             ++mtp_tries_;
             mtp_hits_ += mtp_pending_ == last_tok_;
         }
-        const auto t0 = std::chrono::steady_clock::now();
         int d = -1;
         if (!d4_mtp_draft(last_tok_, p + 1, d, err)) return false;
-        mtp_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         mtp_pending_ = d;
         mtp_pending_pos_ = p + 2;
         if (mtp_tries_ > 0 && mtp_tries_ % 64 == 0 && mtp_pending_ >= 0)
@@ -5368,6 +5394,12 @@ bool Glm5Model::forward_fast(const std::vector<int32_t>& tokens, std::vector<flo
 
 
 // ---------------------------------------------------------------- deepseek4's MTP block (STRATA_DSV4_MTP)
+int Glm5Model::d4_mtp_exp_type() {
+    const char* v = getenv("STRATA_DSV4_MTP_EXPERTS");
+    if (v == nullptr || !v[0]) return -1;
+    const std::string t(v);
+    return t == "q2_k" ? GGML_TYPE_Q2_K : t == "q3_k" ? GGML_TYPE_Q3_K : t == "q4_k" ? -1 : -1;
+}
 // ds4.c metal_graph_eval_mtp_draft_from_hc: the input streams R[s] = e_proj(enorm(emb(token))) + h_proj(hnorm(R_trunk[s]))
 // through one DSv4 layer (an own raw window, no compressor: layer 1's rope), then the mHC head on the block's own
 // hc_head / norm and the trunk's output head.  Its window holds only the block's own rows (from the first decode
@@ -5383,6 +5415,7 @@ struct Glm5Model::D4Mtp {
     uint8_t* stage_dev = nullptr;            // the staged experts (k of them)
     uint8_t* stage_h = nullptr;
     size_t gu_bytes = 0, d_bytes = 0, blob = 0;
+    int gt = 0, dt = 0;          // the experts' types (gate/up, down)
     const uint8_t *src_g = nullptr, *src_u = nullptr, *src_d = nullptr;
     uint16_t* swa = nullptr;
     float *R, *R2, *ep, *hp, *ex, *xs, *glog, *eg, *eu, *ey, *shg, *shu, *shy;
@@ -5470,16 +5503,50 @@ bool Glm5Model::d4_mtp_load(const std::string& path, std::string& err) {
         err = "dsv4 mtp: routed experts missing or of an unsupported type";
         return false;
     }
-    M->gu_bytes = gf::row_bytes((int) tg->type, g.n_embd) * g.n_ff_exp;
-    M->d_bytes = gf::row_bytes((int) td->type, g.n_ff_exp) * g.n_embd;
+    // STRATA_DSV4_MTP_EXPERTS=q3_k|q2_k: the experts requantized (from Q4_K) to leave the trunk's pool more VRAM
+    const int rq = d4_mtp_exp_type();
+    M->gt = rq >= 0 ? rq : (int) tg->type;
+    M->dt = rq >= 0 ? rq : (int) td->type;
+    const size_t src_gu = gf::row_bytes((int) tg->type, g.n_embd) * g.n_ff_exp,
+                 src_d = gf::row_bytes((int) td->type, g.n_ff_exp) * g.n_embd;
+    M->gu_bytes = gf::row_bytes(M->gt, g.n_embd) * g.n_ff_exp;
+    M->d_bytes = gf::row_bytes(M->dt, g.n_ff_exp) * g.n_embd;
     M->blob = 2 * M->gu_bytes + M->d_bytes;
     M->src_g = M->f->tensor_data(*tg);
     M->src_u = M->f->tensor_data(*tu);
     M->src_d = M->f->tensor_data(*td);
+    std::vector<uint8_t> rq_buf;
+    if (rq >= 0) {
+        // [gate | up | down] per expert in the new type, on all cores (ggml's quantizers)
+        const auto t0 = std::chrono::steady_clock::now();
+        rq_buf.resize(M->blob * (size_t) g.n_expert);
+        std::atomic<int> next{0};
+        const auto work = [&] {
+            std::vector<float> f((size_t) g.n_ff_exp * g.n_embd);
+            for (int e; (e = next++) < g.n_expert;) {
+                uint8_t* dst = rq_buf.data() + (size_t) e * M->blob;
+                const ggml_type_traits* sg = ggml_get_type_traits((ggml_type) tg->type);
+                const ggml_type_traits* sd = ggml_get_type_traits((ggml_type) td->type);
+                sg->to_float(M->src_g + (size_t) e * src_gu, f.data(), (int64_t) g.n_ff_exp * g.n_embd);
+                ggml_quantize_chunk((ggml_type) M->gt, f.data(), dst, 0, g.n_ff_exp, g.n_embd, nullptr);
+                sg->to_float(M->src_u + (size_t) e * src_gu, f.data(), (int64_t) g.n_ff_exp * g.n_embd);
+                ggml_quantize_chunk((ggml_type) M->gt, f.data(), dst + M->gu_bytes, 0, g.n_ff_exp, g.n_embd, nullptr);
+                sd->to_float(M->src_d + (size_t) e * src_d, f.data(), (int64_t) g.n_ff_exp * g.n_embd);
+                ggml_quantize_chunk((ggml_type) M->dt, f.data(), dst + 2 * M->gu_bytes, 0, g.n_embd, g.n_ff_exp, nullptr);
+            }
+        };
+        std::vector<std::thread> th;
+        const int nt = std::max(1, (int) std::thread::hardware_concurrency());
+        for (int i = 0; i < nt; ++i) th.emplace_back(work);
+        for (auto& t : th) t.join();
+        std::fprintf(stderr, "dsv4 mtp: experts requantized to %s in %.1f s\n", ggml_type_name((ggml_type) rq),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
     const int K = g.n_exp_used;
     if (getenv("STRATA_DSV4_MTP_STAGE") == nullptr &&
         cudaMalloc(&M->exp_dev, M->blob * (size_t) g.n_expert) == cudaSuccess) {
-        for (int e = 0; e < g.n_expert; ++e) {
+        if (rq >= 0) cudaMemcpy(M->exp_dev, rq_buf.data(), rq_buf.size(), cudaMemcpyHostToDevice);
+        for (int e = 0; e < g.n_expert && rq < 0; ++e) {
             uint8_t* d = M->exp_dev + (size_t) e * M->blob;
             cudaMemcpy(d, M->src_g + (size_t) e * M->gu_bytes, M->gu_bytes, cudaMemcpyHostToDevice);
             cudaMemcpy(d + M->gu_bytes, M->src_u + (size_t) e * M->gu_bytes, M->gu_bytes, cudaMemcpyHostToDevice);
@@ -5489,6 +5556,7 @@ bool Glm5Model::d4_mtp_load(const std::string& path, std::string& err) {
     } else {
         cudaGetLastError();
         M->exp_dev = nullptr;
+        if (rq >= 0) { err = "dsv4 mtp: no VRAM for the requantized experts"; return false; }
         if (cudaMalloc(&M->stage_dev, M->blob * (size_t) K) != cudaSuccess ||
             cudaHostAlloc((void**) &M->stage_h, M->blob * (size_t) K, cudaHostAllocDefault) != cudaSuccess) {
             err = "dsv4 mtp: no room for the staged experts";
@@ -5525,6 +5593,7 @@ bool Glm5Model::d4_mtp_load(const std::string& path, std::string& err) {
     M->shy = a;
     (void) F;
     d4mtp_ = M;
+    d4mtp_resident_ = M->exp_dev != nullptr;
     std::fprintf(stderr, "dsv4 mtp: %s - %.2f GB of VRAM, experts %s\n", path.c_str(), total / 1e9,
                  M->exp_dev ? "resident" : "staged a token");
     return true;
@@ -5537,6 +5606,7 @@ bool Glm5Model::d4_mtp_draft(int32_t token, int64_t pos, int& draft, std::string
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
     const int E = g.n_embd, HD = g.head_dim, K = g.n_exp_used, FF = g.n_ff_exp;
+    const auto t_in = std::chrono::steady_clock::now();
     if (pos != M->last_pos + 1) M->vpos = 0;   // a new run (a prompt in between): the block's window starts over
     M->last_pos = pos;
     const int vp = (int) M->vpos++;
@@ -5641,7 +5711,7 @@ bool Glm5Model::d4_mtp_draft(int32_t token, int64_t pos, int& draft, std::string
     for (int k = 0; k < K; ++k) sum += pr[(size_t) id[(size_t) k]];
     gf::Dsv4MtpW wt{};
     for (int k = 0; k < K; ++k) wt.w[k] = pr[(size_t) id[(size_t) k]] / sum * g.w_scale;
-    const int gt = M->f->find("mtp.0.ffn_gate_exps.weight")->type, dt = M->f->find("mtp.0.ffn_down_exps.weight")->type;
+    const int gt = M->gt, dt = M->dt;
     const uint8_t* blob[8];
     if (M->exp_dev) {
         for (int k = 0; k < K; ++k) blob[k] = M->exp_dev + (size_t) id[(size_t) k] * M->blob;
@@ -5686,6 +5756,361 @@ bool Glm5Model::d4_mtp_draft(int32_t token, int64_t pos, int& draft, std::string
         return false;
     }
     draft = M->tok_h[0];
+    mtp_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_in).count();
+    return true;
+}
+
+// ---------------------------------------------------------------- deepseek4: the MTP speculative decode
+// The second row's buffers: swapped with the FastState's own for a per-row step (the kernels read F's fields)
+struct Glm5Model::D4Spec {
+    float *x, *mixer, *ffn, *pre, *post, *comb, *head_x;
+    void *xq, *head_xq;
+    float *d4_qr, *d4_qrn, *d4_q, *d4_kv, *d4_ckv, *d4_csc, *d4_ickv, *d4_icsc, *d4_iq, *d4_iw, *d4_score, *d4_heads,
+        *d4_low;
+    void *d4_qrn_q8, *d4_heads_q8, *d4_low_q8;
+    int* d4_sel;
+    float* R = nullptr;          // row B's streams: [Rc | Ro], 2 x hc x n_embd
+    float* Rb = nullptr;         // row B's final streams
+    float* logits = nullptr;     // row B's
+    float* win = nullptr;        // the compressor windows before row B, per layer
+    struct Run { int il; int64_t off, n, at; };
+    std::vector<Run> runs;       // every layer's compressor windows: state_ offset, floats, offset in win
+    int* tok = nullptr;          // 2: the rows' argmax
+    int* tok_h = nullptr;
+};
+
+template<class FS, class SB>
+static void d4_swap_rows(FS* F, SB* B) {
+    std::swap(F->x, B->x); std::swap(F->mixer, B->mixer); std::swap(F->ffn, B->ffn); std::swap(F->pre, B->pre);
+    std::swap(F->post, B->post); std::swap(F->comb, B->comb); std::swap(F->head_x, B->head_x);
+    std::swap(F->xq, B->xq); std::swap(F->head_xq, B->head_xq);
+    std::swap(F->d4_qr, B->d4_qr); std::swap(F->d4_qrn, B->d4_qrn); std::swap(F->d4_q, B->d4_q);
+    std::swap(F->d4_kv, B->d4_kv); std::swap(F->d4_ckv, B->d4_ckv); std::swap(F->d4_csc, B->d4_csc);
+    std::swap(F->d4_ickv, B->d4_ickv); std::swap(F->d4_icsc, B->d4_icsc); std::swap(F->d4_iq, B->d4_iq);
+    std::swap(F->d4_iw, B->d4_iw); std::swap(F->d4_score, B->d4_score); std::swap(F->d4_heads, B->d4_heads);
+    std::swap(F->d4_low, B->d4_low); std::swap(F->d4_qrn_q8, B->d4_qrn_q8); std::swap(F->d4_heads_q8, B->d4_heads_q8);
+    std::swap(F->d4_low_q8, B->d4_low_q8); std::swap(F->d4_sel, B->d4_sel);
+}
+
+bool Glm5Model::d4_spec_alloc(std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    auto* B = new D4Spec;
+    const size_t E = (size_t) g.n_embd;
+    const auto q8f = [](size_t n) { return (n / 32 * 36 + 3) / 4; };
+    const size_t QL = (size_t) g.q_lora, QH = (size_t) g.n_head * g.head_dim, LO = (size_t) g.o_groups * g.o_lora,
+                 IQ = (size_t) g.idx_heads * g.idx_key, NC = (size_t) std::max<int64_t>(1, max_ctx_ / 4 + 1);
+    int64_t wn = 0;
+    for (int il = l0_; il < l1_; ++il) {
+        if (d4_st_[(size_t) il] >= 0) { B->runs.push_back({il, d4_st_[(size_t) il], d4_st_floats(il), wn}); wn += d4_st_floats(il); }
+        if (d4_ist_[(size_t) il] >= 0) {
+            const int64_t n = (int64_t) 2 * 8 * 2 * g.idx_key;
+            B->runs.push_back({il, d4_ist_[(size_t) il], n, wn});
+            wn += n;
+        }
+    }
+    std::vector<size_t> sz = {E, E, E, 8, 8, 16, E, q8f(E), q8f(E), QL, QL, q8f(QL), QH, (size_t) g.head_dim,
+                              2 * (size_t) g.head_dim, 2 * (size_t) g.head_dim, 2 * (size_t) g.idx_key,
+                              2 * (size_t) g.idx_key, IQ, (size_t) g.idx_heads, NC, QH, q8f(QH), LO, q8f(LO),
+                              (size_t) g.idx_top_k, 4 * g.hc * E, (size_t) g.hc * E, (size_t) g.n_vocab, (size_t) wn, 16};
+    size_t tot = 0;
+    for (size_t v : sz) tot += (v + 15) / 16 * 16;
+    float* at = nullptr;
+    if (cudaMalloc(&at, tot * sizeof(float)) != cudaSuccess ||
+        cudaHostAlloc((void**) &B->tok_h, 2 * sizeof(int), cudaHostAllocDefault) != cudaSuccess) {
+        err = "dsv4 spec: the second row's buffers did not allocate";
+        return false;
+    }
+    size_t k = 0;
+    const auto take = [&]() { float* r = at; at += (sz[k++] + 15) / 16 * 16; return r; };
+    B->x = take(); B->mixer = take(); B->ffn = take(); B->pre = take(); B->post = take(); B->comb = take();
+    B->head_x = take(); B->xq = take(); B->head_xq = take();
+    B->d4_qr = take(); B->d4_qrn = take(); B->d4_qrn_q8 = take(); B->d4_q = take(); B->d4_kv = take();
+    B->d4_ckv = take(); B->d4_csc = take(); B->d4_ickv = take(); B->d4_icsc = take(); B->d4_iq = take();
+    B->d4_iw = take(); B->d4_score = take(); B->d4_heads = take(); B->d4_heads_q8 = take(); B->d4_low = take();
+    B->d4_low_q8 = take(); B->d4_sel = (int*) take(); B->R = take(); B->Rb = take(); B->logits = take();
+    B->win = take(); B->tok = (int*) take();
+    (void) F;
+    d4spec_ = B;
+    std::fprintf(stderr, "dsv4 mtp spec: on (greedy decode), %.1f MB for the second row\n", tot * 4.0 / 1e6);
+    return true;
+}
+
+bool Glm5Model::d4_spec_ready() const {
+    return d4mtp_ != nullptr && d4spec_ != nullptr && split_next_ == nullptr && fast_ != nullptr;
+}
+
+// rows A (token a at p = pos_) and B (token d at p + 1) through every layer; ya / yb: the trunk's argmax after each.
+// Leaves A's streams in state_, B's in d4spec_->Rb, pos_ unchanged, B's windows saved in d4spec_->win.
+bool Glm5Model::d4_verify2(int32_t a, int32_t d, int& ya, int& yb, std::string& err) {
+    FastState* F = fast_;
+    D4Spec* B = d4spec_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const int E = g.n_embd, HD = g.head_dim;
+    const int64_t p = pos_;
+    if (!fast_boundary(err)) return false;
+    const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
+    const size_t rb = ggml_row_size((ggml_type) pack_emb_type_, E);
+    tt->to_float(pack_emb_src_ + (size_t) a * rb, F->emb_h, E);
+    cudaMemcpyAsync(F->emb, F->emb_h, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
+    gf::embed_streams(F->emb, state_, E, s);
+    cudaStreamSynchronize(s);
+    tt->to_float(pack_emb_src_ + (size_t) d * rb, F->emb_h, E);
+    cudaMemcpyAsync(F->emb, F->emb_h, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
+    gf::embed_streams(F->emb, B->R, E, s);
+    float* Rc[2] = {state_, B->R};
+    float* Ro[2] = {state_ + (int64_t) g.hc * E, B->R + (int64_t) g.hc * E};
+    bool pf_pending = false;
+    if (F->prof_on) F->mark("start");
+    const auto hc_args = [&](int r, const FastState::Layer& Ly, bool ffn_side, bool first) {
+        gf::HcArgs h;
+        h.block_out = ffn_side ? F->mixer : first ? nullptr : F->ffn;
+        h.R_old = Rc[r];
+        h.R_new = Ro[r];
+        h.post_in = F->post;
+        h.comb_in = F->comb;
+        h.pre = F->pre;
+        h.post = F->post;
+        h.comb = F->comb;
+        h.w_fn = ffn_side ? Ly.hc_ffn_fn : Ly.hc_attn_fn;
+        h.w_f16 = true;
+        h.w_scale = ffn_side ? Ly.hc_ffn_scale : Ly.hc_attn_scale;
+        h.w_base = ffn_side ? Ly.hc_ffn_base : Ly.hc_attn_base;
+        h.norm_w = ffn_side ? Ly.ffn_norm : Ly.attn_norm;
+        h.norm_eps = g.norm_eps;
+        h.hc_eps = g.hc_eps;
+        h.iters = g.sinkhorn_iters;
+        h.n_embd = E;
+        h.x = F->x;
+        h.xq = F->xq;
+        h.part = F->part;
+        h.counter = F->counter;
+        gf::hc(h, s);
+    };
+    // row r's step on F's fields (row 1: B's buffers swapped in)
+    const auto on_row = [&](int r, const std::function<void()>& f) {
+        if (r) d4_swap_rows(F, B);
+        f();
+        if (r) d4_swap_rows(F, B);
+    };
+    for (int il = l0_; il < l1_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        const bool first = il == l0_;
+        for (int r = 0; r < 2; ++r) {
+            on_row(r, [&] { hc_args(r, Ly, false, first); });
+            if (!first) std::swap(Rc[r], Ro[r]);
+        }
+        if (F->prof_on) F->mark("v_hc_attn");
+        // ---- the attention: the projections of both rows in one pass over the weights
+        const int rt = g.ratio(il), W = rt == 4 ? 2 * HD : HD, IW = 2 * g.idx_key;
+        gf::MvJob j[2][gf::kMaxMvJobs];
+        int nj = 0;
+        for (int r = 0; r < 2; ++r)
+            on_row(r, [&] {
+                int n = 0;
+                j[r][n++] = {Ly.q_a.q, F->xq, nullptr, F->d4_qr, nullptr, 1.0f, Ly.q_a.type, E, g.q_lora};
+                j[r][n++] = {Ly.kv_a.q, F->xq, nullptr, F->d4_kv, nullptr, 1.0f, Ly.kv_a.type, E, HD};
+                if (rt > 0) {
+                    j[r][n++] = {Ly.c_kv, nullptr, F->x, F->d4_ckv, nullptr, 1.0f, gf::kTypeF16, E, W};
+                    j[r][n++] = {Ly.c_gate, nullptr, F->x, F->d4_csc, nullptr, 1.0f, gf::kTypeF16, E, W};
+                }
+                if (rt == 4) {
+                    j[r][n++] = {Ly.ic_kv, nullptr, F->x, F->d4_ickv, nullptr, 1.0f, gf::kTypeF16, E, IW};
+                    j[r][n++] = {Ly.ic_gate, nullptr, F->x, F->d4_icsc, nullptr, 1.0f, gf::kTypeF16, E, IW};
+                    j[r][n++] = {Ly.idx_proj, nullptr, F->x, F->d4_iw, nullptr, 1.0f, gf::kTypeF16, E, g.idx_heads};
+                }
+                nj = n;
+            });
+        if (!gf::mv2(j[0], j[1], nj, s)) { err = "dsv4 spec: projections"; return false; }
+        if (F->prof_on) F->mark("v_proj_mv");
+        for (int r = 0; r < 2; ++r)
+            on_row(r, [&] {
+                gf::dsv4_qr_norm(F->d4_qr, Ly.q_a_norm, g.norm_eps, g.q_lora, F->d4_qrn, F->d4_qrn_q8, s);
+                int n = 0;
+                j[r][n++] = {Ly.q_b.q, F->d4_qrn_q8, nullptr, F->d4_q, nullptr, 1.0f, Ly.q_b.type, g.q_lora, g.n_head * HD};
+                if (rt == 4)
+                    j[r][n++] = {Ly.idx_q_b, nullptr, F->d4_qrn, F->d4_iq, nullptr, 1.0f, gf::kTypeF16, g.q_lora,
+                                 g.idx_heads * g.idx_key};
+                nj = n;
+            });
+        if (!gf::mv2(j[0], j[1], nj, s)) { err = "dsv4 spec: q"; return false; }
+        if (F->prof_on) F->mark("v_q_mv");
+        const gf::Dsv4Layer L = d4_layer(il);
+        const gf::Dsv4Rope& rope = F->d4_rope[(size_t) il];
+        for (int r = 0; r < 2; ++r) {
+            if (r == 1)   // row B's windows can be rolled back
+                for (const auto& u : B->runs)
+                    if (u.il == il)
+                        cudaMemcpyAsync(B->win + u.at, state_ + u.off, (size_t) u.n * sizeof(float),
+                                        cudaMemcpyDeviceToDevice, s);
+            on_row(r, [&] {
+                const int64_t pr = p + r;
+                const gf::Dsv4KvArgs ka{F->d4_kv, Ly.kv_a_norm, F->d4_ckv, F->d4_csc, Ly.c_ape, Ly.c_norm,
+                                        F->d4_ickv, F->d4_icsc, Ly.ic_ape, Ly.ic_norm, g.norm_eps, g.n_swa};
+                gf::dsv4_kv_update(ka, L, rope, (int) pr, s);
+                const int n_comp = rt > 0 ? (int) ((pr + 1) / rt) : 0;
+                const int* sel = nullptr;
+                int n_sel = n_comp;
+                if (rt == 4 && n_comp > g.idx_top_k) {
+                    gf::dsv4_indexer(F->d4_iq, F->d4_iw, g.idx_heads, L, n_comp, rope, (int) pr, g.idx_top_k,
+                                     F->d4_score, F->d4_sel, s);
+                    sel = F->d4_sel;
+                    n_sel = g.idx_top_k;
+                }
+                gf::dsv4_attn(F->d4_q, Ly.sinks, L, g.n_swa, (int) pr, sel, n_sel, rope, g.norm_eps, g.n_head,
+                              F->d4_heads, s);
+                gf::quantize_q8_1(F->d4_heads, F->d4_heads_q8, g.n_head * HD, s);
+            });
+        }
+        if (F->prof_on) F->mark("v_attn");
+        const int GD = g.n_head / g.o_groups * HD;
+        const size_t wrow = gf::row_bytes(Ly.o_a.type, GD);
+        for (int r = 0; r < 2; ++r)
+            on_row(r, [&] {
+                for (int gr = 0; gr < g.o_groups; ++gr)
+                    j[r][gr] = {(const uint8_t*) Ly.o_a.q + (size_t) gr * g.o_lora * wrow,
+                                (const uint8_t*) F->d4_heads_q8 + (size_t) gr * (GD / 32) * 36, nullptr,
+                                F->d4_low + (size_t) gr * g.o_lora, nullptr, 1.0f, Ly.o_a.type, GD, g.o_lora};
+            });
+        if (!gf::mv2(j[0], j[1], g.o_groups, s)) { err = "dsv4 spec: output a"; return false; }
+        for (int r = 0; r < 2; ++r)
+            on_row(r, [&] {
+                gf::quantize_q8_1(F->d4_low, F->d4_low_q8, g.o_groups * g.o_lora, s);
+                j[r][0] = {Ly.o_b.q, F->d4_low_q8, nullptr, F->mixer, nullptr, 1.0f, Ly.o_b.type,
+                           g.o_groups * g.o_lora, E};
+            });
+        if (!gf::mv2(j[0], j[1], 1, s)) { err = "dsv4 spec: output b"; return false; }
+        if (F->prof_on) F->mark("v_out_mv");
+        // ---- the FFN side: per row (the expert machinery is one row's)
+        for (int r = 0; r < 2; ++r) {
+            on_row(r, [&] { hc_args(r, Ly, true, first); });
+            std::swap(Rc[r], Ro[r]);
+        }
+        if (F->prof_on) F->mark("v_hc_ffn");
+        bool ok = true;
+        for (int r = 0; r < 2 && ok; ++r) {
+            cur_tok_ = r ? d : a;
+            on_row(r, [&] {
+                if (!Ly.moe) {
+                    gf::MvJob dj[2];
+                    dj[0] = {Ly.ffn_gate.q, F->xq, nullptr, F->dg, nullptr, 1.0f, Ly.ffn_gate.type, E, g.n_ff_dense};
+                    dj[1] = {Ly.ffn_up.q, F->xq, nullptr, F->du, nullptr, 1.0f, Ly.ffn_up.type, E, g.n_ff_dense};
+                    ok = gf::mv(dj, 2, s);
+                    gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, g.n_ff_dense, F->dhq, s);
+                    gf::MvJob dn = {Ly.ffn_down.q, F->dhq, nullptr, F->ffn, nullptr, 1.0f, Ly.ffn_down.type,
+                                    g.n_ff_dense, E};
+                    ok = ok && gf::mv(&dn, 1, s);
+                } else {
+                    ok = fast_moe(il, pf_pending, err);
+                }
+            });
+        }
+        if (!ok) { if (err.empty()) err = "dsv4 spec: ffn"; return false; }
+    }
+    // the last layer's write halves, then the heads
+    gf::hc_post(F->ffn, Rc[0], F->post, F->comb, E, Ro[0], s);
+    if (Ro[0] != state_) cudaMemcpyAsync(state_, Ro[0], (size_t) g.hc * E * sizeof(float), cudaMemcpyDeviceToDevice, s);
+    gf::hc_post(B->ffn, Rc[1], B->post, B->comb, E, B->Rb, s);
+    const uint16_t* hfn = w16_.at("output_hc_fn.weight");
+    const float *hsc = w_.at("output_hc_scale.weight"), *hba = w_.at("output_hc_base.weight"),
+                *onorm = w_.at("output_norm.weight");
+    gf::dsv4_hc_head(state_, hfn, hsc, hba, g.hc_eps, onorm, g.norm_eps, E, F->head_x, F->head_xq, s);
+    gf::dsv4_hc_head(B->Rb, hfn, hsc, hba, g.hc_eps, onorm, g.norm_eps, E, B->head_x, B->head_xq, s);
+    const WSlot& ow = ws_map_.at("output.weight");
+    gf::MvJob oa = {ow.q, F->head_xq, F->head_x, sc_ + sc_logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
+    gf::MvJob ob = {ow.q, B->head_xq, B->head_x, B->logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
+    if (ow.type == 0) oa.w = ob.w = ow.f32;
+    if (!gf::mv2(&oa, &ob, 1, s)) { err = "dsv4 spec: output head"; return false; }
+    gf::argmax(sc_ + sc_logits, g.n_vocab, B->tok, s);
+    gf::argmax(B->logits, g.n_vocab, B->tok + 1, s);
+    if (F->prof_on) F->mark("v_head");
+    cudaMemcpyAsync(B->tok_h, B->tok, 2 * sizeof(int), cudaMemcpyDeviceToHost, s);
+    cudaEventRecord(F->ev_done, s);
+    cudaError_t done;
+    while ((done = cudaEventQuery(F->ev_done)) == cudaErrorNotReady) std::this_thread::yield();
+    if (!glmfast::cuda_ok(done, "dsv4 spec round", err)) return false;
+    if (!F->route_ok(err)) return false;
+    if (gf::launch_errors() > 0) { err = "dsv4 spec: kernel launch(es) failed"; return false; }
+    ya = B->tok_h[0];
+    yb = B->tok_h[1];
+    if (F->prof_on) F->collect();
+    return true;
+}
+
+bool Glm5Model::d4_decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
+                               int64_t& produced, std::string& err) {
+    FastState* F = fast_;
+    D4Spec* B = d4spec_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const size_t hcb = (size_t) g.hc * g.n_embd * sizeof(float);
+    produced = 0;
+    const auto rollback = [&] {   // row B's windows back
+        for (const auto& u : B->runs)
+            cudaMemcpyAsync(state_ + u.off, B->win + u.at, (size_t) u.n * sizeof(float), cudaMemcpyDeviceToDevice, s);
+    };
+    int a = sample_token(sp, err);
+    if (a < 0) return false;
+    a = forced(a);
+    sp.counter += 1;
+    ++produced;
+    if (!emit(a)) return true;
+    int dft = -1;
+    if (!d4_mtp_draft(a, pos_, dft, err)) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    const int64_t tok0 = F->tokens;
+    const uint64_t r0 = d4_rounds_;
+    double verify_ms = 0.0;
+    const double mtp0 = mtp_ms_;
+    bool go = true;
+    while (go) {
+        int ya = -1, yb = -1;
+        const int64_t p = pos_;
+        const auto tv = std::chrono::steady_clock::now();
+        if (!d4_verify2(a, dft, ya, yb, err)) return false;
+        verify_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tv).count();
+        ++d4_rounds_;
+        const int t1 = forced(ya);
+        if (t1 == dft && ya == dft) {   // the draft holds: both rows stay
+            ++d4_accepts_;
+            sp.counter += 1;
+            ++produced;
+            if (!emit(t1)) { rollback(); pos_ = p + 1; last_tok_ = ya; break; }
+            pos_ = p + 2;
+            const int t2 = forced(yb);
+            sp.counter += 1;
+            ++produced;
+            F->tokens += 2;
+            int dummy = -1;
+            // the block's window takes row (d at p + 1, A's streams) before it drafts from (t2, B's)
+            if (!d4_mtp_draft(dft, p + 1, dummy, err)) return false;
+            cudaMemcpyAsync(state_, B->Rb, hcb, cudaMemcpyDeviceToDevice, s);
+            last_tok_ = t2;
+            if (!emit(t2)) break;
+            a = t2;
+            if (!d4_mtp_draft(a, p + 2, dft, err)) return false;
+        } else {
+            rollback();
+            pos_ = p + 1;
+            F->tokens += 1;
+            sp.counter += 1;
+            ++produced;
+            last_tok_ = t1;
+            if (!emit(t1)) break;
+            a = t1;
+            if (!d4_mtp_draft(a, p + 1, dft, err)) return false;
+        }
+        (void) max_new;
+    }
+    cudaStreamSynchronize(s);
+    F->ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    (void) tok0;
+    const double wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const double nr = (double) std::max<uint64_t>(1, d4_rounds_ - r0);
+    std::fprintf(stderr, "dsv4 mtp spec: %llu / %llu drafts accepted (%.1f%%); a round %.1f ms: verify %.1f, drafts %.1f\n",
+                 (unsigned long long) d4_accepts_, (unsigned long long) d4_rounds_,
+                 100.0 * d4_accepts_ / std::max<uint64_t>(1, d4_rounds_), wall / nr, verify_ms / nr, (mtp_ms_ - mtp0) / nr);
     return true;
 }
 }  // namespace strata::core

@@ -1026,6 +1026,63 @@ __global__ void __launch_bounds__(256) mv_kernel_t(const __grid_constant__ MvBat
     if (lane == 0) J.y[row] = J.alpha * s + (J.bias ? J.bias[row] : 0.0f);
 }
 
+// two inputs through the same weights (a speculative verify's two rows): batch a's job i and batch b's job i share the
+// weight; a warp computes its row for a, then for b while the row's bytes are still in the caches.  Each value is
+// mv_kernel(_t)'s for that input, bit for bit.
+template<int T>
+__global__ void __launch_bounds__(256) mv2_kernel_t(const __grid_constant__ MvBatch a, const __grid_constant__ MvBatch b) {
+    const int bid = blockIdx.x;
+    int ji = 0;
+    while (ji < a.n - 1 && bid >= a.blk_end[ji]) ++ji;
+    const int blk0 = ji ? a.blk_end[ji - 1] : 0;
+    const int row = (bid - blk0) * MV_ROWS + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    const MvJob& J = a.j[ji];
+    if (row >= J.n_out) return;
+    const MvJob& K = b.j[ji];
+    float s0, s1;
+    if constexpr (T == 8) {   // one load of each weight item for both inputs (dot_q8_0's arithmetic per input)
+        const block_q8_0* w = (const block_q8_0*) ((const uint8_t*) J.w + (size_t) row * rbytes<8>(J.n_in));
+        const block_q8_1 *x0 = (const block_q8_1*) J.xq, *x1 = (const block_q8_1*) K.xq;
+        const int n = J.n_in / 32 * 4;
+        s0 = s1 = 0.0f;
+        for (int k = lane; k < n; k += 32) {
+            const int kb = k / 4, iqs = 2 * (k % 4);
+            const block_q8_0* wb = w + kb;
+            const int v0 = get_int_b2(wb->qs, iqs), v1 = get_int_b2(wb->qs, iqs + 1);
+            const float d = __half2float(wb->d);
+            const int a0 = __dp4a(v1, ((const int*) x0[kb].qs)[iqs + 1], __dp4a(v0, ((const int*) x0[kb].qs)[iqs], 0));
+            const int a1 = __dp4a(v1, ((const int*) x1[kb].qs)[iqs + 1], __dp4a(v0, ((const int*) x1[kb].qs)[iqs], 0));
+            s0 += d * __low2float(x0[kb].ds) * float(a0);
+            s1 += d * __low2float(x1[kb].ds) * float(a1);
+        }
+        s0 = warp_sum(s0);
+        s1 = warp_sum(s1);
+    } else if (J.type == kTypeF16 && J.xq == nullptr) {   // row_dot_f16 for both inputs
+        const uint4* r8 = (const uint4*) ((const uint16_t*) J.w + (size_t) row * J.n_in);
+        const float4 *p0 = (const float4*) J.xf, *p1 = (const float4*) K.xf;
+        s0 = s1 = 0.0f;
+        for (int k = lane; k < J.n_in / 8; k += 32) {
+            const uint4 w = r8[k];
+            const float2 w0 = __half22float2(*(const __half2*) &w.x), w1 = __half22float2(*(const __half2*) &w.y),
+                         w2 = __half22float2(*(const __half2*) &w.z), w3 = __half22float2(*(const __half2*) &w.w);
+            float4 a = p0[2 * k], c = p0[2 * k + 1];
+            s0 += w0.x * a.x + w0.y * a.y + w1.x * a.z + w1.y * a.w + w2.x * c.x + w2.y * c.y + w3.x * c.z + w3.y * c.w;
+            a = p1[2 * k]; c = p1[2 * k + 1];
+            s1 += w0.x * a.x + w0.y * a.y + w1.x * a.z + w1.y * a.w + w2.x * c.x + w2.y * c.y + w3.x * c.z + w3.y * c.w;
+        }
+        s0 = warp_sum(s0);
+        s1 = warp_sum(s1);
+    } else {
+        s0 = any_row_dot(J.type, J.w, row, J.xq, J.xf, J.n_in, lane);
+        s1 = any_row_dot(K.type, K.w, row, K.xq, K.xf, K.n_in, lane);
+    }
+    if (lane == 0) {
+        J.y[row] = J.alpha * s0 + (J.bias ? J.bias[row] : 0.0f);
+        K.y[row] = K.alpha * s1 + (K.bias ? K.bias[row] : 0.0f);
+    }
+}
+
 #if defined(STRATA_USE_HIP)
 // ---------------------------------------------------------------- the dense GEMV on RDNA3 (gfx11)
 // Q6_K is ~64% of a decode token's bytes (Maya-S: the KDA/DSA projections, the shared experts, the dense FFN and the
@@ -3347,6 +3404,35 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         mv_kernel<<<acc, 256, 0, s>>>(b);
     }
     launch_check("mv");
+    return true;
+}
+
+bool mv2(const MvJob* ja, const MvJob* jb, int n, cudaStream_t s) {
+    if (n <= 0 || n > kMaxMvJobs) return false;
+    for (int i = 0; i < n; ++i)
+        if (!mv_type_ok(ja[i].type) || ja[i].type != jb[i].type || ja[i].w != jb[i].w || ja[i].n_in != jb[i].n_in ||
+            ja[i].n_out != jb[i].n_out) {
+            std::fprintf(stderr, "glm_fast mv2: job %d does not pair\n", i);
+            return false;
+        }
+    // one launch per type group as mv(): Q8_0 typed, the rest generic
+    for (int pass = 0; pass < 2; ++pass) {
+        MvBatch a{}, b{};
+        int acc = 0, m = 0;
+        for (int i = 0; i < n; ++i) {
+            if ((ja[i].type == 8) != (pass == 0)) continue;
+            a.j[m] = ja[i];
+            b.j[m] = jb[i];
+            acc += (ja[i].n_out + MV_ROWS - 1) / MV_ROWS;
+            a.blk_end[m] = b.blk_end[m] = acc;
+            ++m;
+        }
+        if (m == 0) continue;
+        a.n = b.n = m;
+        if (pass == 0) mv2_kernel_t<8><<<acc, 256, 0, s>>>(a, b);
+        else mv2_kernel_t<-1><<<acc, 256, 0, s>>>(a, b);
+    }
+    launch_check("mv2");
     return true;
 }
 

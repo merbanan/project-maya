@@ -36,6 +36,8 @@ struct MvJob {
 constexpr int kMaxMvJobs = 8;
 /// One launch for up to kMaxMvJobs independent GEMVs (they share nothing but the launch).
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
+/// mv() of two inputs through the same weights: ja[i] and jb[i] differ only in xq / xf / y / bias / alpha.
+bool mv2(const MvJob* ja, const MvJob* jb, int n, cudaStream_t s);
 /// Whether mv() serves this weight type.
 bool mv_supported(int type);
 /// Whether moe_gate_up() / moe_down() serve routed experts of this type.
