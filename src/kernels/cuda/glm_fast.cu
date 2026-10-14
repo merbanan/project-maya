@@ -2316,6 +2316,22 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     __shared__ unsigned long long s_pp[8], s_cs[8];
     __shared__ int s_npf, s_pfid[8];
     __shared__ unsigned long long s_pfptr[8];
+    // the route's table entries, counts and this layer's spares, read by many threads at once (thread 0's walk below
+    // read them one dependent load after another); it writes every change through to the tables as before
+    __shared__ unsigned long long s_tv[8], s_rv[8], s_sp[kSpares];
+    __shared__ unsigned int s_cnt[8];
+    {
+        const bool counting = a.cpu_plan != 0ull && a.skip_from > 0;
+        if (tid < a.k) {
+            const size_t key = (size_t) a.layer * E + s_ids[tid];
+            s_tv[tid] = a.d.tab[key];
+            s_rv[tid] = a.d.tab[a.d.n_keys + key];
+            s_cnt[tid] = a.d.dcnt == nullptr ? 0u : counting ? ++a.d.dcnt[key] : a.d.dcnt[key];
+        } else if (tid >= 32 && tid < 32 + kSpares) {
+            s_sp[tid - 32] = a.d.tab[2 * (size_t) a.d.n_keys + (size_t) a.layer * kSpares + (tid - 32)];
+        }
+    }
+    __syncthreads();
     if (tid == 0) {
         double sum = 0.0;
         for (int i = 0; i < a.k; ++i) sum += (double) s_p[s_ids[i]];
@@ -2332,9 +2348,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             int f_ram = 0, ri[8];
             unsigned int rcnt[8];
             for (int i = 0; i < a.k; ++i) {
-                const size_t key = (size_t) a.layer * E + s_ids[i];
-                const unsigned int c = a.d.dcnt != nullptr ? ++a.d.dcnt[key] : 0u;
-                if (i < a.skip_from && a.d.tab[key] == 0ull && rtab[key] != 0ull) {
+                const unsigned int c = s_cnt[i];
+                if (i < a.skip_from && s_tv[i] == 0ull && s_rv[i] != 0ull) {
                     ri[f_ram] = i;
                     rcnt[f_ram++] = c;
                 }
@@ -2351,14 +2366,14 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             const float w = (float) ((double) s_p[s_ids[i]] * inv * a.w_scale);
             s_w[i] = w;
             const size_t key = (size_t) a.layer * E + s_ids[i];
-            unsigned long long ptr = a.d.tab[key];
+            unsigned long long ptr = s_tv[i];
             unsigned long long src = 0ull;
             s_pp[i] = 0ull;
             s_cs[i] = 0ull;
             if (ptr == 0ull && i >= a.skip_from) {
                 // left out: the expert kernels skip a null plan entry (a draft only has to be a good guess)
             } else if (ptr == 0ull) {
-                src = rtab[key];
+                src = s_rv[i];
                 if (src != 0ull && ((host_set >> i) & 1u)) {
                     // to the host: a null plan entry (the expert kernels skip it), no spare, no fetch
                     cpu |= 1u << i;
@@ -2368,10 +2383,11 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
                     // not in VRAM: land it in a spare slot of this layer (it becomes resident: the table says so
                     // from here on) or, with none left, in this entry's scratch slot.  promote_min > 1: keep it
                     // only when its aged route count clears the bar - one-offs take scratch and do not churn the tier
-                    const unsigned int rc = a.d.dcnt != nullptr ? a.d.dcnt[key] : 0u;
-                    while (next_spare < kSpares && spares[next_spare] == 0ull) ++next_spare;
+                    const unsigned int rc = s_cnt[i];
+                    while (next_spare < kSpares && s_sp[next_spare] == 0ull) ++next_spare;
                     if (next_spare < kSpares && (a.promote_min <= 1 || rc >= (unsigned int) a.promote_min)) {
-                        ptr = spares[next_spare];
+                        ptr = s_sp[next_spare];
+                        s_sp[next_spare] = 0ull;
                         spares[next_spare] = 0ull;
                         a.d.tab[key] = ptr;
                         promo |= 1u << i;
