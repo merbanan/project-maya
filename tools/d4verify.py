@@ -1,5 +1,6 @@
-"""DSv4 verify-cost probe: how long n+1 tokens take in one pass (the prompt path from a snapshot, as an MTP verify of
-n drafts would) against n+1 decode steps.  python d4verify.py [TOKENS]"""
+"""DSv4 verify-cost probe: how long n+1 tokens take as one request after a snapshot of the prompt, against n+1 decode
+steps.  Under 32 new tokens the engine runs them through the TOKEN path (one decode step each); with
+STRATA_GLM_PREFILL_MIN=1 through the batched PROMPT path (what a batched MTP verify would use).  python d4verify.py [TOKENS]"""
 import os, subprocess, sys, time
 sys.path.insert(0, "tools")
 import strata_tokenizer as T
