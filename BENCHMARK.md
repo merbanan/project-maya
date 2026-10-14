@@ -144,6 +144,11 @@ for ~1.88 tokens. tools/d4mtp.py, 3 prompts x 256 tokens:
 | default pool, MTP experts q2_k (2.30 GB) | 31.7 / 31.7 / 33.0 | 32.9 / 30.0 / 34.1 |
 | 28K prompts | 26.3 / 26.3 / 26.3 | 26.5 / 24.2 / 25.8 |
 
+Split verify (dsv4 c193e7f, the default; after lighttransport/Strata glm53f and PolyStrata): the rows half a
+layer apart, one row's CPU-lane experts under the other row's attention. Same run, default pool: plain 31.3 / 31.6 /
+33.2, split **34.4 / 33.0 / 34.7** (+6%, a round 54.0 ms), joint (`STRATA_DSV4_SPEC_JOINT=1`) 32.8 / 31.6 / 33.4.
+28K: plain 26.2 / 26.4 / 26.8, split 28.0 / 24.9 / 24.9 (a round 74.7 ms), needles 3/3.
+
 Round profile: dense GEMVs 10.3 ms (one row 10.0), MoE side 34.5 ms (one row 17.6: CPU-lane wait 14.3, fetch 6.1) -
 the expert pipeline is CPU-lane bound and costs both rows in full, so the gain is the shared dense reads minus the
 VRAM the MTP block takes from the pool: even at default settings.
