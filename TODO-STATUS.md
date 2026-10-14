@@ -42,6 +42,12 @@ lives. Branches on the fork: `qwen38` (strata-dense: Qwen3.8-27B, Qwen3.6-35B-A3
 | freetoken-ox-boost review | done | its wins (prefetch, soft cache, overlap, FP8) map to the above; FP8 n/a on V100 |
 | VRAM release on stop | done | engine exits when its server is gone (e6beee4 ...), and at once after QUIT |
 
+## Open
+
+| Item | Status | Evidence |
+|---|---|---|
+| Forks in Niko1221/Strata#2067 (lighttransport/Strata `glm53f`, PolyStrata / NenadSteric, iMilnb HIP, mw00/project-maya) | in progress | investigating for GLM / DSv4 / Hy3 prefill and decode ideas |
+
 ## Serving / tooling
 
 | Item | Status | Evidence |
