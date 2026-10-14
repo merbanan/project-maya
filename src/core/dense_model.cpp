@@ -175,6 +175,16 @@ struct DenseModel::Impl {
     uint64_t dev_used = 0, host_bytes = 0;
     int host_tensors = 0;
     cudaStream_t stream = nullptr;
+    // decode graphs (STRATA_DENSE_GRAPH=0 disables): the segments between attention cores of a pass of up to 8 rows,
+    // per (rows, verify, logits); dropped when a buffer they hold moves
+    bool pairs_mma = false;   // STRATA_DENSE_PAIRS_MMA: the experts' tensor-core GEMVs at 1-3 rows too
+    bool graphs = false;   // (measured: no gain on the 35B / 27B decode - the kernels, not the launches, cost)
+    std::map<int, std::vector<cudaGraphExec_t>> graph_sets;
+    void drop_graphs() {
+        for (auto& [k, v] : graph_sets)
+            for (cudaGraphExec_t g : v) cudaGraphExecDestroy(g);
+        graph_sets.clear();
+    }
     int chunk = 512;                                // the largest T of a forward pass
     int max_in = 0;                                 // the widest input the activation conversions are sized for
     int kv_mode = 0;                                // the K / V cache: 0 FP16, 1 K8V4 (STRATA_DENSE_KV / --kv)
@@ -395,7 +405,7 @@ struct DenseModel::Impl {
     // ---- the projections of T token rows (x dense rows of n_in): prep() once per input, then mm() per matrix
     // up to 8 rows: the tensor-core GEMV (q35_mmt) for the formats it takes - from mmt_min rows, or from 1 with
     // STRATA_DENSE_MMT1 - else native_mmvq's dp4a GEMV (its q8_1 activations made on first use)
-    bool mmt_on = true, mmt1 = false;
+    bool mmt_on = true, mmt1 = false, packed_dp4a = true;   // (STRATA_DENSE_PACKED_DP4A=0: the tensor-core form at 1-3 rows)
     int mmt_min = 4;                                // (dp4a is faster up to 3 rows on a V100)
     uint16_t* xh8 = nullptr;
     float* mmt_part = nullptr;
@@ -418,6 +428,11 @@ struct DenseModel::Impl {
             } else {
                 gemm.native(xh, w.type, w.dev, y, cur_T, w.n_out, w.n_in);
             }
+            return;
+        }
+        if (w.packed && cur_T < mmt_min && packed_dp4a && q35_mmtp_dp4a_supported(w.type)) {
+            if (!q8_ready) { native_quantize_q8_1(cur_x, q8_1, cur_n, cur_T, stream); q8_ready = true; }
+            q35_mmtp_dp4a(w.type, w.dev, q8_1, y, w.n_in, w.n_out, cur_T, mmt_part, stream);
             return;
         }
         if (w.packed) {
@@ -502,6 +517,7 @@ DenseModel::DenseModel() : impl_(new Impl) {}
 DenseModel::~DenseModel() {
     if (!impl_) return;
     if (impl_->stream) cudaStreamSynchronize(impl_->stream);
+    impl_->drop_graphs();
     for (void* p : impl_->allocations) cudaFree(p);
     for (void* p : impl_->host_allocs) cudaFreeHost(p);
     for (uint8_t* p : impl_->ckpt) if (p) cudaFreeHost(p);
@@ -882,6 +898,9 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         if (const char* e = std::getenv("STRATA_DENSE_MMT")) I.mmt_on = std::atoi(e) != 0;
         if (const char* e = std::getenv("STRATA_DENSE_MMT1")) I.mmt1 = std::atoi(e) != 0;
         if (const char* e = std::getenv("STRATA_DENSE_MMT_MIN")) I.mmt_min = std::max(1, std::atoi(e));
+        if (const char* e = std::getenv("STRATA_DENSE_GRAPH")) I.graphs = std::atoi(e) != 0;
+        if (const char* e = std::getenv("STRATA_DENSE_PACKED_DP4A")) I.packed_dp4a = std::atoi(e) != 0;
+        I.pairs_mma = std::getenv("STRATA_DENSE_PAIRS_MMA") != nullptr;
 
         reset();
         std::string serr;
@@ -916,20 +935,24 @@ bool DenseModel::sync(std::string& err) {
 
 namespace {
 
-// The attention layer's mixer for T rows at p0 (xn prepared): mix = attn_output(gated attention)
-void attn_mixer(DenseModel::Impl& I, const DenseConfig& c, Layer& L, int64_t p0, int T, int max_ctx) {
-    const int H = c.n_head, HK = c.n_head_kv, D = c.head_dim;
+// The attention layer's mixer for T rows at p0 (xn prepared): mix = attn_output(gated attention), in three parts:
+// the projections and the output projection read no position (a decode graph holds them), the core does
+void attn_proj(DenseModel::Impl& I, Layer& L) {
     I.mm(L.q, I.q_full);
     I.mm(L.k, I.kcur);
     I.mm(L.v, I.vcur);
     I.stage("attn_qkv", I.stream);
+}
+void attn_core(DenseModel::Impl& I, const DenseConfig& c, Layer& L, int64_t p0, int T) {
+    const int H = c.n_head, HK = c.n_head_kv, D = c.head_dim;
     q35_attn_prep(I.q_full, H * 2 * D, I.kcur, I.vcur, HK * D, L.q_norm, L.k_norm, c.rms_eps, c.rope_base, c.n_rot,
                   (int) p0, T, H, HK, D, I.qcur, L.kv, I.stream);
-    (void) max_ctx;
     q35_attn(I.qcur, L.kv, (int) p0, T, H, HK, D, I.q_full, H * 2 * D, I.attn, I.attn_scratch,
              T <= kMaxCols ? 0 : 1, I.stream);
     I.stage("attn_core", I.stream);
-    I.prep(I.attn, H * D, T);
+}
+void attn_out(DenseModel::Impl& I, const DenseConfig& c, Layer& L, int T) {
+    I.prep(I.attn, c.n_head * c.head_dim, T);
     I.mm(L.o, I.mix);
     I.stage("attn_out", I.stream);
 }
@@ -945,7 +968,30 @@ void moe_ffn(DenseModel::Impl& I, const DenseConfig& c, Layer& L, float* x, int 
     q35_moe_route_ld(I.moe_logits, NR, T, NE, K, c.expert_weights_scale, I.moe_ids, I.moe_w, s);
     const bool pairs = P <= 64 && q35_mmt_supported(L.type_gate) && q35_mmt_supported(L.type_up) &&
                        q35_mmt_supported(L.type_down) && FF % 256 == 0;
-    if (pairs) {   // a decode / verify window: each (token, expert) pair its own GEMV, no grouping
+    const bool dp4a = pairs && T < I.mmt_min && native_mmvq_pairs_supported(L.type_gate) &&
+                      native_mmvq_pairs_supported(L.type_up) && native_mmvq_pairs_supported(L.type_down) &&
+                      (int64_t) P * FF <= (int64_t) kMaxCols * I.max_in && !I.pairs_mma;
+    if (dp4a) {   // a window of 1-3 tokens: dp4a GEMVs a (token, expert) pair (the tensor-core form pads to 8 columns)
+        native_quantize_q8_1(I.xn, I.q8_1, E, T, s);
+        I.stage("moe_route", s);
+        if (L.type_up == L.type_gate) {   // one launch for both
+            native_mmvq_pairs(L.type_gate, L.exp_gate, mmq::matrix_bytes(L.type_gate, FF, E), I.moe_ids, I.moe_pairtok,
+                              I.q8_1, I.moe_g, E, FF, P, s, L.exp_up, I.moe_u);
+        } else {
+            native_mmvq_pairs(L.type_gate, L.exp_gate, mmq::matrix_bytes(L.type_gate, FF, E), I.moe_ids, I.moe_pairtok,
+                              I.q8_1, I.moe_g, E, FF, P, s);
+            native_mmvq_pairs(L.type_up, L.exp_up, mmq::matrix_bytes(L.type_up, FF, E), I.moe_ids, I.moe_pairtok,
+                              I.q8_1, I.moe_u, E, FF, P, s);
+        }
+        I.stage("ex_gate_up", s);
+        dense_swiglu(I.moe_g, I.moe_u, I.moe_g, (int64_t) P * FF, s);
+        native_quantize_q8_1(I.moe_g, I.q8_1, P * FF, 1, s);   // (the pairs' rows back to back: one long row)
+        I.stage("ex_swiglu", s);
+        native_mmvq_pairs(L.type_down, L.exp_down, mmq::matrix_bytes(L.type_down, E, FF), I.moe_ids, I.moe_iota,
+                          I.q8_1, I.moe_y, FF, E, P, s);
+        I.q8_ready = false;   // (the shared expert quantizes its rows again)
+        I.stage("moe_experts", s);
+    } else if (pairs) {   // a decode / verify window: each (token, expert) pair its own GEMV, no grouping
         q35_to_half(I.xn, I.xh, (int64_t) T * E, s);
         if (T <= 8) {   // (the shared expert's GEMV reads the same FP16 rows)
             cudaMemcpyAsync(I.xh8, I.xh, (size_t) T * E * 2, cudaMemcpyDeviceToDevice, s);
@@ -954,10 +1000,13 @@ void moe_ffn(DenseModel::Impl& I, const DenseConfig& c, Layer& L, float* x, int 
         I.stage("moe_route", s);
         q35_mmt_pairs(L.type_gate, L.exp_gate, strata::prefill::mmq::matrix_bytes(L.type_gate, FF, E), I.moe_ids,
                       I.moe_pairtok, I.xh, I.moe_g, E, FF, P, I.mmt_part, s);
+        I.stage("ex_gate", s);
         q35_mmt_pairs(L.type_up, L.exp_up, strata::prefill::mmq::matrix_bytes(L.type_up, FF, E), I.moe_ids,
                       I.moe_pairtok, I.xh, I.moe_u, E, FF, P, I.mmt_part, s);
+        I.stage("ex_up", s);
         dense_swiglu(I.moe_g, I.moe_u, I.moe_g, (int64_t) P * FF, s);
         q35_to_half(I.moe_g, I.xh, (int64_t) P * FF, s);
+        I.stage("ex_swiglu", s);
         q35_mmt_pairs(L.type_down, L.exp_down, strata::prefill::mmq::matrix_bytes(L.type_down, E, FF), I.moe_ids,
                       I.moe_iota, I.xh, I.moe_y, FF, E, P, I.mmt_part, s);
         I.stage("moe_experts", s);
@@ -992,10 +1041,12 @@ void moe_ffn(DenseModel::Impl& I, const DenseConfig& c, Layer& L, float* x, int 
     const int SF = c.n_ff_shexp;
     if (sh) {
         I.prep(I.xn, E, T);
-        if (pairs && T <= 8) I.h8_ready = true;   // (xh8 already holds these rows)
+        if (pairs && !dp4a && T <= 8) I.h8_ready = true;   // (xh8 already holds these rows)
         if (L.sh_gu.dev) {   // gate and up in one GEMV: rows [g | u] per token
             I.mm(L.sh_gu, I.ffn_g);
+            I.stage("sh_gu", s);
             q35_swiglu_rows(I.ffn_g, I.ffn_g + SF, 2 * SF, I.ffn_h, SF, T, s);
+            I.stage("sh_swiglu", s);
         } else {
             I.mm(L.sh_gate_m, I.ffn_g);
             I.mm(L.sh_up, I.ffn_u);
@@ -1003,6 +1054,7 @@ void moe_ffn(DenseModel::Impl& I, const DenseConfig& c, Layer& L, float* x, int 
         }
         I.prep(I.ffn_h, SF, T);
         I.mm(L.sh_down, I.moe_sh);
+        I.stage("sh_down", s);
     }
     q35_moe_combine_ld(I.moe_y, pairs ? I.moe_iota : I.moe_pos, I.moe_w, T, K, E,
                        sh && L.sh_gate ? I.moe_logits + NE : nullptr, NR, sh ? I.moe_sh : nullptr,
@@ -1048,12 +1100,28 @@ bool DenseModel::forward(const int32_t* tokens, int T, bool verify, int want, st
             dequant_f32(I.embd.type, I.embd.dev, tokens[t], 1, E, I.x + (size_t) t * E, s);
         I.stage("embed", s);
 
-        for (int l = 0; l < cfg_.n_layer; ++l) {
+        auto post = [&](int l) {   // the layer from the mixer's output: the residual add, the FFN, the drafter taps
+            Layer& L = I.layers[(size_t) l];
+            if (L.attn) attn_out(I, cfg_, L, T);
+            q35_add(I.x, I.mix, (int64_t) T * E, s);
+            ffn(I, cfg_, L, I.x, T);
+            I.stage("ffn", s);
+            if (I.df.on)   // the drafter's features: the residual after its target layers, in their order
+                for (size_t j = 0; j < I.df.target_layers.size(); ++j)
+                    if (I.df.target_layers[j] == l)
+                        cudaMemcpy2DAsync(I.df.feat + j * E, I.df.target_layers.size() * E * 4, I.x, (size_t) E * 4,
+                                          (size_t) E * 4, T, cudaMemcpyDeviceToDevice, s);
+        };
+        // the pass as steps: the ones that read no position run as CUDA graphs (a segment between two attention
+        // cores, one graph set per (rows, verify, logits) - the launches of a small model's decode cost more than
+        // its kernels); the attention cores (their position, their grid) run as they are
+        auto pre = [&](int l) {   // the layer up to the attention core (all of a GDN layer)
             Layer& L = I.layers[(size_t) l];
             q35_rms_rows(I.x, E, L.attn_norm, I.xn, nullptr, T, E, eps, s);
             I.prep(I.xn, E, T);
             I.stage("norm_prep", s);
-            if (!L.attn) {
+            if (L.attn) { attn_proj(I, L); return; }
+            {
                 // ---- gated delta net: a verify pass keeps the recurrence's inputs for commit()
                 float* raw = verify ? L.st_raw : I.qkv;
                 float* cv = verify ? L.st_conv : I.conv;
@@ -1082,24 +1150,63 @@ bool DenseModel::forward(const int32_t* tokens, int T, bool verify, int want, st
                 I.prep(I.y, V, T);
                 I.mm(L.ssm_out, I.mix);
                 I.stage("gdn_out", s);
-            } else {
-                attn_mixer(I, cfg_, L, p0, T, (int) max_context_);
             }
-            q35_add(I.x, I.mix, (int64_t) T * E, s);
-            ffn(I, cfg_, L, I.x, T);
-            I.stage("ffn", s);
-            if (I.df.on)   // the drafter's features: the residual after its target layers, in their order
-                for (size_t j = 0; j < I.df.target_layers.size(); ++j)
-                    if (I.df.target_layers[j] == l)
-                        cudaMemcpy2DAsync(I.df.feat + j * E, I.df.target_layers.size() * E * 4, I.x, (size_t) E * 4,
-                                          (size_t) E * 4, T, cudaMemcpyDeviceToDevice, s);
-        }
-        // the final norm of every row (the MTP block reads them), then the logits asked for
-        q35_rms_rows(I.x, E, I.output_norm, I.hn, nullptr, T, E, eps, s);
-        if (want != kNone) {
-            const int rows = want == kAll ? T : 1;
-            I.prep(want == kAll ? I.hn : I.hn + (size_t) (T - 1) * E, E, rows);
-            I.mm(I.head, I.logits);
+            post(l);
+        };
+        auto head = [&]() {   // the final norm of every row (the MTP block reads them), then the logits asked for
+            q35_rms_rows(I.x, E, I.output_norm, I.hn, nullptr, T, E, eps, s);
+            if (want != kNone) {
+                const int rows = want == kAll ? T : 1;
+                I.prep(want == kAll ? I.hn : I.hn + (size_t) (T - 1) * E, E, rows);
+                I.mm(I.head, I.logits);
+            }
+        };
+        const bool graphs = I.graphs && T <= kMaxCols && !I.prof.on;
+        if (!graphs) {
+            for (int l = 0; l < cfg_.n_layer; ++l) {
+                pre(l);
+                if (I.layers[(size_t) l].attn) { attn_core(I, cfg_, I.layers[(size_t) l], p0, T); post(l); }
+            }
+            head();
+        } else {
+            auto& set = I.graph_sets[(T * 2 + (verify ? 1 : 0)) * 4 + want];
+            size_t seg = 0;
+            int l = 0;
+            bool after_core = false;   // the segment starts with the post part of layer l
+            while (true) {
+                // one segment: [post(l) if after_core], then pre() of the layers up to and including the next attention
+                // layer's (or all, then the head)
+                const int l0 = l;
+                const bool ac0 = after_core;
+                auto body = [&]() {
+                    int k = l0;
+                    if (ac0) post(k++);
+                    while (k < cfg_.n_layer) {
+                        pre(k);
+                        if (I.layers[(size_t) k].attn) return;
+                        ++k;
+                    }
+                    head();
+                };
+                int k = l0 + (ac0 ? 1 : 0);
+                while (k < cfg_.n_layer && !I.layers[(size_t) k].attn) ++k;
+                if (seg == set.size()) {
+                    cudaGraph_t g = nullptr;
+                    cudaGraphExec_t ge = nullptr;
+                    if (cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal) != cudaSuccess)
+                        throw std::runtime_error("decode graph: capture");
+                    body();
+                    if (cudaStreamEndCapture(s, &g) != cudaSuccess || cudaGraphInstantiate(&ge, g, nullptr, nullptr, 0) != cudaSuccess)
+                        throw std::runtime_error("decode graph: instantiate");
+                    cudaGraphDestroy(g);
+                    set.push_back(ge);
+                }
+                if (cudaGraphLaunch(set[seg++], s) != cudaSuccess) throw std::runtime_error("decode graph: launch");
+                if (k >= cfg_.n_layer) break;
+                attn_core(I, cfg_, I.layers[(size_t) k], p0, T);
+                l = k;
+                after_core = true;
+            }
         }
         I.stage("head", s);
         I.prof_flush(T);
@@ -1156,7 +1263,9 @@ bool DenseModel::mtp_forward(const int32_t* toks, const float* hidden, int64_t p
         I.mm(M.eh_proj, x);
         q35_rms_rows(x, E, M.attn_norm, I.xn, nullptr, T, E, eps, s);
         I.prep(I.xn, E, T);
-        attn_mixer(I, cfg_, M, p0, T, (int) max_context_);
+        attn_proj(I, M);
+        attn_core(I, cfg_, M, p0, T);
+        attn_out(I, cfg_, M, T);
         q35_add(x, I.mix, (int64_t) T * E, s);
         ffn(I, cfg_, M, x, T);
         q35_rms_rows(x, E, M.head_norm, I.mtp_h, nullptr, T, E, eps, s);
@@ -1329,6 +1438,7 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
                     I.allocations.erase(std::find(I.allocations.begin(), I.allocations.end(), old));
                 }
                 I.max_in = need;
+                I.drop_graphs();
                 if (!I.alloc(&I.xh, (uint64_t) I.chunk * need * 2, err, "fp16 activations") ||
                     !I.alloc(&I.xh8, (uint64_t) 8 * need * 2, err, "fp16 rows") ||
                     !I.alloc(&I.q8_1, native_q8_1_bytes(need, kMaxCols), err, "q8_1 scratch"))

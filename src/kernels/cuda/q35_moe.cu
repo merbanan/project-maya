@@ -114,14 +114,65 @@ __global__ void group_kernel(const int32_t* __restrict__ ids, int P, int n_exp, 
 __global__ void combine_kernel(const float* __restrict__ y, const int32_t* __restrict__ pos_of_pair,
                                const float* __restrict__ w, int k, int E, const float* __restrict__ sh_logit, int sh_ld,
                                const float* __restrict__ sh, float* __restrict__ out, int add) {
-    const int t = blockIdx.x;
+    const int t = blockIdx.y;
     const float g = sh_logit ? 1.0f / (1.0f + expf(-sh_logit[(size_t) t * sh_ld])) : (sh ? 1.0f : 0.0f);
-    for (int e = threadIdx.x; e < E; e += blockDim.x) {
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < E; e += gridDim.x * blockDim.x) {
         float a = 0.0f;
         for (int j = 0; j < k; ++j) a += w[(size_t) t * k + j] * y[(size_t) pos_of_pair[(size_t) t * k + j] * E + e];
         if (sh) a += g * sh[(size_t) t * E + e];
         float* o = out + (size_t) t * E + e;
         *o = add ? *o + a : a;
+    }
+}
+
+// the same routing a warp a row (n_exp <= 32 * kPerLane): the logits in registers, softmax and k rounds of a warp
+// arg-max with shuffles only (the block form's barriers cost more than its work at one token); same picks, same ties
+constexpr int kPerLane = 8;
+__global__ void route_warp_kernel(const float* __restrict__ logits, int ld, int n_exp, int k, float scale,
+                                  int32_t* __restrict__ ids, float* __restrict__ w) {
+    const int lane = threadIdx.x & 31, row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const float* lr = logits + (size_t) row * ld;
+    float p[kPerLane];
+    float m = -FLT_MAX;
+#pragma unroll
+    for (int i = 0; i < kPerLane; ++i) {
+        const int e = lane + 32 * i;
+        p[i] = e < n_exp ? lr[e] : -FLT_MAX;
+        m = fmaxf(m, p[i]);
+    }
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kPerLane; ++i) {
+        p[i] = lane + 32 * i < n_exp ? expf(p[i] - m) : -1.0f;
+        if (p[i] > 0.0f || lane + 32 * i < n_exp) sum += fmaxf(p[i], 0.0f);
+    }
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    float sel = 0.0f, tot = 0.0f;
+    int mine = -1;   // lane r keeps pick r
+    for (int r = 0; r < k; ++r) {
+        float bv = -1.0f;
+        int bi = 0x7fffffff;
+#pragma unroll
+        for (int i = 0; i < kPerLane; ++i) {
+            const int e = lane + 32 * i;
+            if (p[i] > bv || (p[i] == bv && e < bi)) { bv = p[i]; bi = e; }
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        const float wv = bv / sum;
+        tot += wv;
+        if (lane == r) { sel = wv; mine = bi; }
+#pragma unroll
+        for (int i = 0; i < kPerLane; ++i)
+            if (lane + 32 * i == bi) p[i] = -2.0f;   // (taken)
+    }
+    if (lane < k) {
+        ids[(size_t) row * k + lane] = mine;
+        w[(size_t) row * k + lane] = sel / tot * scale;
     }
 }
 
@@ -142,20 +193,25 @@ void q35_moe_group(const int32_t* ids, int T, int k, int n_exp, int32_t* bounds,
 
 void q35_moe_combine(const float* y, const int32_t* pos_of_pair, const float* w, int T, int k, int E,
                      const float* sh_logit, const float* sh, float* out, bool add, void* stream) {
-    combine_kernel<<<T, 256, 0, (cudaStream_t) stream>>>(y, pos_of_pair, w, k, E, sh_logit, 1, sh, out, add);
+    combine_kernel<<<dim3((E + 255) / 256, T), 256, 0, (cudaStream_t) stream>>>(y, pos_of_pair, w, k, E, sh_logit, 1, sh, out, add);
     check("q35_moe_combine");
 }
 
 void q35_moe_route_ld(const float* logits, int ld, int T, int n_exp, int k, float scale, int32_t* ids, float* w,
                       void* stream) {
     if (n_exp > 1024 || k > 32) throw std::invalid_argument("q35_moe_route: up to 1024 experts, 32 picks");
+    if (n_exp <= 32 * kPerLane) {
+        route_warp_kernel<<<T, 32, 0, (cudaStream_t) stream>>>(logits, ld, n_exp, k, scale, ids, w);
+        check("q35_moe_route_warp");
+        return;
+    }
     route_kernel<<<T, 256, 0, (cudaStream_t) stream>>>(logits, ld, n_exp, k, scale, ids, w);
     check("q35_moe_route");
 }
 
 void q35_moe_combine_ld(const float* y, const int32_t* pos_of_pair, const float* w, int T, int k, int E,
                         const float* sh_logit, int sh_ld, const float* sh, float* out, bool add, void* stream) {
-    combine_kernel<<<T, 256, 0, (cudaStream_t) stream>>>(y, pos_of_pair, w, k, E, sh_logit, sh_ld, sh, out, add);
+    combine_kernel<<<dim3((E + 255) / 256, T), 256, 0, (cudaStream_t) stream>>>(y, pos_of_pair, w, k, E, sh_logit, sh_ld, sh, out, add);
     check("q35_moe_combine");
 }
 

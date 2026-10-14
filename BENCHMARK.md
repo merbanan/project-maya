@@ -16,8 +16,8 @@ Engines: `strata-dense` (branch `qwen38`) for the dense / small-MoE Qwen3.5-arch
 | Setting | Prompt (tok/s) | Decode (tok/s) | Notes |
 |---|---:|---:|---|
 | llama.cpp | 681 (1.6K) | 31.4 | |
-| no drafts | 1,017 (1.6K) / 1,063 (12K, chunk 2048) | 29.1 | one-token GEMV on the packed layout; 33.4 with the dp4a GEMV (`STRATA_DENSE_PACK=0`) |
-| MTP, 3 drafts | | 47.9 | 2.61 tokens a round |
+| no drafts | 1,017 (1.6K) / 1,063 (12K, chunk 2048) | 33.6 | dp4a GEMV on the packed layout for 1-3 rows (was 29.1 with the tensor-core form) |
+| MTP, 3 drafts | | 56.9 (128 tokens) | 2.46 tokens a round (47.9 before the dp4a draft steps) |
 | MTP, 7 drafts | | 48.7 | 3.20 tokens a round |
 | **DFlash2, 7 drafts** | | **96.6** (code answer) / 79.9 (after a 1.6K prompt) | 4.47 / 3.75 tokens a round; 69.4 at 1.6K before the split-K drafter attention |
 | DFlash2, sampled (T 0.6, top-k 20) | | 73.9 | 3.46 tokens a round |
@@ -43,11 +43,11 @@ Verify window cost (1K context): 1 token 37.6 ms, 8 tokens 40.6 ms (`STRATA_DENS
 | Setting | Prompt (tok/s) | Decode (tok/s) | Notes |
 |---|---:|---:|---|
 | llama.cpp | 731 (1.6K) | 88.6 | |
-| no drafts | 2,333 (1.6K) / 2,075 (28K) / 1,443 (94K) | 79.5 (short) / 70.3 (28K) / 57.5 (94K) | needles 3/3 at 28K and 94K |
-| MTP, 3 drafts (unsloth `-MTP-GGUF`) | | 139.2 | 2.78 tokens a round |
+| no drafts | 2,333 (1.6K) / 2,075 (28K) / 1,443 (94K) | **97.8** (short; was 79.5) / 70.3 (28K) / 57.5 (94K) | dp4a experts / packed GEMVs at 1-3 rows, warp router, gate + up one launch; needles 3/3 at 28K and 94K |
+| MTP, 3 drafts (unsloth `-MTP-GGUF`) | | 139.2 (256 tokens) / 137.3 (128) | 2.78 / 2.65 tokens a round |
 | MTP, 5 drafts | | 135.7 | 3.31 tokens a round |
 | DFlash2, 7 drafts (incoai/Qwen3.6-35B-A3B-DFlash2) | | 193.8 (code answer) / 197.1 (after 1.6K) / 162.7 (after 28K) | 4.83 / 5.00 / 4.49 tokens a round |
-| **DSpark, 7 drafts** (LithosAI NVFP4 -> F16 GGUF, Q8_0 at load) | | 193.3 (code answer) / **200.4** (after 1.6K) / 162.7 (after 28K, 8K window) | 4.92 / 5.22 / 4.74 tokens a round; needles 3/3 at 28K |
+| **DSpark, 7 drafts** (LithosAI NVFP4 -> F16 GGUF, Q8_0 at load) | | 201.1 (code answer) / **200.4** (after 1.6K) / 162.7 (after 28K, 8K window) | 4.92 / 5.22 / 4.74 tokens a round; needles 3/3 at 28K |
 
 Drafter changes behind these rows (commit e2a748a): split-K drafter attention (a kv head's rows together a chunk
 of the context: the 1.6K draft pass 10.4 -> 4.0 ms DFlash2, 18.1 -> 4.8 ms DSpark) and drafter K/V buffers of

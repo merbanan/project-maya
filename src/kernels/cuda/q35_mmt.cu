@@ -455,6 +455,122 @@ __global__ void __launch_bounds__(kW * 32) mmtp_kernel(const uint4* __restrict__
     }
 }
 
+// ---- dp4a on the packed layout, 1..3 token rows (the tensor-core form pads every product to 8 columns; at one
+// row the dequantization it pays for 8 dominates): a lane its row's whole super-block in registers (the same
+// coalesced chunk loads), integer dot products against the rows' Q8_1 blocks (36 bytes: half2 (d, sum), 32 int8).
+// A block 4 warps on one row group, splitting the super-blocks; partials across blockIdx.y as the tensor-core form.
+__device__ __forceinline__ void q8b(const uint8_t* __restrict__ xq, int blk, const int*& u, float& d, float& sm) {
+    const uint8_t* b = xq + (size_t) blk * 36;
+    const float2 ds = __half22float2(*(const __half2*) b);
+    d = ds.x; sm = ds.y;
+    u = (const int*) (b + 4);
+}
+__device__ __forceinline__ void k4_scale_min(int j, const uint8_t* q, int& sc, int& m) {
+    if (j < 4) { sc = q[j] & 63; m = q[j + 4] & 63; }
+    else { sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
+}
+// one super-block of a row (w: its words) . the column's Q8_1 blocks 8 sb .. 8 sb + 7
+template <int TYPE> __device__ __forceinline__ float sb_dot(const uint32_t* w, const uint8_t* __restrict__ xq, int sb) {
+    float acc = 0.0f;
+    if (TYPE == 12 || TYPE == 13) {   // Q4_K / Q5_K: d, dmin, scales[12], (Q5_K: qh[32]), qs[128]
+        const float d = __half2float(__ushort_as_half((unsigned short) (w[0] & 0xffff)));
+        const float dm = __half2float(__ushort_as_half((unsigned short) (w[0] >> 16)));
+        uint8_t sc8[12];
+#pragma unroll
+        for (int i = 0; i < 12; ++i) sc8[i] = (uint8_t) (w[1 + i / 4] >> (8 * (i % 4)));
+        constexpr int QS = TYPE == 12 ? 4 : 12;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int* u; float d8, s8;
+            q8b(xq, sb * 8 + j, u, d8, s8);
+            int sumi = 0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                uint32_t v = (w[QS + 8 * (j / 2) + i] >> (4 * (j & 1))) & 0x0f0f0f0fu;
+                if (TYPE == 13) v |= ((w[4 + i] >> j) & 0x01010101u) << 4;
+                sumi = __dp4a((int) v, u[i], sumi);
+            }
+            int sc, m;
+            k4_scale_min(j, sc8, sc, m);
+            acc += d * (float) sc * d8 * (float) sumi - dm * (float) m * s8;
+        }
+    } else if (TYPE == 14) {   // Q6_K: ql[128], qh[64], scales[16] (int8), d
+        const float d = __half2float(__ushort_as_half((unsigned short) (w[52] & 0xffff)));
+#pragma unroll
+        for (int n = 0; n < 2; ++n)
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                const int* u; float d8, s8;
+                q8b(xq, sb * 8 + 4 * n + g, u, d8, s8);
+                int lo = 0, hi = 0;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const uint32_t ql = w[16 * n + 8 * (g & 1) + i], qh = w[32 + 8 * n + i];
+                    uint32_t v = ((ql >> (4 * (g >> 1))) & 0x0f0f0f0fu) | (((qh >> (2 * g)) & 0x03030303u) << 4);
+                    v = __vsubss4(v, 0x20202020u);
+                    if (i < 4) lo = __dp4a((int) v, u[i], lo);
+                    else hi = __dp4a((int) v, u[i], hi);
+                }
+                const int b0 = 8 * n + 2 * g;
+                const int sA = (int) (int8_t) (w[48 + b0 / 4] >> (8 * (b0 % 4)));
+                const int sB = (int) (int8_t) (w[48 + (b0 + 1) / 4] >> (8 * ((b0 + 1) % 4)));
+                acc += d * d8 * (float) (sA * lo + sB * hi);
+            }
+    } else {   // Q8_0: 8 blocks of [half d | 32 int8], 34 bytes
+#pragma unroll
+        for (int bb = 0; bb < 8; ++bb) {
+            const int* u; float d8, s8;
+            q8b(xq, sb * 8 + bb, u, d8, s8);
+            const int o = 34 * bb;
+            const float dw = __half2float(__ushort_as_half((unsigned short) ((w[o >> 2] >> (8 * (o & 3))) & 0xffff)));
+            int sumi = 0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int b = o + 2 + 4 * i;
+                const uint32_t v = (b & 3) == 0 ? w[b >> 2] : __byte_perm(w[b >> 2], w[(b >> 2) + 1], 0x5432);
+                sumi = __dp4a((int) v, u[i], sumi);
+            }
+            acc += dw * d8 * (float) sumi;
+        }
+    }
+    return acc;
+}
+
+template <int TYPE, int M>
+__global__ void __launch_bounds__(128) mmtp_dp4a_kernel(const uint4* __restrict__ P, const uint8_t* __restrict__ X,
+                                                        int K, int N, int sb_per_split, float* __restrict__ out) {
+    constexpr int CH = packed_bytes<TYPE>() / 16;
+    __shared__ float red[3][M][32];
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, g = blockIdx.x, row = g * 32 + lane;
+    const int nsb = K / 256;
+    const int sb0 = blockIdx.y * sb_per_split, sb1 = min(nsb, sb0 + sb_per_split);
+    const size_t xs = (size_t) K / 32 * 36;   // a column's Q8_1 bytes
+    float acc[M];
+#pragma unroll
+    for (int t = 0; t < M; ++t) acc[t] = 0.0f;
+    for (int sb = sb0 + wp; sb < sb1; sb += 4) {
+        uint32_t w[4 * CH];
+        const uint4* tp = P + ((size_t) g * nsb + sb) * 32 * CH + lane;
+#pragma unroll
+        for (int k = 0; k < CH; ++k) {
+            const uint4 v = __ldg(tp + k * 32);
+            w[4 * k] = v.x; w[4 * k + 1] = v.y; w[4 * k + 2] = v.z; w[4 * k + 3] = v.w;
+        }
+#pragma unroll
+        for (int t = 0; t < M; ++t) acc[t] += sb_dot<TYPE>(w, X + t * xs, sb);
+    }
+    if (wp > 0)
+#pragma unroll
+        for (int t = 0; t < M; ++t) red[wp - 1][t][lane] = acc[t];
+    __syncthreads();
+    if (wp > 0 || row >= N) return;
+#pragma unroll
+    for (int t = 0; t < M; ++t) {
+        const float v = acc[t] + red[0][t][lane] + red[1][t][lane] + red[2][t][lane];
+        out[((size_t) blockIdx.y * M + t) * N + row] = v;
+    }
+}
+
 __global__ void reduce_kernel(const float* __restrict__ part, int splits, int64_t n, float* __restrict__ y) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -599,6 +715,44 @@ void q35_mmtp(int ggml_type, const void* packed, const uint16_t* xh8, float* y, 
         const int64_t n = (int64_t) M * N;
         reduce_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(part, splits, n, y);
         check("q35_mmtp_reduce");
+    }
+}
+
+bool q35_mmtp_dp4a_supported(int t) { return t == 12 || t == 13 || t == 14 || t == 8; }
+
+void q35_mmtp_dp4a(int ggml_type, const void* packed, const void* xq8_1, float* y, int K, int N, int M, float* part,
+                   void* stream) {
+    if (M < 1 || M > 3 || K % 256 != 0) throw std::invalid_argument("q35_mmtp_dp4a: 1..3 rows, K a multiple of 256");
+    const int nsb = K / 256, bx = (N + 31) / 32;
+    // blocks: enough to fill the GPU (8 a SM), each split at least 4 super-blocks (a warp one)
+    int splits = std::max(1, std::min(std::max(1, nsb / 4), (8 * sm_count() + bx - 1) / bx));
+    while (splits > 1 && (int64_t) splits * M * N > q35_mmt_part_floats(N)) --splits;
+    const int per = (nsb + splits - 1) / splits;
+    splits = (nsb + per - 1) / per;
+    float* dst = splits == 1 ? y : part;
+    const dim3 grid(bx, splits);
+    cudaStream_t s = (cudaStream_t) stream;
+    const uint4* P = (const uint4*) packed;
+    const uint8_t* X = (const uint8_t*) xq8_1;
+#define Q35_DP4A(T)                                                                                       \
+    switch (M) {                                                                                          \
+    case 1: mmtp_dp4a_kernel<T, 1><<<grid, 128, 0, s>>>(P, X, K, N, per, dst); break;                     \
+    case 2: mmtp_dp4a_kernel<T, 2><<<grid, 128, 0, s>>>(P, X, K, N, per, dst); break;                     \
+    default: mmtp_dp4a_kernel<T, 3><<<grid, 128, 0, s>>>(P, X, K, N, per, dst); break;                    \
+    }
+    switch (ggml_type) {
+    case 12: Q35_DP4A(12) break;
+    case 13: Q35_DP4A(13) break;
+    case 14: Q35_DP4A(14) break;
+    case 8: Q35_DP4A(8) break;
+    default: throw std::invalid_argument("q35_mmtp_dp4a: weight type");
+    }
+#undef Q35_DP4A
+    check("q35_mmtp_dp4a");
+    if (splits > 1) {
+        const int64_t n = (int64_t) M * N;
+        reduce_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(part, splits, n, y);
+        check("q35_mmtp_dp4a_reduce");
     }
 }
 

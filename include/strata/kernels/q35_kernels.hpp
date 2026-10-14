@@ -108,6 +108,10 @@ void q35_mmt_unpack(int ggml_type, const void* packed, void* W, int K, int N, vo
 /// rows row0 .. row0 + rows - 1 (row0 a multiple of 32) of a packed matrix to FP16 rows of K (the prompt's GEMMs)
 void q35_mmt_dequant_packed(int ggml_type, const void* packed, int K, int N, int row0, int rows, uint16_t* out,
                             void* stream);
+/// the packed form's dp4a GEMV for 1..3 rows: x as the rows' Q8_1 blocks (native_quantize_q8_1), K a multiple of 256
+bool q35_mmtp_dp4a_supported(int ggml_type);
+void q35_mmtp_dp4a(int ggml_type, const void* packed, const void* xq8_1, float* y, int K, int N, int M, float* part,
+                   void* stream);
 void q35_mmtp(int ggml_type, const void* packed, const uint16_t* xh8, float* y, int K, int N, int M, float* part,
               void* stream);
 
