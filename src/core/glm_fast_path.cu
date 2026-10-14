@@ -2519,8 +2519,13 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         const char* v = getenv("STRATA_GLM_WIN_LANES");
         return v == nullptr ? 2 : std::atoi(v);
     }();
-    // STRATA_GLM_WIN_L3=1: one NUMA node of several L3 domains (a Ryzen's two CCDs) - the lanes a domain each
-    static const bool win_l3 = getenv("STRATA_GLM_WIN_L3") != nullptr && std::atoi(getenv("STRATA_GLM_WIN_L3")) != 0;
+    // one NUMA node of several L3 domains (a Ryzen's two CCDs): the lanes a domain each (STRATA_GLM_WIN_L3=0: one lane,
+    // the calibrated plan).  V100 + 7950X, Maya-S24, --spec 3: one lane 21.5 / 20.1 / 25.0 tok/s, two 24.4 / 23.9 / 28.0
+    // (plain 24.5 / 27.7 / 26.3) - the window's RAM-tier experts on the CPU instead of over PCIe
+    static const bool win_l3 = [] {
+        const char* v = getenv("STRATA_GLM_WIN_L3");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
     if (!shared && n_parts_ == 1 && dflash_on_ && win_lanes != 0) {
         auto groups = cpu_groups();
         if (win_l3 && groups.size() < 2) groups = cpu_l3_groups();   // (the GPU's lane: the first domain)
