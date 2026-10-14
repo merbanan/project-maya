@@ -474,7 +474,8 @@ public:
     // kKvLent) - their experts moved over colder main-slot ones or parked in the RAM tier
     bool lend_range(const uint8_t* lo, const uint8_t* hi, char state, uint64_t& moved, uint64_t& dropped, std::string& err);
     bool fast_layers_gqa(int64_t p, std::string& err);      // hy_v3: this part's layers
-    bool fast_moe(int il, bool& pf_pending, std::string& err);   // one MoE FFN (x -> ffn)
+    bool fast_moe(int il, bool& pf_pending, std::string& err, bool cpu_wait = true);   // one MoE FFN (x -> ffn)
+    bool fast_moe_lane(int il) const;                       // whether layer il's routes give the CPU lane experts
     void fast_service();
     // gate / up / down of one expert from the shards (or its chunk-th of n_chunks pieces)
     void fast_read_part(int il, int e, int role, uint8_t* blob, int chunk = 0, int n_chunks = 1);

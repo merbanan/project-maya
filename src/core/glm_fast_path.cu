@@ -3718,7 +3718,13 @@ static int trunk_skip_from(int il) {
     return v;
 }
 
-bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
+bool Glm5Model::fast_moe_lane(int il) const {
+    return fast_->cpu_plan != 0ull && fast_->cpu_fmt[(size_t) il].n_ff > 0;
+}
+
+// (cpu_wait false: the CPU lane's answer is left for the caller's moe_cpu_wait - the MTP verify runs the other row's
+// attention meanwhile)
+bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err, bool cpu_wait) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
@@ -3815,7 +3821,7 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
                  Ly.sh_down.q != nullptr ? F->sh_out : nullptr, F->ffn, s);
     if (F->prof_on) F->mark("moe_down");
     // the CPU lane's experts last: the device's own down rows ran while the CPU worked
-    if (lane) {
+    if (lane && cpu_wait) {
         gf::moe_cpu_wait(md, g.n_embd, F->ffn, s);
         if (F->prof_on) F->mark("moe_cpu_wait");
     }
@@ -5894,7 +5900,53 @@ bool Glm5Model::d4_verify2(int32_t a, int32_t d, int& ya, int& yb, std::string& 
         f();
         if (r) d4_swap_rows(F, B);
     };
-    for (int il = l0_; il < l1_; ++il) {
+    // the default order: the rows half a layer apart, so a row's attention runs on the GPU while the CPU lane computes
+    // the other row's experts - route A, A's device experts, B's attention, A's CPU answer, route B, B's device
+    // experts, A's next attention, B's CPU answer, ... (one route's device work in flight at a time, as in decode).
+    // STRATA_DSV4_SPEC_JOINT=1: both rows' attention together (the dense weights read once), then each row's MoE.
+    static const bool joint = getenv("STRATA_DSV4_SPEC_JOINT") != nullptr && std::atoi(getenv("STRATA_DSV4_SPEC_JOINT")) != 0;
+    if (!joint) {
+        const auto attn = [&](int r, int il) -> bool {
+            const auto& Ly = F->L[(size_t) il];
+            const bool first = il == l0_;
+            bool ok = true;
+            on_row(r, [&] {
+                hc_args(r, Ly, false, first);
+                if (!first) std::swap(Rc[r], Ro[r]);
+                if (r == 1)   // row B's windows can be rolled back
+                    for (const auto& u : B->runs)
+                        if (u.il == il)
+                            cudaMemcpyAsync(B->win + u.at, state_ + u.off, (size_t) u.n * sizeof(float),
+                                            cudaMemcpyDeviceToDevice, s);
+                ok = fast_dsv4(il, p + r, err);
+                hc_args(r, Ly, true, first);
+                std::swap(Rc[r], Ro[r]);
+            });
+            if (F->prof_on) F->mark(r ? "v_attn_b" : "v_attn_a");
+            return ok;
+        };
+        const auto moe = [&](int r, int il) -> bool {
+            bool ok = true;
+            cur_tok_ = r ? d : a;
+            on_row(r, [&] { ok = fast_moe(il, pf_pending, err, false); });
+            return ok;
+        };
+        const auto lane_wait = [&](int r, int il) {
+            if (!fast_moe_lane(il)) return;
+            on_row(r, [&] { gf::moe_cpu_wait(F->md, E, F->ffn, s); });
+            if (F->prof_on) F->mark("v_cpu_wait");
+        };
+        if (!attn(0, l0_)) return false;
+        for (int il = l0_; il < l1_; ++il) {
+            if (!moe(0, il)) return false;
+            if (!attn(1, il)) return false;
+            lane_wait(0, il);
+            if (!moe(1, il)) return false;
+            if (il + 1 < l1_ && !attn(0, il + 1)) return false;
+            lane_wait(1, il);
+        }
+    }
+    for (int il = l0_; il < l1_ && joint; ++il) {
         const auto& Ly = F->L[(size_t) il];
         const bool first = il == l0_;
         for (int r = 0; r < 2; ++r) {
