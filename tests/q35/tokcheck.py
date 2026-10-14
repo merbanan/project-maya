@@ -18,6 +18,8 @@ TEXTS = [
     "<|start|>user<|message|>Hi there<|eot|><|start|>assistant",
     "https://example.com/path?q=1&r=2#frag  user@mail.org  C:\\\\Windows\\\\system32",
     "हिन्दी पाठ और বাংলা লেখা, ภาษาไทย",
+    "<|turn>user\nWrite a haiku about rain.<turn|>\n<|turn>model\n",
+    "a\n\nb\n\n\n\nc  double  spaces\u00a0nbsp",
 ]
 
 
@@ -39,7 +41,7 @@ def main():
                                          {"Content-Type": "application/json"})
             ref = json.loads(urllib.request.urlopen(req, timeout=60).read())["tokens"]
             mine = tk.encode(t, parse_special=True)
-            ok = mine == ref
+            ok = mine == ref and (tk.decode(mine) == t or "<|" in t or "<turn" in t)
             bad += not ok
             print("ok  " if ok else "DIFF", len(ref), repr(t[:50]))
             if not ok:

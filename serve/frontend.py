@@ -56,7 +56,10 @@ class ChatTemplate:
         self.dsv4 = "<｜Assistant｜>" in self.source and "DSML" in self.source
         # Muse Glimmer: `<|start|>assistant to=RECIPIENT<|message|>` messages (MuseTranslator)
         self.muse = "<|start|>assistant" in self.source and "<|message|>" in self.source
-        self.tags = HY3_TAGS if self.hy3 else "dsml" if self.dsv4 else "muse" if self.muse else None
+        # Gemma 4: `<|channel>thought ... <channel|>` (GemmaTranslator)
+        self.gemma = "<|channel>thought" in self.source and "<|turn>" in self.source
+        self.tags = HY3_TAGS if self.hy3 else "dsml" if self.dsv4 else "muse" if self.muse else \
+            "gemma" if self.gemma else None
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -372,8 +375,8 @@ class MuseTranslator:
     `</think>` opens it); a header still arriving is held back."""
     MSG, EOM, EOT = "<|message|>", "<|eom|>", "<|eot|>"
 
-    def __init__(self):
-        self.buf, self.in_header, self.answered = "", True, False
+    def __init__(self, thinking: bool = True):
+        self.buf, self.in_header, self.answered = "", True, not thinking   # (no reasoning state: no </think>)
 
     def feed(self, delta: str) -> str:
         self.buf += delta
@@ -406,6 +409,51 @@ class MuseTranslator:
         """The end of the text: a message body's held-back tail goes out; a header that never finished is dropped."""
         rest, self.buf = ("" if self.in_header else self.buf), ""
         return rest
+
+
+class GemmaTranslator:
+    """Gemma 4's output to the parser's form: with thinking, an answer may open with its thought channel
+    `<|channel>thought\n...\n<channel|>` (reasoning, then `</think>`); one without it is all answer (`</think>` at
+    once).  The start is held back until it can be told apart; any later channel tags are dropped."""
+    OPEN, CLOSE = "<|channel>", "<channel|>"
+
+    def __init__(self, thinking: bool = True):
+        self.buf, self.state = "", "start" if thinking else "answer"
+
+    def feed(self, delta: str) -> str:
+        self.buf += delta
+        out = []
+        if self.state == "start":
+            b = self.buf.lstrip()
+            if b.startswith(self.OPEN):
+                j = b.find("\n")
+                if j < 0:
+                    return ""
+                self.buf, self.state = b[j + 1:], "thought"          # (past `<|channel>thought\n`)
+            elif len(b) < len(self.OPEN) and self.OPEN.startswith(b):
+                return ""
+            else:
+                self.state = "answer"
+                out.append("</think>")
+        if self.state == "thought":
+            i = self.buf.find(self.CLOSE)
+            if i < 0:
+                keep = max((n for n in range(1, len(self.CLOSE)) if self.buf.endswith(self.CLOSE[:n])), default=0)
+                out.append(self.buf[:len(self.buf) - keep])
+                self.buf = self.buf[len(self.buf) - keep:]
+                return "".join(out)
+            out.append(self.buf[:i].rstrip("\n") + "</think>")
+            self.buf, self.state = self.buf[i + len(self.CLOSE):], "answer"
+        if self.state == "answer":
+            text = self.buf.replace(self.OPEN, "").replace(self.CLOSE, "")
+            keep = max((n for t in (self.OPEN, self.CLOSE) for n in range(1, len(t)) if text.endswith(t[:n])), default=0)
+            out.append(text[:len(text) - keep])
+            self.buf = text[len(text) - keep:]
+        return "".join(out)
+
+    def flush(self) -> str:
+        rest, self.buf = self.buf, ""
+        return rest if self.state != "start" else ""
 
 
 class TagTranslator:
@@ -527,8 +575,8 @@ class OutputParser:
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  tags: dict[str, str] | None = None):
         # a model's own tags (Hy3; DeepSeek-V4's DSML) -> the ones parsed below
-        self.tr = DsmlTranslator() if tags == "dsml" else MuseTranslator() if tags == "muse" else \
-            TagTranslator(tags) if tags else None
+        self.tr = DsmlTranslator() if tags == "dsml" else MuseTranslator(thinking) if tags == "muse" else \
+            GemmaTranslator(thinking) if tags == "gemma" else TagTranslator(tags) if tags else None
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False

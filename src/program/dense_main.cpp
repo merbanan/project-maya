@@ -262,6 +262,7 @@ int main(int argc, char** argv) {
         else if (a == "--chunk") chunk = std::atoi(next("--chunk"));
         else if (a == "--dflash") dflash = next("--dflash");
         else if (a == "--kv") setenv("STRATA_DENSE_KV", next("--kv"), 1);
+        else if (a == "--mtp") setenv("STRATA_DENSE_MTP", next("--mtp"), 1);   // (Gemma 4: the assistant GGUF)
         else if (a == "--help" || a == "-h") { usage(); return 0; }
         // the flags setup passes to `strata` (--gpu-layers, --cache, ...) mean nothing here and are not an error
     }
@@ -711,5 +712,9 @@ int main(int argc, char** argv) {
     }
     cudaFree(d_next);
     cudaFree(d_hist);
-    return 0;
+    // (exit()'s teardown waits on std::cin, which the reader thread still holds in getline while the server keeps
+    // the pipe open: the engine sat there until the server killed it 50 s later.  The OS frees the GPU memory.)
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(0);
 }
