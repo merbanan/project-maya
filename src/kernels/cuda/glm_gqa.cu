@@ -1705,6 +1705,63 @@ __global__ void __launch_bounds__(128) gqa_attn_mma_kernel(const float* __restri
             if (lane == 0) scorr[g] = corr;
         }
         __syncthreads();
+        if (VK == kT3 && use_reg == 2 && !PS) {
+            // (3, V in registers, opt-in STRATA_GLM_GQA_REG=2; measured 3.6x SLOWER than the staged form at 28K tq6v3 -
+            // 60.3 vs 16.8 ms a token, KL 0.059, needles 3/3 - kept for the record): lane = output dim 32 w + lane, its
+            // B column of mma.m8n8k4 the 3-bit codes at bit 3 lane of 4 keys' rows (their row pointers and scales
+            // shuffled from the lanes that resolved them); A = P from shared memory.  Every key costs each lane two
+            // shuffles and its own code read, where the staged form decodes 32 values of one key with a few vector ops.
+            float cr[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            const int g = (lane & 3) + ((lane >> 4) << 2);
+            const int bit = 3 * lane, wd = bit >> 5, sh = bit & 31;
+#pragma unroll 1
+            for (int kb = 0; kb < kMT / 32; ++kb) {
+                const int i = k0 + 32 * kb + lane;
+                const bool ok = i < k_hi && ks.ok(i);
+                const uint8_t* mycp = nullptr;
+                float mysc = 0.0f;
+                if (ok) {
+                    const uint8_t* bp = V.base(ks.pos(i));
+                    mycp = V.codes(bp, kvh) + 12 * w;
+                    mysc = *(const float*) V.scales(bp, kvh);
+                }
+                const unsigned long long myp = (unsigned long long) mycp;
+                for (int k4 = 0; k4 < 32; k4 += 4) {
+                    __half hv[4];
+#pragma unroll
+                    for (int q = 0; q < 4; ++q) {
+                        const int src = k4 + q;
+                        const unsigned long long pp = __shfl_sync(0xffffffffu, myp, src);
+                        const float sc = __shfl_sync(0xffffffffu, mysc, src);
+                        float v = 0.0f;
+                        if (pp != 0ull) {
+                            const unsigned* cw = (const unsigned*) pp;
+                            const unsigned lo = cw[wd], hi2 = sh > 29 ? cw[wd + 1] : 0u;
+                            const unsigned code = (unsigned) ((((unsigned long long) hi2 << 32) | lo) >> sh) & 7u;
+                            v = V.lv[code] * sc;
+                        }
+                        hv[q] = __float2half(v);
+                    }
+                    __syncwarp();
+                    const uint32_t b0 = (uint32_t) __half_as_ushort(hv[0]) | ((uint32_t) __half_as_ushort(hv[1]) << 16);
+                    const uint32_t b1 = (uint32_t) __half_as_ushort(hv[2]) | ((uint32_t) __half_as_ushort(hv[3]) << 16);
+                    const uint2 av = *(const uint2*) (sP + g * kMLdP + 32 * kb + k4);
+                    mma884(cr, av.x, av.y, b0, b1);
+                }
+            }
+            const int j = lane & 3, hi = lane >> 4, bb = 4 * ((lane >> 2) & 3);
+            const int r0 = bb + (j & 1) + 16 * hi, cc = bb + (j & 2);
+            const int rl[2] = {r0, r0 + 2}, cl[4] = {cc, cc + 1, cc + 16, cc + 17};
+            const int ci[8][2] = {{0, 0}, {0, 1}, {1, 0}, {1, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}};
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                const int rlane = rl[ci[q][0]], gg = (rlane & 3) + ((rlane >> 4) << 2);
+                sS[gg * kMLdS + 32 * w + cl[ci[q][1]]] = cr[q];
+            }
+            __syncwarp();
+#pragma unroll
+            for (int gg = 0; gg < G; ++gg) o[gg] = o[gg] * scorr[gg] + sS[gg * kMLdS + t];
+        } else
         {   // (3) dims 32 w .. 32 w + 31, 32 keys at a time
             wmma::fragment<wmma::accumulator, 8, 32, 16, float> acc;
             wmma::fill_fragment(acc, 0.0f);
