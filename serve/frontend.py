@@ -368,6 +368,21 @@ class DsmlTranslator:
         return out
 
 
+class AtemTranslator(DsmlTranslator):
+    """Muse Glimmer's calls (<atem:function_calls><atem:invoke name="F"><atem:parameter name="K">V</atem:parameter>
+    </atem:invoke></atem:function_calls>, newlines between the tags) rewritten to GLM's form, as DSML's; the layout
+    newlines after a structural tag are dropped, a value's own text is kept as written."""
+    FIXED = {"<atem:function_calls>\n": "", "<atem:function_calls>": "", "</atem:function_calls>\n": "",
+             "</atem:function_calls>": "", "</atem:invoke>\n": "</tool_call>", "</atem:invoke>": "</tool_call>",
+             "</atem:parameter>\n": "</arg_value>", "</atem:parameter>": "</arg_value>"}
+    OPEN = ("<atem:invoke ", "<atem:parameter ")
+
+    def feed(self, delta: str) -> str:
+        out = super().feed(delta)
+        # (the newline after an invoke's opening tag is layout too)
+        return out.replace("\n<arg_key>", "<arg_key>") if "<tool_call>" in out or "<arg_key>" in out else out
+
+
 class MuseTranslator:
     """Muse Glimmer's messages rewritten to the parser's form while text streams in: a turn is messages
     `[<|start|>assistant] to=RECIPIENT<|message|>BODY` ending in <|eom|> (another follows) or <|eot|> (the turn's end).
@@ -377,6 +392,7 @@ class MuseTranslator:
 
     def __init__(self, thinking: bool = True):
         self.buf, self.in_header, self.answered = "", True, not thinking   # (no reasoning state: no </think>)
+        self.atem, self.reasoning = AtemTranslator(), False
 
     def feed(self, delta: str) -> str:
         self.buf += delta
@@ -389,6 +405,7 @@ class MuseTranslator:
                 head = self.buf[:i].replace("<|start|>", "").replace("assistant", "").strip()
                 self.buf = self.buf[i + len(self.MSG):]
                 self.in_header = False
+                self.reasoning = head == "to=self"
                 if head != "to=self" and not self.answered:    # the answer (to=user, or no recipient)
                     out.append("</think>")
                     self.answered = True
@@ -397,18 +414,22 @@ class MuseTranslator:
             if j < 0:
                 keep = max((n for t in (self.EOM, self.EOT) for n in range(1, len(t)) if self.buf.endswith(t[:n])),
                            default=0)
-                out.append(self.buf[:len(self.buf) - keep])
+                out.append(self._body(self.buf[:len(self.buf) - keep]))
                 self.buf = self.buf[len(self.buf) - keep:]
                 return "".join(out)
-            out.append(self.buf[:j])
+            out.append(self._body(self.buf[:j]) + ("" if self.reasoning else self.atem.flush()))
             self.in_header = True
             self.buf = self.buf[j + len(self.EOM):]               # (<|eom|> and <|eot|> are the same length)
         return "".join(out)
 
+    def _body(self, text: str) -> str:
+        """A message's text: its reasoning as written, anything else through the call translation."""
+        return text if self.reasoning else self.atem.feed(text)
+
     def flush(self) -> str:
         """The end of the text: a message body's held-back tail goes out; a header that never finished is dropped."""
-        rest, self.buf = ("" if self.in_header else self.buf), ""
-        return rest
+        rest, self.buf = ("" if self.in_header else self._body(self.buf)), ""
+        return rest + ("" if self.reasoning else self.atem.flush())
 
 
 class GemmaTranslator:
