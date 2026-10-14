@@ -67,7 +67,7 @@ lives. Branches on the fork: `qwen38` (strata-dense: Qwen3.8-27B, Qwen3.6-35B-A3
 | Item | Status | Evidence |
 |---|---|---|
 | Gemma 4 30B-class model support (strata-dense) | in progress | |
-| salient-data/qwen38-next-dgx-recipe: patches that could speed up prefill / decode | open | |
+| salient-data/qwen38-next-dgx-recipe: patches that could speed up prefill / decode | reviewed: little applies | vLLM recipe for Qwen3.8-Flash-Next NVFP4 on a DGX Spark (67.5 tok/s 1 stream). Patches: PLE host-file gather (that model's 51 GB n-gram table; none of ours), FP8 dense cast (no FP8 on V100), NVFP4 draft head / sm12x alignment (Blackwell), mamba block-table fuse and GLM kpool tail (vLLM internals). The one idea that carries: a reduced-vocabulary draft head - strata-dense has one already; GLM DFlash2's head scores the full 154K vocab (2.1 ms a round, ~2% of it) |
 | Upstream PRs (mw00/project-maya): grouping-kernel stack fix, window VRAM swaps, Volta prompt attention, L3 window lanes, KDA split, shared-expert sub-batch | in progress | rebased on main 78af351, before/after runs |
 | Strata (Niko1221) tree: update, then a V100-optimized tree from Strata's PRs, benchmarked | open | |
 | Niko1221/Strata code, issues and PRs: ideas for this work | done | 400 PRs / 600 issues filtered by title, the CUDA / V100 ones read, upstream built and measured on this V100 - below |
