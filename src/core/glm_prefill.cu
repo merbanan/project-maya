@@ -93,6 +93,7 @@ struct Carve {
 };
 
 constexpr int kSub = 256;   // the sub-batch the mixers, the dense FFN and the shared expert start from
+constexpr int kShSub = 2048;   // the shared expert's on CUDA (shexp_sub)
 // prestaging (PrefillState::pbuf): the buffer's slots on one GPU, the chunk from which it is carved, and the fewest
 // predicted rows an expert is prestaged for (below that it may not be routed at all)
 constexpr int kPreSlots = 160, kPreMinT = 1024, kPreMinRows = 4;
@@ -302,6 +303,21 @@ MoeBufs carve_moe(Carve& c, size_t T, size_t sub, const Glm5Geometry& g) {
     return b;
 }
 
+// the shared expert's sub-batch: each one dequantizes its three matrices to FP16 again, so on CUDA it runs in larger
+// ones than the mixers (DSv4, 26K prompt: 1.73 s at 256 tokens); STRATA_GLM_PREFILL_SH_SUB overrides, sub_env sets it
+int shexp_sub(int sub_env) {
+    if (sub_env > 0) return sub_env;
+#if defined(STRATA_USE_HIP)
+    return kSub;
+#else
+    static const int v = [] {
+        const char* e = getenv("STRATA_GLM_PREFILL_SH_SUB");
+        return e ? std::clamp(std::atoi(e), 16, 8192) : kShSub;
+    }();
+    return v;
+#endif
+}
+
 // the mixers' and the dense FFN's sub-batch for chunks of T tokens: kSub, doubled (up to 4096) while their buffers
 // stay within what the chunk's MoE buffers take of the union anyway - no extra memory, fewer and larger GEMMs, and
 // each projection dequantized to FP16 once a sub-batch instead of once every 256 tokens (a 14.8K chunk: 58 -> 4).
@@ -344,7 +360,7 @@ struct Glm5Model::PrefillState {
     bool lend_pct_fixed = false;
     std::string mode;
     int sub_env = 0;                 // STRATA_GLM_PREFILL_SUB: every sub-batch (0: mixer_sub, the shared expert kSub)
-    int sh_sub() const { return sub_env > 0 ? sub_env : kSub; }   // the shared expert's sub-batch
+    int sh_sub() const { return shexp_sub(sub_env); }   // the shared expert's sub-batch
     int max_pools = 0;
     cublasHandle_t blas = nullptr;
     void* ws = nullptr;
@@ -916,7 +932,7 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     if (has_dense) { Carve d; carve_dense(d, ts, g); uni = std::max(uni, d.off); }
     if (g.gqa()) { Carve q; carve_gqa(q, ts, g); uni = std::max(uni, q.off); }
     if (g.dsv4()) { Carve q; carve_dsv4(q, ts, g, max_pools); uni = std::max(uni, q.off); }
-    if (has_moe) { Carve m; carve_moe(m, T, (size_t) (sub_env > 0 ? sub_env : kSub), g); uni = std::max(uni, m.off); }
+    if (has_moe) { Carve m; carve_moe(m, T, (size_t) shexp_sub(sub_env), g); uni = std::max(uni, m.off); }
     // the NextN block's cache fill (the last half) carves 4 n_embd + 1.5 n_embd rows of its own
     if (mtp) uni = std::max(uni, T * (size_t) (6 * g.n_embd + (g.gqa() ? 2 * g.n_kv * g.head_dim : g.kv_lora) +
                                                2 * g.idx_key) * 4 + 8 * 256);
