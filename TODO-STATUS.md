@@ -66,7 +66,14 @@ lives. Branches on the fork: `qwen38` (strata-dense: Qwen3.8-27B, Qwen3.6-35B-A3
 
 | Item | Status | Evidence |
 |---|---|---|
-| Niko1221/Strata code, issues and PRs: ideas for this work | in progress | |
+| Niko1221/Strata code, issues and PRs: ideas for this work | reviewed (400 PRs / 600 issues by title, CUDA ones read) | see below |
+| - #2464: Qwen3.6-35B-A3B on a V100 - upstream q36 engine 111 tok/s plain / 154 MTP at 256 tokens, 56-59 at 16K (ours: 99 plain, 168-177 adaptive MTP, 86 / 154 at 28K) | open | the short-context plain gap (111 vs 99): upstream decodes from one captured graph per step (q36_engine.cu) with native_mmvq; compare on the same file |
+| - native_mmvq V100 row table (STRATA_SM70_TABLE, PR 1401; PolyStrata: head 1,094 -> 821 us, decode +10-15% on V100-SXM2) | open | strata-dense / GLM use their own dp4a GEMVs |
+| - #1949: CPU AVX2 dot kernels with accumulators in registers (router 2.1x, expert rows +20-24%) | open | applies to the GLM CPU lane if its dots are Strata's (ours: ggml vec_dot) |
+| - #2227: MTP hnorm on the stream (acceptance 82 -> 86%, decode +2-4% on sm_89) | open | GLM/Qwen MTP heads |
+| - #2357 / #2358: sm_70 argmax_rows (+0.7-0.8%), fused GR norm (+0.5%) | open | small |
+| - #2356: Volta prompt-expert WMMA kernel for IQ2_S / IQ4_NL | open | prefill of IQ quants |
+| - not applicable: the SYCL / HIP / Metal / Arc / gfx PRs, multi-GPU layer splits, setup / serve / MCP changes | - | |
 
 ## Serving / tooling
 
