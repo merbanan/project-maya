@@ -445,6 +445,191 @@ void launch_dec(const float* q, const G4Kv& kv, int p0, int n_head, int n_kv, in
     }
 }
 
+// ---- head 512 prompts: one block (32 rows, 4 warps) computes the scores ONCE and both halves of the output (the
+// generic form splits V's 512 dims over two blocks, each paying the whole q k^T).  Tiles of 16 keys: warp w scores
+// rows (w & 1) * 16 .. over dims (w >> 1) * 256 .., the halves summed by warps 0 / 1, which keep the rows' online
+// softmax and publish P and the rescale; warp w then accumulates rows (w & 1) * 16 .., output dims (w >> 1) * 256 ..
+constexpr int P5_AK = 16, P5_LDQ = 512 + 8, P5_LDS = P5_AK + 4, P5_LDP = P5_AK + 8;
+constexpr size_t p5_smem() {
+    return (size_t) 32 * P5_LDQ * 2 + (size_t) 2 * P5_AK * P5_LDQ * 2 + (size_t) 4 * 16 * P5_LDS * 4 +
+           (size_t) 32 * P5_LDP * 2 + (size_t) 64 * 4;
+}
+__global__ void __launch_bounds__(128) attn512_kernel(const float* __restrict__ q, G4Kv kv, int p0, int T, int n_head,
+                                                      int G, int window, int kbase, int split_len, float scale,
+                                                      float* __restrict__ out, float* __restrict__ part_o,
+                                                      float* __restrict__ part_ml) {
+    using namespace nvcuda;
+    constexpr int AD = 512, AR = 32;
+    extern __shared__ __align__(32) unsigned char smem[];
+    __half* sQ = (__half*) smem;
+    __half* sK = sQ + AR * P5_LDQ;
+    __half* sV = sK + P5_AK * P5_LDQ;
+    float* sS = (float*) (sV + P5_AK * P5_LDQ);
+    __half* sP = (__half*) (sS + 4 * 16 * P5_LDS);
+    float* sCorr = (float*) (sP + 32 * P5_LDP);     // 32 rows' rescale, then (the end) their sums
+    float* sL = sCorr + 32;
+    const int kvh = blockIdx.y, split = blockIdx.z, n_split = gridDim.z;
+    const int rows = T * G, r0 = blockIdx.x * AR;
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, rt = w & 1, half = w >> 1;
+    const int qld = n_head * AD;
+    for (int i = tid; i < AR * (AD / 4); i += 128) {
+        const int r = i / (AD / 4), d = (i % (AD / 4)) * 4, row = r0 + r;
+        float4 f = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (row < rows) f = *(const float4*) (q + (size_t) (row / G) * qld + (size_t) (kvh * G + row % G) * AD + d);
+        __half2* dst = (__half2*) (sQ + r * P5_LDQ + d);
+        dst[0] = __floats2half2_rn(f.x * scale, f.y * scale);
+        dst[1] = __floats2half2_rn(f.z * scale, f.w * scale);
+    }
+    const int last_row = min(r0 + AR, rows) - 1;
+    const int kend = p0 + last_row / G + 1;
+    const int klo = window > 0 ? max(0, p0 + r0 / G - window + 1) : 0;
+    const int ks = kbase + split * split_len, ke = min(kend, ks + split_len);
+    const int kstart = max(ks, ks + (klo - ks) / P5_AK * P5_AK);
+    // the softmax rows (warps 0 / 1): lane pair (ri, hi) one row, 8 keys each
+    const int ri = lane >> 1, hi = lane & 1, srow = r0 + rt * 16 + ri;
+    const bool srow_ok = srow < rows;
+    const int pos = srow_ok ? p0 + srow / G : -1, lo = window > 0 ? pos - window + 1 : 0;
+    float m = -INFINITY, l = 0.0f;
+    constexpr float kLazy = 8.0f;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> fo[16];
+#pragma unroll
+    for (int n = 0; n < 16; ++n) wmma::fill_fragment(fo[n], 0.0f);
+    for (int k0 = kstart; k0 < ke; k0 += P5_AK) {
+        __syncthreads();
+        for (int i = tid; i < P5_AK * (AD / 8); i += 128) {
+            const int r = i / (AD / 8), d = (i % (AD / 8)) * 8, key = k0 + r;
+            uint4 kq = make_uint4(0, 0, 0, 0), vq = kq;
+            if (key < ke) {
+                const size_t cell = ((size_t) kvh * kv.max_ctx + key) * AD + d;
+                kq = __ldg((const uint4*) (kv.k + cell));
+                vq = __ldg((const uint4*) (kv.v + cell));
+            }
+            *(uint4*) (sK + r * P5_LDQ + d) = kq;
+            *(uint4*) (sV + r * P5_LDQ + d) = vq;
+        }
+        __syncthreads();
+        {   // scores: rows rt * 16 .., dims half * 256 ..
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+#pragma unroll 4
+            for (int kk = 0; kk < 16; ++kk) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fq;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+                wmma::load_matrix_sync(fq, sQ + rt * 16 * P5_LDQ + half * 256 + kk * 16, P5_LDQ);
+                wmma::load_matrix_sync(fb, sK + half * 256 + kk * 16, P5_LDQ);
+                wmma::mma_sync(acc, fq, fb, acc);
+            }
+            wmma::store_matrix_sync(sS + w * 16 * P5_LDS, acc, P5_LDS, wmma::mem_row_major);
+        }
+        __syncthreads();
+        if (w < 2) {   // the softmax of rows rt * 16 .. (both halves' scores summed)
+            const float* Sa = sS + w * 16 * P5_LDS;
+            const float* Sb = sS + (w + 2) * 16 * P5_LDS;
+            constexpr int KH = P5_AK / 2;
+            float sv[KH], mt = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < KH; ++j) {
+                const int c = hi * KH + j, key = k0 + c;
+                sv[j] = srow_ok && key < ke && key <= pos && key >= lo ? Sa[ri * P5_LDS + c] + Sb[ri * P5_LDS + c] : -INFINITY;
+                mt = fmaxf(mt, sv[j]);
+            }
+            mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, 1));
+            float corr = 1.0f;
+            if (mt > m + kLazy) {
+                corr = m == -INFINITY ? 0.0f : __expf(m - mt);
+                l *= corr;
+                m = mt;
+            }
+            float ps = 0.0f;
+#pragma unroll
+            for (int j = 0; j < KH; ++j) {
+                const float pj = sv[j] == -INFINITY ? 0.0f : __expf(sv[j] - m);
+                ps += pj;
+                sP[(rt * 16 + ri) * P5_LDP + hi * KH + j] = __float2half(pj);
+            }
+            l += ps + __shfl_xor_sync(0xffffffffu, ps, 1);
+            if (hi == 0) sCorr[rt * 16 + ri] = corr;
+        }
+        __syncthreads();
+        {   // P . V: rows rt * 16 .., output dims half * 256 ..
+            const float cr = sCorr[rt * 16 + (lane & 15)];
+            if (__any_sync(0xffffffffu, cr != 1.0f)) {
+                float* Sw = sS + w * 16 * P5_LDS;   // (the scores are read: scratch for the rescale)
+#pragma unroll
+                for (int n = 0; n < 16; ++n) {
+                    wmma::store_matrix_sync(Sw, fo[n], P5_LDS, wmma::mem_row_major);
+                    __syncwarp();
+                    for (int i = lane; i < 256; i += 32) Sw[(i / 16) * P5_LDS + i % 16] *= sCorr[rt * 16 + i / 16];
+                    __syncwarp();
+                    wmma::load_matrix_sync(fo[n], Sw, P5_LDS, wmma::mem_row_major);
+                    __syncwarp();
+                }
+            }
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fp;
+            wmma::load_matrix_sync(fp, sP + rt * 16 * P5_LDP, P5_LDP);
+#pragma unroll
+            for (int n = 0; n < 16; ++n) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> fv;
+                wmma::load_matrix_sync(fv, sV + half * 256 + n * 16, P5_LDQ);
+                wmma::mma_sync(fo[n], fp, fv, fo[n]);
+            }
+        }
+    }
+    __syncthreads();
+    if (w < 2 && hi == 0) { sL[rt * 16 + ri] = l; sCorr[rt * 16 + ri] = m; }   // (sums, maxima)
+    __syncthreads();
+    float* Sw = sS + w * 16 * P5_LDS;
+#pragma unroll
+    for (int n = 0; n < 16; ++n) {
+        wmma::store_matrix_sync(Sw, fo[n], P5_LDS, wmma::mem_row_major);
+        __syncwarp();
+        for (int i = lane; i < 256; i += 32) {
+            const int rr = i / 16, c = i % 16, row = r0 + rt * 16 + rr;
+            if (row >= rows) continue;
+            const int tok = row / G, head = kvh * G + row % G, d = half * 256 + n * 16 + c;
+            const float v = Sw[rr * P5_LDS + c];
+            if (n_split == 1) {
+                const float L = sL[rt * 16 + rr];
+                out[(size_t) tok * qld + (size_t) head * AD + d] = L > 0.0f ? v / L : 0.0f;
+            } else {
+                part_o[(((size_t) split * gridDim.y + kvh) * rows + row) * AD + d] = v;
+            }
+        }
+        __syncwarp();
+    }
+    if (n_split > 1 && tid < 32) {
+        const int row = r0 + tid;
+        if (row < rows) {
+            part_ml[(((size_t) split * gridDim.y + kvh) * rows + row) * 2] = sCorr[tid];
+            part_ml[(((size_t) split * gridDim.y + kvh) * rows + row) * 2 + 1] = sL[tid];
+        }
+    }
+}
+
+void launch_attn512(const float* q, const G4Kv& kv, int p0, int T, int n_head, int n_kv, int window, float scale,
+                    float* out, float* scratch, cudaStream_t s) {
+    constexpr size_t sm = p5_smem();
+    static const bool attr = cudaFuncSetAttribute(attn512_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm) ==
+                             cudaSuccess;
+    if (!attr) throw std::runtime_error("g4_attn512: shared memory attribute");
+    const int G = n_head / n_kv, rows = T * G, tiles = (rows + 31) / 32;
+    const int kbase = window > 0 ? std::max(0, p0 - window + 1) : 0;
+    const int n_keys = p0 + T - kbase;
+    const int want = 160 / std::max(1, tiles * n_kv);
+    int n_split = std::max(1, std::min(want, (n_keys + 127) / 128));
+    const int split_len = n_split == 1 ? n_keys : ((n_keys + n_split - 1) / n_split + P5_AK - 1) / P5_AK * P5_AK;
+    n_split = (n_keys + split_len - 1) / split_len;
+    float* part_o = scratch;
+    float* part_ml = scratch + (size_t) n_split * rows * n_kv * 512;
+    attn512_kernel<<<dim3(tiles, n_kv, n_split), 128, sm, s>>>(q, kv, p0, T, n_head, G, window, kbase, split_len, scale,
+                                                               out, part_o, part_ml);
+    check("g4_attn512");
+    if (n_split > 1) {
+        merge_kernel<<<dim3(rows, n_kv), 512, 0, s>>>(part_o, part_ml, rows, n_split, G, n_head, out);
+        check("g4_attn512_merge");
+    }
+}
+
 template <int AD, int VD, int AW>
 void launch_attn(const float* q, const G4Kv& kv, int p0, int T, int n_head, int n_kv, int window, float scale,
                  float* out, float* scratch, cudaStream_t s) {
@@ -505,7 +690,11 @@ void g4_attn(const float* q, const G4Kv& kv, int p0, int T, int n_head, int n_kv
     }
     if (D == 128) launch_attn<128, 128, 4>(q, kv, p0, T, n_head, n_kv, window, scale, out, scratch, s);
     else if (D == 256) launch_attn<256, 256, 4>(q, kv, p0, T, n_head, n_kv, window, scale, out, scratch, s);
-    else if (D == 512) launch_attn<512, 256, 2>(q, kv, p0, T, n_head, n_kv, window, scale, out, scratch, s);
+    else if (D == 512) {
+        static const bool p5 = std::getenv("STRATA_G4_ATTN512") == nullptr || std::atoi(std::getenv("STRATA_G4_ATTN512")) != 0;
+        if (p5 && T > 1) launch_attn512(q, kv, p0, T, n_head, n_kv, window, scale, out, scratch, s);
+        else launch_attn<512, 256, 2>(q, kv, p0, T, n_head, n_kv, window, scale, out, scratch, s);
+    }
     else throw std::invalid_argument("g4_attn: head size 128, 256 or 512");
 }
 

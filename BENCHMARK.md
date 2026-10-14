@@ -78,7 +78,7 @@ target's K/V), `STRATA_DENSE_DRAFT=K`.
 | Setting | Prompt (tok/s) | Decode (tok/s) | Notes |
 |---|---:|---:|---|
 | llama.cpp | 287 (32) / 3,449 (1.5K) / 3,676 (5.6K) / 3,140 (26K) | 92.5 / 92.5 / 91.1 / 85.2 | |
-| no drafts | 579 (32) / 4,303 (1.5K) / 4,668 (5.6K) / 2,695 (26K) | **98.8 - 100.1** / 85.6 / 80.3 / **85.3** (26K) | |
+| no drafts | 579 (32) / 4,303 (1.5K) / **5,104** (5.6K) / **3,765** (26K; 2,695 before the one-pass head-512 prompt attention) | **98.8 - 100.1** / 85.6 / 80.3 / **85.3** (26K) | |
 | assistant, 2 drafts | | **161.3** | 2.37 tokens a round |
 | assistant, 3 drafts | | 152.0 / 150.3 (after 1.5K) | 2.69 / 2.64 |
 | assistant, 4 drafts | | 157.6 | 2.91 |
