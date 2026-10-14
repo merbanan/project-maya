@@ -124,9 +124,13 @@ the RAM-tier experts (CPU lane ~14.5 ms, fetches) at every length.
 
 MTP (dsv4 0caeb94, `STRATA_DSV4_MTP=<the MTP GGUF>`, tools/d4mtp.py: the block drafts beside every greedy step, 3
 prompts x 256 tokens): **83.5%** of drafts match the trunk, 1.81 ms a draft with its experts in VRAM
-(`STRATA_GLM_VRAM_GB=27`; 19.6 ms staged), plain decode 29.6-30.9 tok/s, 27.5-28.2 with the shadow draft. A verify
-of 1 / 2 drafts costs 1.95 / 2.83 decode steps (tools/d4verify.py: every extra token brings its own RAM-tier
-experts), so speculation would give 1.84 tokens in 2.01 steps (0.92x) / 2.53 in 2.94 (0.86x): off.
+(`STRATA_GLM_VRAM_GB=27`; 19.6 ms staged), plain decode 29.6-30.9 tok/s, 27.5-28.2 with the shadow draft.
+Verify cost (tools/d4verify.py, 2K context, decode step 31.8-33.9 ms), 1 / 2 / 4 / 8 drafts:
+token path (one step a token) 1.95 / 2.75 / 4.44 / 8.05 steps; batched prompt path (`STRATA_GLM_PREFILL_MIN=1`)
+4.61 / 4.60 / 4.78 / 5.53 steps - ~150 ms fixed (pool lend, plan, PCIe staging of RAM-tier experts), ~4.5 ms a row.
+At 83.5% the expected tokens a round are 1.84 / 2.53 / 3.6 / 4.9: 0.38-0.87x on either path, so speculation is off.
+A gain needs a multi-row token path (dense weights read once, the CPU lane over both rows): ~1.2x at best by the
+decode split (dense ~9 ms, experts ~23 ms a token).
 
 ## GLM-5.3-Flash - Maya-S24 (94.7 GB), live Maya (v1.0.30 + PR #78)
 

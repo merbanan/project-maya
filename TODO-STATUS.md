@@ -25,7 +25,7 @@ lives. Branches on the fork: `qwen38` (strata-dense: Qwen3.8-27B, Qwen3.6-35B-A3
 | Adaptive K (MTP) | done | default for MoE: 35B MTP K5 141 -> 168, K7 125 -> 172 tok/s; off for dense (27B -3%) |
 | Sampled-draft p/q acceptance (lithos) | done | MTP drafts sampled from q, exact min(1,p/q) + residual: 35B T0.6 148.7 -> 155.5, T1.0 130.1 -> 147.7 tok/s; default for MoE |
 | DSv4 prompt indexer on tensor cores | done | d4_index 11.2 -> 2.1 s, d4_attn 12.7 -> 6.0 s at 26K (6d39cfc) |
-| DSv4 MTP | done, opt-in (slower) | MTP block built (dsv4 0caeb94, STRATA_DSV4_MTP): 83.5% of drafts accepted, 1.81 ms a draft, trunk tokens unchanged (fixed tiers). Verify of 1 / 2 drafts = 1.95 / 2.83 decode steps (tools/d4verify.py) -> 0.92x / 0.86x: kept as a measurement, off |
+| DSv4 MTP | done, opt-in (slower) | MTP block built (dsv4 0caeb94, STRATA_DSV4_MTP): 83.5% of drafts accepted, 1.81 ms a draft, trunk tokens unchanged (fixed tiers). Verify of 1 / 2 / 4 / 8 drafts: token path 1.95 / 2.75 / 4.44 / 8.05 steps, batched prompt path 4.61 / 4.60 / 4.78 / 5.53 (~150 ms fixed) -> 0.38-0.87x: speculation off. Needs a multi-row token path (~1.2x at best) |
 | Hy3 long-context attention | done | code-pair LUT (1d72f3b) + K fragments in registers (2f13857): 36.1 -> 33.5 ms at 66K |
 | Hy3 attention, V side in registers | done, opt-in | STRATA_GLM_GQA_REG=2 (cffeaaf): correct, 3.6x slower (60.3 vs 16.8 ms) - off |
 | Gemma head-512 prompt attention | done | 2,693 -> 3,826 (26K), 1,106 -> 1,993 (94K) tok/s, needles 3/3 (196cc14, 9a93286) |
