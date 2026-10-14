@@ -98,6 +98,20 @@ HUNYUAN_DENSE_PATTERNS = (
 )
 
 
+# The `llama4` / `gpt-4o` pre-tokenizer (Muse Glimmer), llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_GPT4O: llama.cpp's ACTIVE
+# pattern, not tokenizer.json's original - it writes the case classes as lookaheads ((?=\p{L})[^a-z]: a letter that is
+# not a-z) and has no \p{M}.  One pattern, every piece through BPE (no ignore_merges).
+GPT4O_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))*((?=[\p{L}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?"
+    r"|[^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))+((?=[\p{L}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
                  pre: str = "qwen35", special_ids: dict[str, int] | None = None):
@@ -108,8 +122,10 @@ class Tokenizer:
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5", "hunyuan-dense"):
-            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, hunyuan-dense" % pre)
+        if pre == "gpt-4o":
+            pre = "llama4"
+        if pre not in ("qwen35", "glm4", "glm5", "hunyuan-dense", "llama4"):
+            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, hunyuan-dense, llama4" % pre)
         # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
         self.ignore_merges = pre in ("glm4", "glm5")
         self.token_types = token_types
@@ -129,7 +145,7 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN)
+        self._re = regex.compile(GLM_PATTERN if self.ignore_merges else GPT4O_PATTERN if pre == "llama4" else QWEN35_PATTERN)
         self._seq = [regex.compile(r) for r in HUNYUAN_DENSE_PATTERNS] if pre == "hunyuan-dense" else None
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
@@ -255,7 +271,7 @@ class Tokenizer:
     def _pieces(self, text: str) -> list[str]:
         """The pre-tokenizer's pieces: one pattern's matches, or (hunyuan-dense) the pattern sequence's splits."""
         if self._seq is None:
-            return self._re.findall(text)
+            return [m.group(0) for m in self._re.finditer(text)]   # (finditer: a pattern may have groups)
         pieces = [text]
         for r in self._seq:
             nxt = []
@@ -370,10 +386,11 @@ def extract(gguf_path, out_dir) -> dict:
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
         "ignore_merges": tk.ignore_merges,
-        "pre_pattern": GLM_PATTERN if tk.ignore_merges else QWEN35_PATTERN,
+        "pre_pattern": GLM_PATTERN if tk.ignore_merges else GPT4O_PATTERN if tk.pre == "llama4" else QWEN35_PATTERN,
         "pre_patterns": list(HUNYUAN_DENSE_PATTERNS) if tk.pre == "hunyuan-dense" else None,
         "pre_pattern_source": (".ref/llama.cpp src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4; "
                                "glm4/glm5 set ignore_merges)" if tk.ignore_merges else
+                               "llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_GPT4O (llama4)" if tk.pre == "llama4" else
                                ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")

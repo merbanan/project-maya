@@ -54,7 +54,9 @@ class ChatTemplate:
         # DeepSeek-V4: `thinking` (or enable_thinking) opens <think>, else the answer starts after </think>; its BOS
         # comes from the template's bos_token; its tool calls are DSML (DsmlTranslator)
         self.dsv4 = "<｜Assistant｜>" in self.source and "DSML" in self.source
-        self.tags = HY3_TAGS if self.hy3 else "dsml" if self.dsv4 else None
+        # Muse Glimmer: `<|start|>assistant to=RECIPIENT<|message|>` messages (MuseTranslator)
+        self.muse = "<|start|>assistant" in self.source and "<|message|>" in self.source
+        self.tags = HY3_TAGS if self.hy3 else "dsml" if self.dsv4 else "muse" if self.muse else None
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -363,6 +365,49 @@ class DsmlTranslator:
         return out
 
 
+class MuseTranslator:
+    """Muse Glimmer's messages rewritten to the parser's form while text streams in: a turn is messages
+    `[<|start|>assistant] to=RECIPIENT<|message|>BODY` ending in <|eom|> (another follows) or <|eot|> (the turn's end).
+    to=self is its reasoning (passed through: the parser starts in the reasoning state), to=user the answer (a
+    `</think>` opens it); a header still arriving is held back."""
+    MSG, EOM, EOT = "<|message|>", "<|eom|>", "<|eot|>"
+
+    def __init__(self):
+        self.buf, self.in_header, self.answered = "", True, False
+
+    def feed(self, delta: str) -> str:
+        self.buf += delta
+        out = []
+        while self.buf:
+            if self.in_header:
+                i = self.buf.find(self.MSG)
+                if i < 0:
+                    return "".join(out)                          # (the header is still arriving)
+                head = self.buf[:i].replace("<|start|>", "").replace("assistant", "").strip()
+                self.buf = self.buf[i + len(self.MSG):]
+                self.in_header = False
+                if head != "to=self" and not self.answered:    # the answer (to=user, or no recipient)
+                    out.append("</think>")
+                    self.answered = True
+                continue
+            j = min((k for k in (self.buf.find(self.EOM), self.buf.find(self.EOT)) if k >= 0), default=-1)
+            if j < 0:
+                keep = max((n for t in (self.EOM, self.EOT) for n in range(1, len(t)) if self.buf.endswith(t[:n])),
+                           default=0)
+                out.append(self.buf[:len(self.buf) - keep])
+                self.buf = self.buf[len(self.buf) - keep:]
+                return "".join(out)
+            out.append(self.buf[:j])
+            self.in_header = True
+            self.buf = self.buf[j + len(self.EOM):]               # (<|eom|> and <|eot|> are the same length)
+        return "".join(out)
+
+    def flush(self) -> str:
+        """The end of the text: a message body's held-back tail goes out; a header that never finished is dropped."""
+        rest, self.buf = ("" if self.in_header else self.buf), ""
+        return rest
+
+
 class TagTranslator:
     """Rewrites a model's own tags to the parser's while text streams in; a tag split across deltas is held back."""
 
@@ -482,7 +527,8 @@ class OutputParser:
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  tags: dict[str, str] | None = None):
         # a model's own tags (Hy3; DeepSeek-V4's DSML) -> the ones parsed below
-        self.tr = DsmlTranslator() if tags == "dsml" else TagTranslator(tags) if tags else None
+        self.tr = DsmlTranslator() if tags == "dsml" else MuseTranslator() if tags == "muse" else \
+            TagTranslator(tags) if tags else None
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False

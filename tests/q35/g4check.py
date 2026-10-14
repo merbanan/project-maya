@@ -89,7 +89,7 @@ def main():
     mine = eng_tokens(a.bin, a.gguf, ids, a.new, a.ctx, dict(kv.split("=", 1) for kv in a.env))
     srv = start(0)
     try:
-        print("engine :", repr(post("/detokenize", {"tokens": mine}).get("content", ""))[:400])
+        print("engine :", repr(post("/detokenize", {"tokens": mine}).get("content", ""))[:int(os.environ.get("G4_SHOW", "400"))])
         if ref:
             print("llama  :", repr(post("/detokenize", {"tokens": ref}).get("content", ""))[:400])
     finally:

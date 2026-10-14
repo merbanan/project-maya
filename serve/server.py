@@ -1226,7 +1226,8 @@ class Service:
         # and it must not reach the answer's text either
         self.stop_ids = set(_special_ids(IM_END) + _special_ids("<|endoftext|>") + _special_ids("<|user|>") +
                             _special_ids("<|observation|>") + _special_ids("<｜hy_eos:opensource｜>") +
-                            _special_ids("<｜end▁of▁sentence｜>"))
+                            _special_ids("<｜end▁of▁sentence｜>") +
+                            _special_ids("<|eot|>") + _special_ids("<turn|>"))   # (Muse Glimmer's, Gemma 4's turn end)
         # ... and a model that spells a role marker out of ordinary pieces ('<|', 'user', '|>') has ended its turn just
         # the same: the text stops there.  Only markers that are special tokens in this vocabulary count.
         self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>") if _special_ids(s)]

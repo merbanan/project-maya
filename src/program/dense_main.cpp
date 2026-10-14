@@ -296,14 +296,20 @@ int main(int argc, char** argv) {
         strata::GgufFile g(gguf, 1u << 20);
         if (const auto* toks = g.get("tokenizer.ggml.tokens"))
             for (size_t i = 0; i < toks->items.size(); ++i)
-                if (toks->items[i].s == "<|im_end|>" || toks->items[i].s == "<|endoftext|>") stop_ids.push_back((int32_t) i);
+                if (toks->items[i].s == "<|im_end|>" || toks->items[i].s == "<|endoftext|>" ||   // Qwen
+                    toks->items[i].s == "<|eot|>" ||                                                // Muse Glimmer's turn end
+                    toks->items[i].s == "<turn|>")                                                  // Gemma 4's
+                    stop_ids.push_back((int32_t) i);
     } catch (const std::exception&) {}
     int32_t im_start = -1;   // the chat template's message header: prompts are checkpointed at its last occurrence
     try {
         strata::GgufFile g(gguf, 1u << 20);
         if (const auto* toks = g.get("tokenizer.ggml.tokens"))
             for (size_t i = 0; i < toks->items.size(); ++i)
-                if (toks->items[i].s == "<|im_start|>") { im_start = (int32_t) i; break; }
+                if (toks->items[i].s == "<|im_start|>" || toks->items[i].s == "<|start|>" || toks->items[i].s == "<|turn>") {
+                    im_start = (int32_t) i;   // (Qwen's, Muse Glimmer's, Gemma 4's message header)
+                    break;
+                }
     } catch (const std::exception&) {}
     std::sort(stop_ids.begin(), stop_ids.end());
     stop_ids.erase(std::unique(stop_ids.begin(), stop_ids.end()), stop_ids.end());
