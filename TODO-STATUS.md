@@ -47,7 +47,7 @@ lives. Branches on the fork: `qwen38` (strata-dense: Qwen3.8-27B, Qwen3.6-35B-A3
 
 | Item | Status | Evidence |
 |---|---|---|
-| Forks in Niko1221/Strata#2067 (lighttransport/Strata `glm53f`, NenadSteric/PolyStrata; iMilnb's HIP work is inside PolyStrata; VecSzn's repo is gone) | reviewed, applied | split verify -> DSv4 MTP +6% (c193e7f); GLM DFlash2 (upstream's batched window is the same idea) working on the V100 (glm-dflash). Not taken: lossy ones (expert deferral, routing affinity); the GPU mailbox, staged prefill prefetch and adaptive VRAM cache are present in Maya already (device-written route ring, prestage, promotions/swaps) |
+| Forks in Niko1221/Strata#2067 (lighttransport/Strata `glm53f`, NenadSteric/PolyStrata; iMilnb's HIP work is inside PolyStrata; VecSzn's repo is gone) | reviewed, applied | split verify -> DSv4 MTP +6% (c193e7f); GLM DFlash2 on the V100 (glm-dflash); GLM prompt attention -46% (a4f2f49). Already in Maya: V100 codebook-in-shared expert GEMVs, device-written route ring (the GPU mailbox), prestaged prefill experts, VRAM promotions / swaps (the adaptive cache). Not taken: lossy ones (expert deferral, routing affinity); KDA prefill column tiling (their +2.5% at 16K; KDA's recurrence is 6% of a 27K GLM prompt here) |
 
 ## GLM-5.3-Flash DFlash2 (branch `glm-dflash` = upstream v1.1.10 + fixes)
 
@@ -59,6 +59,7 @@ lives. Branches on the fork: `qwen38` (strata-dense: Qwen3.8-27B, Qwen3.6-35B-A3
 | VRAM tier froze under the window's all-CPU plan | fixed: background swaps run beside it | hit rate 41-45% -> 51-60% |
 | Result, short prompts (defaults, Q4_K_M drafter) | +3-5% | plain 26.7 / 27.1, DFlash2 27.6 / 28.5 tok/s avg (two rounds), 95% accepted |
 | Result, 12K prompts | -4% | plain 22.6 / 25.2 / 24.9, DFlash2 21.8 / 22.3 / 25.4 |
+| GLM prompt attention on Volta (fork review follow-up: the DSA attention was 28.7% of a 27K prompt) | done, default | two-pass 32-head kernel: dsa_attn 22.5 / 23.2 -> 12.2 / 12.5 s, 27K prompt GPU time -10% / -12% (glm-dflash a4f2f49; hy3 9927b78: -6%, dsv4 c796d98); rel L2 vs F32 unchanged |
 
 ## Serving / tooling
 

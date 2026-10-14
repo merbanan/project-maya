@@ -170,6 +170,11 @@ Q4_K_M drafter (Anbeeld/GLM-5.3-Flash-DFlash2-GGUF, 0.7 GB), the live config's e
 | ... round 2 | 24.5 / 29.0 / 27.7 | **26.6 / 26.7 / 32.3** |
 | 12K prompts | 22.6 / 25.2 / 24.9 | 21.8 / 22.3 / 25.4 |
 
+GLM prompt attention on the V100 (glm-dflash a4f2f49, the default on Volta; `STRATA_GLM_PREFILL_ATTN=tc` the old):
+27K prompts (3 x 27K, prefix reuse: 48,300 tokens through the prompt path), two rounds - dsa_attn 22.5 / 23.2 ->
+**12.2 / 12.5 s**, GPU time 78.5 / 82.1 -> **70.5 / 72.3 s** (-10% / -12%). hy3 branch (81K tokens): 40.7 -> 24.6 s,
+137.5 -> 129.0 s.
+
 Window cost by drafts checked (EXPLORE stats, before the fixes): 1 / 2 / 3 / 5 / 7 drafts 86 / 111 / 134 / 197 / 326 ms
 against a 37 ms plain token. Policy sweep after the fixes (--spec 3/4, min-p 0/0.5/0.95, STRATA_GLM_PROMOTE 8-32):
 27.2-27.9 tok/s average, all within noise.
