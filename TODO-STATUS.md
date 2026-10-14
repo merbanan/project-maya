@@ -47,7 +47,18 @@ lives. Branches on the fork: `qwen38` (strata-dense: Qwen3.8-27B, Qwen3.6-35B-A3
 
 | Item | Status | Evidence |
 |---|---|---|
-| Forks in Niko1221/Strata#2067 (lighttransport/Strata `glm53f`, NenadSteric/PolyStrata; iMilnb's HIP work is inside PolyStrata; VecSzn's repo is gone) | reviewed, first idea applied | split verify (both forks) -> DSv4 MTP spec +6% at default settings (dsv4 c193e7f). Candidates left: GLM-5.3-Flash DFlash2 / DSpark drafters (incoai, RedHatAI), adaptive VRAM expert cache during decode, GPU mailbox per-layer handoff, staged prefill expert prefetch, KDA prefill column tiling, V100 sm70 GEMV tables (PolyStrata STRATA_SM70_TABLE), lossy: expert deferral, routing affinity |
+| Forks in Niko1221/Strata#2067 (lighttransport/Strata `glm53f`, NenadSteric/PolyStrata; iMilnb's HIP work is inside PolyStrata; VecSzn's repo is gone) | reviewed, applied | split verify -> DSv4 MTP +6% (c193e7f); GLM DFlash2 (upstream's batched window is the same idea) working on the V100 (glm-dflash). Not taken: lossy ones (expert deferral, routing affinity); the GPU mailbox, staged prefill prefetch and adaptive VRAM cache are present in Maya already (device-written route ring, prestage, promotions/swaps) |
+
+## GLM-5.3-Flash DFlash2 (branch `glm-dflash` = upstream v1.1.10 + fixes)
+
+| Item | Status | Evidence |
+|---|---|---|
+| DFlash2 drafter for GLM | done (upstream had it: v1.1.10 `--dflash`), made to run and gain on one V100 | 647b213, 7de22a5 |
+| V100 launch OOM (window grouping kernel's 2.6 KB stack = ~420 MB reserved) | fixed | runs at the live 400 MB reserve |
+| Window's RAM-tier experts over PCIe on a 1-NUMA box | fixed: CPU lanes per L3 domain (two CCDs), default | 2 drafts: 21.5/20.1/25.0 -> 24.4/23.9/28.0 tok/s |
+| VRAM tier froze under the window's all-CPU plan | fixed: background swaps run beside it | hit rate 41-45% -> 51-60% |
+| Result, short prompts (defaults, Q4_K_M drafter) | +3-5% | plain 26.7 / 27.1, DFlash2 27.6 / 28.5 tok/s avg (two rounds), 95% accepted |
+| Result, 12K prompts | -4% | plain 22.6 / 25.2 / 24.9, DFlash2 21.8 / 22.3 / 25.4 |
 
 ## Serving / tooling
 

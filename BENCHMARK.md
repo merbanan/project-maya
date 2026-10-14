@@ -157,6 +157,23 @@ DSv4 decode profile at 2K (35.0 ms a token): CPU-lane wait 8.3, grouped output G
 fetch 3.5, q_b 3.2, expert gate/up + down 4.2, router + shared 1.8, projections 1.7, route 1.5, mHC 1.6. A Q8_0 GEMV
 with 2 / 4 / 8 loads a lane in flight: 27.5 / 27.5 / 26.5 tok/s vs 28.4-28.6 - slower, not kept.
 
+## GLM-5.3-Flash DFlash2 - Maya-S24, one V100 (branch `glm-dflash`: upstream v1.1.10 + 647b213 / 7de22a5)
+
+Q4_K_M drafter (Anbeeld/GLM-5.3-Flash-DFlash2-GGUF, 0.7 GB), the live config's env, 3 prompts x 256 tokens, greedy:
+
+| Setting | Plain (tok/s) | DFlash2 (tok/s) |
+|---|---|---|
+| upstream v1.1.10 as is | 25.4 / 28.5 / 27.2 | fails ("84 kernel launches failed": out of memory) |
+| upstream + STRATA_GLM_RESERVE_MB=1000, --spec 3 | 24.0 / 27.2 / 26.2 | 21.5 / 20.1 / 25.0 |
+| + CPU lanes per L3 domain, stack fix (400 MB reserve) | 25.9 / 28.6 / 28.3 | 25.2 / 23.5 / 27.4 (VRAM hit 41-45%) |
+| + VRAM swaps beside the window, defaults (round 1) | 25.0 / 28.6 / 26.6 | **25.8 / 26.7 / 30.4** |
+| ... round 2 | 24.5 / 29.0 / 27.7 | **26.6 / 26.7 / 32.3** |
+| 12K prompts | 22.6 / 25.2 / 24.9 | 21.8 / 22.3 / 25.4 |
+
+Window cost by drafts checked (EXPLORE stats, before the fixes): 1 / 2 / 3 / 5 / 7 drafts 86 / 111 / 134 / 197 / 326 ms
+against a 37 ms plain token. Policy sweep after the fixes (--spec 3/4, min-p 0/0.5/0.95, STRATA_GLM_PROMOTE 8-32):
+27.2-27.9 tok/s average, all within noise.
+
 ## GLM-5.3-Flash - Maya-S24 (94.7 GB), live Maya (v1.0.30 + PR #78)
 
 | Setting | Prompt (tok/s) | Decode (tok/s) | Notes |
