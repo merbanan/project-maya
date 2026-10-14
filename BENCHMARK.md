@@ -54,6 +54,21 @@ of the context: the 1.6K draft pass 10.4 -> 4.0 ms DFlash2, 18.1 -> 4.8 ms DSpar
 their own (the 35B's target K rows are 512 wide, the drafters' 1024: prompt chunks over 1024 rows overwrote the
 drafter context, now 4.64 -> 5.00 tokens a round at 1.6K). Before: DFlash2 151.9 / DSpark 131.3 after 1.6K.
 
+### Qwen3.6-35B-A3B speculative decoding, fresh run (2026-10-14, after e98df5a; one session, 256 tokens)
+
+Decode tok/s (tokens a round). "code" = the 34-token code prompt; 1.6K / 28K = the same question after that much
+filler (chunk 2048). Greedy unless noted.
+
+| Mode | code | after 1.6K | after 28K | code, sampled T 0.6 top-k 20 |
+|---|---:|---:|---:|---:|
+| no drafts | 99.0 | 99.6 | 85.9 | 97.6 |
+| MTP, 3 drafts | 147.6 (2.81) | 158.0 (3.01) | 153.7 (3.20) | 142.6 (2.71) |
+| MTP, 5 drafts | 141.2 (3.28) | 157.1 (3.66) | **166.3** (4.20) | |
+| DFlash2, 7 drafts | **209.3** (5.02) | 210.2 (5.12) | 162.6 (4.34) | **165.3** (4.00) |
+| DSpark, 7 drafts (8K window) | 201.0 (4.92) | **213.9** (5.33) | 168.2 (4.74) | 156.4 (3.94) |
+
+At 28K the block drafters' extra draft pass costs about what their longer runs gain: MTP with 5 drafts ties them.
+
 ## DeepSeek-V4 Flash - antirez IQ2_XXS (80.8 GB), GLM fast path (`dsv4`)
 
 | Context | Prompt (tok/s) | Decode (tok/s) | Notes |
