@@ -47,7 +47,7 @@ lives. Branches on the fork: `qwen38` (strata-dense: Qwen3.8-27B, Qwen3.6-35B-A3
 
 | Item | Status | Evidence |
 |---|---|---|
-| Forks in Niko1221/Strata#2067 (lighttransport/Strata `glm53f`, NenadSteric/PolyStrata; iMilnb's HIP work is inside PolyStrata; VecSzn's repo is gone) | reviewed, applied | split verify -> DSv4 MTP +6% (c193e7f); GLM DFlash2 on the V100 (glm-dflash); GLM prompt attention -46% (a4f2f49). Already in Maya: V100 codebook-in-shared expert GEMVs, device-written route ring (the GPU mailbox), prestaged prefill experts, VRAM promotions / swaps (the adaptive cache). KDA prefill: the recurrence split over 4 blocks a head (48f2e0f). Not taken: the lossy ones (expert deferral, routing affinity: they change the answers) |
+| Forks in Niko1221/Strata#2067 (lighttransport/Strata `glm53f`, NenadSteric/PolyStrata; iMilnb's HIP work is inside PolyStrata; VecSzn's repo is gone) | reviewed, applied | split verify -> DSv4 MTP +6% (c193e7f); GLM DFlash2 on the V100 (glm-dflash); GLM prompt attention -46% (a4f2f49). Already in Maya: V100 codebook-in-shared expert GEMVs, device-written route ring (the GPU mailbox), prestaged prefill experts, VRAM promotions / swaps (the adaptive cache). KDA prefill: the recurrence split over 4 blocks a head (48f2e0f). Lossy ones built opt-in and measured (glm-dflash 29ca355): STRATA_GLM_ROUTE_AFFINITY 0.02 / 0.08 +7% / +21% decode, STRATA_GLM_DEFER_CPU +15% - both change the greedy tokens within the first few, so off by default |
 
 ## GLM-5.3-Flash DFlash2 (branch `glm-dflash` = upstream v1.1.10 + fixes)
 
