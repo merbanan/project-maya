@@ -125,3 +125,8 @@ the RAM-tier experts (CPU lane ~14.5 ms, fetches) at every length.
 |---|---:|---|
 | 93K | 7.84 | non-streamed KV |
 | 93K, KV streaming (16K / 32K cache) | 10.15 / 10.41 | disk reads 21-24 a token from RAM pressure |
+| 28K tq6v3 (2026-10-14) | 15.47 | attention 16.9 ms a token (17.9 before the code-pair tables + register K fragments); 15.12 before |
+| 66K tq6v3 (2026-10-14) | 11.39 | attention 33.5 ms a token (36.1 before) |
+
+Expert prefetch (`STRATA_GLM_PREFETCH_N` 1 / 2) and fetch overlap (#118) are slower on this PCIe-bound box: 16.4 / 15.6
+and 20.1 tok/s against 22.9 at a short context.
