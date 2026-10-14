@@ -285,7 +285,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     const bool use_df = model.has_dflash();
-    if (draft < 0) draft = std::getenv("STRATA_DENSE_DRAFT") ? std::atoi(std::getenv("STRATA_DENSE_DRAFT")) : (use_df ? 7 : 3);
+    // (a MoE model's MTP drafts adaptively from 5 - measured on Qwen3.6-35B-A3B: 141 -> 168 tok/s at 5, 125 -> 172 at 7;
+    // a dense model's fixed 3 stays: its draft steps are cheap beside the verify, adaptive lost 2-3% on the 27B)
+    if (draft < 0) draft = std::getenv("STRATA_DENSE_DRAFT") ? std::atoi(std::getenv("STRATA_DENSE_DRAFT"))
+                                                             : (use_df ? 7 : cfg.n_expert > 0 ? 5 : 3);
     draft = std::max(0, std::min(draft, use_df ? model.dflash_max() : 7));
     if (!use_df && !model.has_mtp()) draft = 0;
     cudaStream_t cs = (cudaStream_t) model.stream();
@@ -610,6 +613,10 @@ int main(int argc, char** argv) {
         };
         int anchor = -1;
         double draft_ms = 0;
+        // STRATA_DENSE_ADAPTIVE=1: the MTP draft count follows the acceptance (from K down to 1 and back)
+        static const bool adaptive = std::getenv("STRATA_DENSE_ADAPTIVE") ? std::atoi(std::getenv("STRATA_DENSE_ADAPTIVE")) != 0
+                                                                          : cfg.n_expert > 0;
+        int k_cur = K;
         if (!cancelled && budget > 0) {
             if (!sample_rows(model.logits(), 1, &anchor)) failed = true;
             else { budget_force(anchor); emit(anchor); }                         // (a stop token sets finish)
@@ -622,6 +629,7 @@ int main(int argc, char** argv) {
             if (in.stop.load()) { cancelled = true; break; }
             const int64_t pos = model.position();
             int k = (int) std::min<long long>(K, std::min<long long>(budget - produced, model.max_context() - pos - 1));
+            if (adaptive && !use_df) k = std::min(k, k_cur);   // (MTP: each draft is a step of its own)
             k = std::max(0, k);
             std::vector<int32_t> win = {anchor};
             int32_t lk[16];
@@ -664,6 +672,10 @@ int main(int argc, char** argv) {
             if (!sample_rows(model.logits(), W, picks)) { failed = true; break; }
             int acc = 0;
             while (acc + 1 < W && win[acc + 1] == picks[acc]) ++acc;
+            if (adaptive && !use_df && W > 1) {   // NInfer-style: one more after a full round, back to what was kept + 1
+                if (acc == W - 1) k_cur = std::min(K, k_cur + 1);
+                else k_cur = std::max(1, std::min(k_cur, acc + 1));
+            }
             if (in_think) {   // the budget runs out inside the kept drafts: keep them up to it, then force the end
                 const long long room = std::max(0LL, think_budget - produced);
                 for (int j = 0; j < acc; ++j)

@@ -22,7 +22,8 @@ lives. Branches on the fork: `qwen38` (strata-dense: Qwen3.8-27B, Qwen3.6-35B-A3
 | 27B T=1 regression from packing | done | packed dp4a + Q4_K/Q5_K min-term fix: 33.6 tok/s, 128/128 greedy (e98df5a, e9815d9) |
 | Drafter attention at long context | done | split-K: 35B DFlash2 1.6K 151.9 -> 182.9, DSpark 131.3 -> 185.7 (e2a748a) |
 | CUDA graphs / GPU-resident rounds | done, opt-in | segment graphs measured: no gain (STRATA_DENSE_GRAPH=1) |
-| Sampled-draft p/q acceptance, adaptive K | evaluated | greedy-draft accept-on-match is already exact; verify cost flat 1-8 rows |
+| Adaptive K (MTP) | done | default for MoE: 35B MTP K5 141 -> 168, K7 125 -> 172 tok/s; off for dense (27B -3%) |
+| Sampled-draft p/q acceptance | see below | |
 | DSv4 prompt indexer on tensor cores | done | d4_index 11.2 -> 2.1 s, d4_attn 12.7 -> 6.0 s at 26K (6d39cfc) |
 | DSv4 MTP | evaluated, not built | RAM-tier verify (upstream #157 pattern); FreeToken/ox-boost measured MTP/DSpark -13% / slower on PCIe-bound offload |
 | Hy3 long-context attention | done | code-pair LUT (1d72f3b) + K fragments in registers (2f13857): 36.1 -> 33.5 ms at 66K |

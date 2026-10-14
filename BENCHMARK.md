@@ -69,6 +69,10 @@ filler (chunk 2048). Greedy unless noted.
 
 At 28K the block drafters' extra draft pass costs about what their longer runs gain: MTP with 5 drafts ties them.
 
+Adaptive MTP draft count (default for MoE models: from 5, one more after a full round, back to kept + 1 after a
+miss; STRATA_DENSE_ADAPTIVE): 35B code answer K5 141.2 -> 168.5, K7 124.6 -> 172.2 tok/s; after 1.6K K5 157.1 -> 177.4.
+(On the dense 27B it lost 2-3%: off there.)
+
 ## Gemma 4 E4B - unsloth Q4_K_M, `strata-dense` (2026-10-14)
 
 Greedy tokens match llama.cpp (128 / 128 at a short prompt; at 6-28K the first difference is a near-tie, llama
