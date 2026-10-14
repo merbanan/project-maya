@@ -826,7 +826,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                   I.alloc(&I.q_full, R * H * 2 * D * f, err, "q_full") && I.alloc(&I.qcur, R * H * D * f, err, "qcur") &&
                   I.alloc(&I.kcur, R * HK * D * f, err, "kcur") && I.alloc(&I.vcur, R * HK * D * f, err, "vcur") &&
                   I.alloc(&I.attn, R * H * D * f, err, "attn") &&
-                  I.alloc(&I.ffn_g, R * cfg_.n_ff * f, err, "ffn_g") && I.alloc(&I.ffn_u, R * cfg_.n_ff * f, err, "ffn_u") &&
+                  I.alloc(&I.ffn_g, R * std::max(cfg_.n_ff, 2 * cfg_.n_ff_shexp) * f, err, "ffn_g")   /* (the shared expert's [gate | up]) */ && I.alloc(&I.ffn_u, R * cfg_.n_ff * f, err, "ffn_u") &&
                   I.alloc(&I.ffn_h, R * cfg_.n_ff * f, err, "ffn_h") &&
                   I.alloc(&I.logits, (uint64_t) kMaxCols * cfg_.n_vocab * f, err, "logits") &&
                   I.alloc(&I.attn_scratch, (uint64_t) q35_attn_scratch_floats(kMaxCols, H, D, (int) max_context) * f, err,
