@@ -62,6 +62,12 @@ lives. Branches on the fork: `qwen38` (strata-dense: Qwen3.8-27B, Qwen3.6-35B-A3
 | GLM KDA prompt recurrence (fork review: lighttransport's KDA prefill kernels) | done, default | 4 blocks a head instead of 1 (kda_rec_split): kda_rec 4.7 / 5.1 -> 3.5 s at 27K, ~2% of the prompt (inside its run spread); rel L2 1e-7 (glm-dflash 48f2e0f, hy3 / dsv4) |
 | GLM prompt attention on Volta (fork review follow-up: the DSA attention was 28.7% of a 27K prompt) | done, default | two-pass 32-head kernel: dsa_attn 22.5 / 23.2 -> 12.2 / 12.5 s, 27K prompt GPU time -10% / -12% (glm-dflash a4f2f49; hy3 9927b78: -6%, dsv4 c796d98); rel L2 vs F32 unchanged |
 
+## Open
+
+| Item | Status | Evidence |
+|---|---|---|
+| Niko1221/Strata code, issues and PRs: ideas for this work | in progress | |
+
 ## Serving / tooling
 
 | Item | Status | Evidence |
