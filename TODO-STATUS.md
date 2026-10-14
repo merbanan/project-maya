@@ -66,6 +66,7 @@ lives. Branches on the fork: `qwen38` (strata-dense: Qwen3.8-27B, Qwen3.6-35B-A3
 
 | Item | Status | Evidence |
 |---|---|---|
+| Gemma 4 30B-class model support (strata-dense) | in progress | |
 | Niko1221/Strata code, issues and PRs: ideas for this work | done | 400 PRs / 600 issues filtered by title, the CUDA / V100 ones read, upstream built and measured on this V100 - below |
 | - #2464: Qwen3.6-35B-A3B on a V100 (upstream q36 111 tok/s plain on UD-Q4_K_XL, 56-59 at 16K) | measured: ours is faster | upstream strata-q36 built here (Niko1221/Strata main 296b59d, sm_70), our UD-Q4_K_M file: tg256 94.3 tok/s, pp512 1,685 tok/s; strata-dense 97.8 tok/s decode, 2,333 tok/s prompt (1.6K), 70.3 at 28K vs their 56-59 at 16K |
 | - native_mmvq V100 row table (STRATA_SM70_TABLE, PR 1401) | measured: no gain | upstream strata-q36 on our V100-PCIe: 94.3 -> 93.1 tok/s with it; our dp4a GEMVs are faster already |
