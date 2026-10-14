@@ -25,7 +25,7 @@ lives. Branches on the fork: `qwen38` (strata-dense: Qwen3.8-27B, Qwen3.6-35B-A3
 | Adaptive K (MTP) | done | default for MoE: 35B MTP K5 141 -> 168, K7 125 -> 172 tok/s; off for dense (27B -3%) |
 | Sampled-draft p/q acceptance (lithos) | done | MTP drafts sampled from q, exact min(1,p/q) + residual: 35B T0.6 148.7 -> 155.5, T1.0 130.1 -> 147.7 tok/s; default for MoE |
 | DSv4 prompt indexer on tensor cores | done | d4_index 11.2 -> 2.1 s, d4_attn 12.7 -> 6.0 s at 26K (6d39cfc) |
-| DSv4 MTP | evaluated, not built | RAM-tier verify (upstream #157 pattern); FreeToken/ox-boost measured MTP/DSpark -13% / slower on PCIe-bound offload |
+| DSv4 MTP | not built (scoped) | needs: the MTP GGUF's 256 Q4_K experts packed into the tiers, a DSv4 MTP layer (mHC, e/h proj, sink attention), a 2-8 token verify through DSv4 attention + indexer + compressors with compressor/indexer state rollback; the GLM fast path's spec mode is a multi-GPU pipeline, not a 1-GPU draft/verify. Expected payoff negative here: freetoken-ox-boost measured GLM MTP -13% and DSv4 DSpark -24% (55 -> 42 tok/s) on a 96 GB card; this box keeps ~70% of the experts in RAM (CPU lane 14 ms a token) |
 | Hy3 long-context attention | done | code-pair LUT (1d72f3b) + K fragments in registers (2f13857): 36.1 -> 33.5 ms at 66K |
 | Hy3 attention, V side in registers | done, opt-in | STRATA_GLM_GQA_REG=2 (cffeaaf): correct, 3.6x slower (60.3 vs 16.8 ms) - off |
 | Gemma head-512 prompt attention | done | 2,693 -> 3,826 (26K), 1,106 -> 1,993 (94K) tok/s, needles 3/3 (196cc14, 9a93286) |
