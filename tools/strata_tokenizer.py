@@ -228,6 +228,8 @@ class Tokenizer:
         Applying merges in list order rather than rank order is the classic BPE bug: it produces a different
         segmentation and a plausible token count.
         """
+        if len(word) > 64:
+            return self._bpe_heap(word)
         parts = list(word)
         while len(parts) > 1:
             best, best_rank = None, None
@@ -239,6 +241,48 @@ class Tokenizer:
                 break
             parts[best:best + 2] = [parts[best] + parts[best + 1]]
         return parts
+
+    def _bpe_heap(self, word: str) -> list[str]:
+        """_bpe for long pieces (Gemma 4's split only at newlines: a page of text is one piece) in O(n log n): symbols in
+        a linked list, candidate pairs in a heap by (rank, position) - the lowest rank first, the leftmost of equal
+        ranks, as the quadratic scan; a popped pair whose symbols changed since it was pushed is stale and skipped."""
+        import heapq
+        sym = list(word)
+        n = len(sym)
+        prv = list(range(-1, n - 1))
+        nxt = list(range(1, n + 1))
+        nxt[-1] = -1
+        alive = [True] * n
+        heap = []
+        for i in range(n - 1):
+            r = self.ranks.get((sym[i], sym[i + 1]))
+            if r is not None:
+                heap.append((r, i, sym[i], sym[i + 1]))
+        heapq.heapify(heap)
+        while heap:
+            r, i, a, b = heapq.heappop(heap)
+            j = nxt[i] if alive[i] else -1
+            if j < 0 or sym[i] != a or sym[j] != b:
+                continue
+            sym[i] = a + b
+            alive[j] = False
+            nxt[i] = nxt[j]
+            if nxt[j] >= 0:
+                prv[nxt[j]] = i
+            p = prv[i]
+            if p >= 0:
+                rr = self.ranks.get((sym[p], sym[i]))
+                if rr is not None:
+                    heapq.heappush(heap, (rr, p, sym[p], sym[i]))
+            if nxt[i] >= 0:
+                rr = self.ranks.get((sym[i], sym[nxt[i]]))
+                if rr is not None:
+                    heapq.heappush(heap, (rr, i, sym[i], sym[nxt[i]]))
+        out, i = [], 0
+        while i >= 0:
+            out.append(sym[i])
+            i = nxt[i]
+        return out
 
     def _encode_plain(self, text: str) -> list[int]:
         # a piece always encodes to the same ids, so they are remembered (a prompt repeats most of its words, and an

@@ -80,6 +80,9 @@ target's K/V), `STRATA_DENSE_DRAFT=K`.
 | llama.cpp | 287 (32) / 3,449 (1.5K) / 3,676 (5.6K) / 3,140 (26K) | 92.5 / 92.5 / 91.1 / 85.2 | |
 | no drafts | 579 (32) / 4,303 (1.5K) / **5,104** (5.6K) / **3,765** (26K; 2,695 before the one-pass head-512 prompt attention) | **98.8 - 100.1** / 85.6 / 80.3 / **85.3** (26K) | |
 | assistant, 2 drafts | | **161.3** | 2.37 tokens a round |
+
+Needles 3/3 at 26K / 57K / 94K (tests/q35/q38needle.py --style gemma): prompt 3,826 / 2,730 / 1,993 tok/s with the
+one-pass head-512 attention (2,693 / 1,650 / 1,106 with the split form), decode 87.5 / 78.5 / 70.1 tok/s.
 | assistant, 3 drafts | | 152.0 / 150.3 (after 1.5K) | 2.69 / 2.64 |
 | assistant, 4 drafts | | 157.6 | 2.91 |
 

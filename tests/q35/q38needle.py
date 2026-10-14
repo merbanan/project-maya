@@ -23,6 +23,7 @@ ap.add_argument("--ctx", type=int, default=0)
 ap.add_argument("--new", type=int, default=80)
 ap.add_argument("--bin", default="build/strata-dense")
 ap.add_argument("--gguf", default=GGUF)
+ap.add_argument("--style", default="qwen", help="qwen | gemma | muse (the chat format)")
 a = ap.parse_args()
 GGUF = a.gguf
 
@@ -51,8 +52,13 @@ for depth, f in zip((0.10, 0.50, 0.85), facts):
     chunks.insert(int(len(chunks) * depth), f + " ")
 q = ("".join(chunks) + "\n\nUsing only the text above, answer three questions in one line each: 1) the password for "
      "the blue vault, 2) the city where Captain Ilse Varga was born, 3) the experiment's final reading.")
-ids = tk.encode("<|im_start|>user\n" + q + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
-                parse_special=True)
+if a.style == "gemma":
+    ids = tk.encode("<bos><|turn>user\n" + q + "<turn|>\n<|turn>model\n", parse_special=True)
+elif a.style == "muse":
+    ids = tk.encode("<|begin_of_text|><|start|>user<|message|>" + q + "<|eot|><|start|>assistant", parse_special=True)
+else:
+    ids = tk.encode("<|im_start|>user\n" + q + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                    parse_special=True)
 env = dict(os.environ)
 env.update(kv.split("=", 1) for kv in a.env)
 ctx = a.ctx or (len(ids) + a.new + 64)
