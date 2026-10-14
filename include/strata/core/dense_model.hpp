@@ -133,6 +133,8 @@ public:
     bool dflash_inject(int n, int64_t p0, std::string& err);
     /// K drafts after `anchor` (the token at position(), not yet fed); out gets them (host).
     bool dflash_draft(int32_t anchor, int K, std::vector<int32_t>& out, std::string& err);
+    /// "DSpark" or "DFlash2" (the loaded drafter's kind)
+    const char* dflash_kind() const;
 
     struct Impl;
 

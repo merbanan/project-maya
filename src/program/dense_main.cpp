@@ -602,6 +602,7 @@ int main(int argc, char** argv) {
             return true;
         };
         int anchor = -1;
+        double draft_ms = 0;
         if (!cancelled && budget > 0) {
             if (!sample_rows(model.logits(), 1, &anchor)) failed = true;
             else { budget_force(anchor); emit(anchor); }                         // (a stop token sets finish)
@@ -627,7 +628,9 @@ int main(int argc, char** argv) {
                 }
             } else if (k > 0 && use_df) {
                 std::vector<int32_t> d;
+                const auto t_d = Clock::now();
                 if (!model.dflash_draft(anchor, k, d, err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
+                draft_ms += ms_since(t_d);
                 win.insert(win.end(), d.begin(), d.end());
             } else if (k > 0) {
                 // the drafts: the MTP block over the pending rows (the last one's logits), then one row a draft
@@ -693,11 +696,12 @@ int main(int argc, char** argv) {
                     accepted, drafted, (long long) resume);
         std::fflush(stdout);
         std::fprintf(stderr, "strata-dense: prompt %lld tokens = %zu reused%s + %lld read in %.0f ms (%.0f tok/s), %lld generated "
-                     "in %.0f ms (%.1f tok/s)%s; %s %lld rounds (%lld by lookup), %lld of %lld drafts kept (%.2f tokens a round)\n",
+                     "in %.0f ms (%.1f tok/s)%s; %s %lld rounds (%lld by lookup), %lld of %lld drafts kept (%.2f tokens a round, drafter %.1f ms a draft)\n",
                      (long long) n, resume, restored ? " (checkpoint)" : "", (long long) (n - (long long) resume), prompt_ms,
                      prompt_ms > 0 ? 1000.0 * (n - (long long) resume) / prompt_ms : 0.0, produced, decode_ms,
                      decode_ms > 0 ? 1000.0 * produced / decode_ms : 0.0, cancelled ? " (cancelled)" : "",
-                     use_df ? "DFlash2" : "MTP", rounds, lookup_rounds, accepted, drafted, rounds ? (double) (accepted + rounds) / rounds : 0.0);
+                     use_df ? model.dflash_kind() : "MTP", rounds, lookup_rounds, accepted, drafted, rounds ? (double) (accepted + rounds) / rounds : 0.0,
+                     rounds > lookup_rounds ? draft_ms / (rounds - lookup_rounds) : 0.0);
     }
     cudaFree(d_next);
     cudaFree(d_hist);

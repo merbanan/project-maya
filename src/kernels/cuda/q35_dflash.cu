@@ -4,7 +4,9 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -139,6 +141,126 @@ __global__ void attn_kernel(const float* __restrict__ Q, const __half* __restric
         }
     }
     out[((size_t) i * n_head + h) * kHd + d] = sum > 0.0f ? acc / sum : 0.0f;
+}
+
+// ---- the split-K form: block (kv head, chunk of kCh ring positions), every query of the kv head (rep x rows, up to
+// kMaxG) against the chunk's K / V in shared memory; partials (max, sum, o[128]) a (query, chunk); the merge adds
+// the block's own keys. (Each K / V row read once a kv head instead of once a (head, row).)
+constexpr int kCh = 64, kMaxG = 64, kPad = kHd + 2, kPart = kHd + 2;
+
+__global__ void __launch_bounds__(256) attn_split_kernel(const float* __restrict__ Q, const __half* __restrict__ Kr,
+                                                         const __half* __restrict__ Vr, const int64_t* __restrict__ rp,
+                                                         int rows, int n_head, int n_kv, int64_t n_past, int64_t lo0,
+                                                         int ring, int window, float scale, float* __restrict__ part) {
+    extern __shared__ float sm[];
+    const int rep = n_head / n_kv, G = rep * rows, kvh = blockIdx.x, c = blockIdx.y, nsplit = gridDim.y;
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, kvd = n_kv * kHd;
+    float* qs = sm;                                   // [G][kHd]
+    float* sc = qs + (size_t) G * kHd;                // [G][kCh]
+    __half* Ks = (__half*) (sc + (size_t) G * kCh);   // [kCh][kPad]
+    __half* Vs = Ks + kCh * kPad;
+    const int64_t p0 = lo0 + (int64_t) c * kCh;
+    for (int idx = tid; idx < G * kHd; idx += 256) {
+        const int g = idx / kHd, d = idx % kHd, i = g / rep, h = kvh * rep + g % rep;
+        qs[idx] = Q[((size_t) i * n_head + h) * kHd + d] * scale;
+    }
+    for (int idx = tid; idx < kCh * (kHd / 2); idx += 256) {
+        const int t = idx / (kHd / 2), e = idx % (kHd / 2);
+        const int64_t p = p0 + t;
+        __half2 kv = __floats2half2_rn(0.f, 0.f), vv = kv;
+        if (p < n_past) {
+            const size_t slot = (size_t) (p % ring);
+            kv = ((const __half2*) (Kr + slot * kvd + (size_t) kvh * kHd))[e];
+            vv = ((const __half2*) (Vr + slot * kvd + (size_t) kvh * kHd))[e];
+        }
+        ((__half2*) (Ks + t * kPad))[e] = kv;
+        ((__half2*) (Vs + t * kPad))[e] = vv;
+    }
+    __syncthreads();
+    for (int idx = tid; idx < G * kCh; idx += 256) {
+        const int g = idx / kCh, t = idx % kCh, i = g / rep;
+        const int64_t p = p0 + t;
+        float acc = -INFINITY;
+        if (p < n_past && p >= n_past + i - window + 1 && rp[(size_t) (p % ring)] == p) {
+            const float2* q2 = (const float2*) (qs + (size_t) g * kHd);
+            const __half2* k2 = (const __half2*) (Ks + t * kPad);
+            acc = 0.0f;
+#pragma unroll 8
+            for (int e = 0; e < kHd / 2; ++e) {
+                const float2 kf = __half22float2(k2[e]), qf = q2[e];
+                acc += qf.x * kf.x + qf.y * kf.y;
+            }
+        }
+        sc[idx] = acc;
+    }
+    __syncthreads();
+    for (int g = w; g < G; g += 8) {   // a warp a query: the chunk's max, exp, sum
+        float* r = sc + (size_t) g * kCh;
+        float m = fmaxf(r[lane], r[lane + 32]);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        const float e0 = m == -INFINITY ? 0.f : __expf(r[lane] - m), e1 = m == -INFINITY ? 0.f : __expf(r[lane + 32] - m);
+        r[lane] = e0;
+        r[lane + 32] = e1;
+        const float l = warp_sum(e0 + e1);
+        if (lane == 0) {
+            const int i = g / rep, h = kvh * rep + g % rep;
+            float* pp = part + (((size_t) i * n_head + h) * nsplit + c) * kPart;
+            pp[0] = m;
+            pp[1] = l;
+        }
+    }
+    __syncthreads();
+    for (int idx = tid; idx < G * (kHd / 2); idx += 256) {
+        const int g = idx / (kHd / 2), e = idx % (kHd / 2);
+        const float* r = sc + (size_t) g * kCh;
+        float ox = 0.f, oy = 0.f;
+#pragma unroll 8
+        for (int t = 0; t < kCh; ++t) {
+            const float2 v = __half22float2(((const __half2*) (Vs + t * kPad))[e]);
+            ox += r[t] * v.x;
+            oy += r[t] * v.y;
+        }
+        const int i = g / rep, h = kvh * rep + g % rep;
+        float* pp = part + (((size_t) i * n_head + h) * nsplit + c) * kPart + 2;
+        pp[2 * e] = ox;
+        pp[2 * e + 1] = oy;
+    }
+}
+
+// block (head, row), kHd threads: the chunks' partials and the block's own keys -> the row's output
+__global__ void attn_merge_kernel(const float* __restrict__ Q, const float* __restrict__ Kb, const float* __restrict__ Vb,
+                                  const float* __restrict__ part, int nsplit, int rows, int n_head, int n_kv, float scale,
+                                  float* __restrict__ out) {
+    __shared__ float sb[16];
+    const int h = blockIdx.x, i = blockIdx.y, d = threadIdx.x, lane = d & 31, wid = d >> 5;
+    const int kvh = h / (n_head / n_kv), kvd = n_kv * kHd;
+    for (int k = wid; k < rows; k += kHd / 32) {
+        const float* kb = Kb + (size_t) k * kvd + (size_t) kvh * kHd;
+        float a = 0.f;
+        for (int e = lane; e < kHd; e += 32) a += Q[((size_t) i * n_head + h) * kHd + e] * kb[e];
+        a = warp_sum(a);
+        if (lane == 0) sb[k] = a * scale;
+    }
+    __syncthreads();
+    const float* pp = part + ((size_t) i * n_head + h) * nsplit * kPart;
+    float M = -INFINITY;
+    for (int c = 0; c < nsplit; ++c) M = fmaxf(M, pp[(size_t) c * kPart]);
+    for (int k = 0; k < rows; ++k) M = fmaxf(M, sb[k]);
+    float L = 0.f, o = 0.f;
+    for (int c = 0; c < nsplit; ++c) {
+        const float m = pp[(size_t) c * kPart];
+        if (m == -INFINITY) continue;
+        const float f = __expf(m - M);
+        L += f * pp[(size_t) c * kPart + 1];
+        o += f * pp[(size_t) c * kPart + 2 + d];
+    }
+    for (int k = 0; k < rows; ++k) {
+        const float f = __expf(sb[k] - M);
+        L += f;
+        o += f * Vb[(size_t) k * kvd + (size_t) kvh * kHd + d];
+    }
+    out[((size_t) i * n_head + h) * kHd + d] = L > 0.f ? o / L : 0.f;
 }
 
 __device__ __forceinline__ bool tk_before(float v, int i, float bv, int bi) { return v > bv || (v == bv && i < bi); }
@@ -276,10 +398,35 @@ void q35_df_ring_store(const float* K, const float* V, int rows, int kvd, int64_
     check("q35_df_ring_store");
 }
 
+int64_t q35_df_attn_scratch(int n_head, int rows, int window) {
+    return (int64_t) n_head * rows * ((window + kCh - 1) / kCh + 1) * kPart * sizeof(float);
+}
+
 void q35_df_attn(const float* Q, const uint16_t* Kr, const uint16_t* Vr, const int64_t* ring_pos, const float* Kb,
                  const float* Vb, int rows, int n_head, int n_kv, int64_t n_past, int ring, int window, float* out,
-                 void* stream) {
+                 void* stream, float* scratch) {
+    const int G = n_head / n_kv * rows;
+    const int64_t lo0 = std::max<int64_t>(0, n_past - window + 1);
+    if (scratch && G <= kMaxG && rows <= 16 && n_past > lo0 && !std::getenv("STRATA_DENSE_DF_ATTN_OLD")) {
+        const int nsplit = (int) ((n_past - lo0 + kCh - 1) / kCh);
+        const size_t sm = (size_t) G * (kHd + kCh) * 4 + (size_t) 2 * kCh * kPad * 2;
+        static bool attr2 = false;
+        if (!attr2) {
+            cudaFuncSetAttribute(attn_split_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
+            attr2 = true;
+        }
+        const float scale = 1.0f / sqrtf((float) kHd);
+        attn_split_kernel<<<dim3(n_kv, nsplit), 256, sm, (cudaStream_t) stream>>>(
+            Q, (const __half*) Kr, (const __half*) Vr, ring_pos, rows, n_head, n_kv, n_past, lo0, ring, window, scale,
+            scratch);
+        check("q35_df_attn_split");
+        attn_merge_kernel<<<dim3(n_head, rows), kHd, 0, (cudaStream_t) stream>>>(Q, Kb, Vb, scratch, nsplit, rows,
+                                                                                 n_head, n_kv, scale, out);
+        check("q35_df_attn_merge");
+        return;
+    }
     const size_t smem = (size_t) (window + rows) * sizeof(float);
+    if (smem > 64 * 1024) throw std::invalid_argument("q35_df_attn: a window this long needs the split-K form");
     static bool attr = false;
     if (!attr) {
         cudaFuncSetAttribute(attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
@@ -316,6 +463,19 @@ void q35_df_walk(const int* cand, const float* lg, const float* gate, int k, int
     walk_kernel<<<1, rank, 0, (cudaStream_t) stream>>>(cand, lg, gate, k, rank, (const __half*) pred_tab,
                                                        (const __half*) succ_tab, anchor, n, tok, conf);
     check("q35_df_walk");
+}
+
+namespace {
+__global__ void gather_f16_kernel(const __half* __restrict__ tab, int rank, const int* __restrict__ tok,
+                                  float* __restrict__ out) {
+    const size_t r = (size_t) tok[0];
+    for (int i = threadIdx.x; i < rank; i += blockDim.x) out[i] = __half2float(tab[r * rank + i]);
+}
+}  // namespace
+
+void q35_df_gather_f16(const uint16_t* tab, int rank, const int* tok, float* out, void* stream) {
+    gather_f16_kernel<<<1, 256, 0, (cudaStream_t) stream>>>((const __half*) tab, rank, tok, out);
+    check("q35_df_gather_f16");
 }
 
 }  // namespace strata::kernels

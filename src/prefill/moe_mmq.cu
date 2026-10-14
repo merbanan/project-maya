@@ -16,7 +16,8 @@ namespace {
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
         std::fprintf(stderr, "prefill mmq: %s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
+        std::fflush(stderr);
+        std::_Exit(1);   // (exit's teardown can block on threads still reading the request pipe)
     }
 }
 

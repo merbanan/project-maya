@@ -89,6 +89,15 @@ struct Dflash {
     int n_layer = 0, n_head = 0, n_kv = 0, block = 0, taps = 0, group = 0, rank = 0, top_k = 0, window = 2048;
     int mask_tok = 0, n_cand = 0;                     // candidates come from ids [0, n_cand)
     int n_ff = 0;                                     // the drafter's MLP width (its own: a MoE target's differs)
+    // DSpark (LithosAI): no convolutions, no selector; its own embedding and head, a Markov head
+    // d_k = argmax(head(h_k) + W2 . W1[d_(k-1)]); every block row drafts (row 0: the anchor's)
+    bool dspark = false;
+    QMat ds_embd, ds_head, ds_w2;
+    uint16_t* ds_w1 = nullptr;                        // [vocab][rank] FP16
+    float *ds_x = nullptr, *ds_lg = nullptr;          // the chain's W1 row and one row's logits
+    int* ds_tok = nullptr;                            // the anchor, then the drafts (device)
+    float* attn_part = nullptr;                       // the split-K attention's partials
+    float *kc = nullptr, *vc = nullptr;               // its K / V rows (chunk x kvd: wider than the target's on a MoE)
     float *g = nullptr, *u = nullptr, *hh = nullptr;  // its MLP rows (block x n_ff)
     float eps = 1e-6f, theta = 1e7f;
     std::vector<int> target_layers;
@@ -1171,10 +1180,11 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
         I.df_file.reset(new strata::GgufFile(path));
         const strata::GgufFile& G = *I.df_file;
         const auto* arch = G.get("general.architecture");
-        if (!arch || arch->s != "qwen35-dflash-draft") {
-            err = "dflash: " + path + " is not a qwen35-dflash-draft GGUF";
+        if (!arch || (arch->s != "qwen35-dflash-draft" && arch->s != "qwen35-dspark-draft")) {
+            err = "dflash: " + path + " is not a qwen35-dflash-draft / qwen35-dspark-draft GGUF";
             return false;
         }
+        F.dspark = arch->s == "qwen35-dspark-draft";
         const std::string a = arch->s + ".";
         auto num = [&](const std::string& k, double def) -> double {
             const auto* v = G.get(a + k);
@@ -1192,7 +1202,7 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
         F.block = (int) num("dflash.block_size", 8);
         F.taps = (int) num("dflash.dflash2.conv_kernel_size", 0);
         F.group = (int) num("dflash.dflash2.conv_group_size", 16);
-        F.rank = (int) num("dflash.dflash2.selector_rank", 0);
+        F.rank = (int) num(F.dspark ? "dspark.markov_rank" : "dflash.dflash2.selector_rank", 0);
         F.top_k = (int) num("dflash.dflash2.selector_top_k", 16);
         F.mask_tok = (int) num("dflash.mask_token_id", -1);
         F.eps = (float) num("attention.layer_norm_rms_epsilon", 1e-6);
@@ -1202,6 +1212,10 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
         F.n_cand = std::min(cfg_.n_vocab, (int) num("dflash.candidate_vocab", 248077));
         if (const auto* tl = G.get(a + "dflash.target_layer_ids"))
             for (const auto& it : tl->items) F.target_layers.push_back((int) it.u);
+        if (F.dspark) {   // trained on the whole context: a ring of 32K positions (24 KiB a position) unless set
+            F.taps = 2;
+            F.window = (int) std::min<int64_t>(max_context_, std::getenv("STRATA_DENSE_DFLASH_CTX") ? F.window : 32768);
+        }
         if (F.n_layer < 1 || F.n_head < 1 || F.n_kv < 1 || F.taps != 2 || F.rank < 32 || F.rank > 1024 ||
             F.rank % 32 || F.top_k < 1 || F.top_k > 32 || F.mask_tok < 0 || F.target_layers.empty() ||
             F.block < 2 || F.block > 9 || (int) num("attention.key_length", 128) != 128) {
@@ -1220,7 +1234,7 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
             return I.upload_floats(&f, n, want, out, err);
         };
         // an F16 / BF16 / F32 matrix -> Q8_0 on the device (the GEMVs and GEMMs take Q8_0); a quantized one as is
-        auto mat = [&](const std::string& n, int n_in, int n_out, QMat& out) {
+        auto mat = [&](const std::string& n, int n_in, int n_out, QMat& out, bool packable = true) {
             const auto* t = find(n);
             if (!t || t->shape.size() != 2 || t->shape[0] != (uint64_t) n_in || t->shape[1] != (uint64_t) n_out) {
                 err = "dflash: " + n + " missing or not " + std::to_string(n_in) + " x " + std::to_string(n_out);
@@ -1236,14 +1250,29 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
             cudaMemcpy(dev, q.data(), q.size(), cudaMemcpyHostToDevice);
             out = QMat{dev, 8, n_in, n_out};
             total += q.size();
-            if (!I.pack(out, true, err)) return false;
+            if (packable && !I.pack(out, true, err)) return false;
             return true;
         };
         const int qd = F.n_head * 128, kvd = F.n_kv * 128, cdyn = 2 * F.taps * (E / F.group);
-        if (!mat("dflash.fc.weight", NF * E, E, F.fc) || !mat("dflash.selector.hproj.weight", E, F.rank, F.hproj) ||
+        if (!mat("dflash.fc.weight", NF * E, E, F.fc) ||
+            (!F.dspark && !mat("dflash.selector.hproj.weight", E, F.rank, F.hproj)) ||
             !f32("dflash.hidden_norm.weight", E, &F.hidden_norm) || !f32("output_norm.weight", E, &F.out_norm))
             return false;
+        if (F.dspark) {
+            const auto* t1 = find("dspark.markov_w1");
+            if (!mat("token_embd.weight", E, cfg_.n_vocab, F.ds_embd, false) || !mat("output.weight", E, cfg_.n_vocab, F.ds_head) ||
+                !mat("dspark.markov_w2.weight", F.rank, cfg_.n_vocab, F.ds_w2) || !t1 || t1->type != kF16)
+                return false;
+            const size_t b1 = (size_t) F.rank * cfg_.n_vocab * 2;
+            if (!I.alloc(&F.ds_w1, b1, err, "markov w1")) return false;
+            cudaMemcpy(F.ds_w1, G.tensor_data(*t1), b1, cudaMemcpyHostToDevice);
+            total += b1;
+            if (!I.alloc(&F.ds_x, (uint64_t) F.rank * 4, err, "dspark") ||
+                !I.alloc(&F.ds_lg, (uint64_t) cfg_.n_vocab * 4, err, "dspark") || !I.alloc(&F.ds_tok, 16 * 4, err, "dspark"))
+                return false;
+        }
         for (const char* n : {"dflash.selector.pred_cb", "dflash.selector.succ_cb"}) {
+            if (F.dspark) break;
             const auto* t = find(n);
             if (!t || t->type != kF16 || t->shape.size() != 2 || t->shape[0] != (uint64_t) F.rank ||
                 t->shape[1] != (uint64_t) cfg_.n_vocab) {
@@ -1262,12 +1291,12 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
             const std::string P = "blk." + std::to_string(il) + ".";
             if (!f32(P + "attn_norm.weight", E, &L.attn_norm) || !f32(P + "ffn_norm.weight", E, &L.ffn_norm) ||
                 !f32(P + "attn_q_norm.weight", 128, &L.q_norm) || !f32(P + "attn_k_norm.weight", 128, &L.k_norm) ||
-                !f32(P + "attn_conv.base", (uint64_t) 2 * F.taps * E, &L.attn_base) ||
-                !f32(P + "ffn_conv.base", (uint64_t) 2 * F.taps * E, &L.ffn_base) ||
+                (!F.dspark && !f32(P + "attn_conv.base", (uint64_t) 2 * F.taps * E, &L.attn_base)) ||
+                (!F.dspark && !f32(P + "ffn_conv.base", (uint64_t) 2 * F.taps * E, &L.ffn_base)) ||
                 !mat(P + "attn_q.weight", E, qd, L.q) || !mat(P + "attn_k.weight", E, kvd, L.k) ||
                 !mat(P + "attn_v.weight", E, kvd, L.v) || !mat(P + "attn_output.weight", qd, E, L.o) ||
-                !mat(P + "attn_conv.proj.weight", E, cdyn, L.attn_conv) ||
-                !mat(P + "ffn_conv.proj.weight", E, cdyn, L.ffn_conv) ||
+                (!F.dspark && !mat(P + "attn_conv.proj.weight", E, cdyn, L.attn_conv)) ||
+                (!F.dspark && !mat(P + "ffn_conv.proj.weight", E, cdyn, L.ffn_conv)) ||
                 !mat(P + "ffn_gate.weight", E, F.n_ff, L.gate) || !mat(P + "ffn_up.weight", E, F.n_ff, L.up) ||
                 !mat(P + "ffn_down.weight", F.n_ff, E, L.down))
                 return false;
@@ -1284,6 +1313,8 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
             !I.alloc(&F.gate, W * F.rank * 4, err, "dflash") ||
             !I.alloc(&F.cand_v, W * F.top_k * 4, err, "dflash") || !I.alloc(&F.cand_i, W * F.top_k * 4, err, "dflash") ||
             !I.alloc(&F.tok, W * 4, err, "dflash") || !I.alloc(&F.conf, W * 4, err, "dflash") ||
+            !I.alloc(&F.kc, std::max(R, W) * kvd * 4, err, "dflash k") || !I.alloc(&F.vc, std::max(R, W) * kvd * 4, err, "dflash v") ||
+            !I.alloc(&F.attn_part, (uint64_t) q35_df_attn_scratch(F.n_head, (int) W, F.window), err, "dflash attn") ||
             !I.alloc(&F.topk_scratch, (uint64_t) q35_df_topk_scratch((int) W, F.top_k), err, "dflash"))
             return false;
         if (!I.alloc(&F.g, W * F.n_ff * 4, err, "dflash mlp") || !I.alloc(&F.u, W * F.n_ff * 4, err, "dflash mlp") ||
@@ -1306,8 +1337,8 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
         cudaMemset(F.ring_pos, 0xff, (size_t) F.window * 8);   // -1: no position
         if (cudaDeviceSynchronize() != cudaSuccess) { err = "dflash: upload failed"; return false; }
         F.on = true;
-        std::fprintf(stderr, "strata-dense: DFlash2 drafter %s: %d layers, block %d, %.2f GiB (Q8_0), window %d, "
-                     "target layers", path.c_str(), F.n_layer, F.block, total / 1073741824.0, F.window);
+        std::fprintf(stderr, "strata-dense: %s drafter %s: %d layers, block %d, %.2f GiB (Q8_0), window %d, "
+                     "target layers", F.dspark ? "DSpark" : "DFlash2", path.c_str(), F.n_layer, F.block, total / 1073741824.0, F.window);
         for (int l : F.target_layers) std::fprintf(stderr, " %d", l);
         std::fprintf(stderr, "\n");
         return true;
@@ -1330,12 +1361,12 @@ bool DenseModel::dflash_inject(int n, int64_t p0, std::string& err) {
         q35_rms_rows(I.mix, E, F.hidden_norm, I.xn, nullptr, n, E, F.eps, s);
         I.prep(I.xn, E, n);
         for (DfLayer& L : F.layers) {
-            I.mm(L.k, I.kcur);
-            I.mm(L.v, I.vcur);
-            q35_df_head_norm_rope(I.kcur, n, F.n_kv, L.k_norm, F.eps, p0, F.theta, s);
+            I.mm(L.k, F.kc);
+            I.mm(L.v, F.vc);
+            q35_df_head_norm_rope(F.kc, n, F.n_kv, L.k_norm, F.eps, p0, F.theta, s);
             // rows beyond the window would overwrite each other's slots: keep the last `window`
             const int skip = std::max(0, n - F.window);
-            q35_df_ring_store(I.kcur + (size_t) skip * kvd, I.vcur + (size_t) skip * kvd, n - skip, kvd, p0 + skip,
+            q35_df_ring_store(F.kc + (size_t) skip * kvd, F.vc + (size_t) skip * kvd, n - skip, kvd, p0 + skip,
                               F.window, L.Kr, L.Vr, F.ring_pos, s);
         }
         return true;
@@ -1345,20 +1376,66 @@ bool DenseModel::dflash_inject(int n, int64_t p0, std::string& err) {
     }
 }
 
+const char* DenseModel::dflash_kind() const { return impl_->df.dspark ? "DSpark" : "DFlash2"; }
+
 bool DenseModel::dflash_draft(int32_t anchor, int K, std::vector<int32_t>& out, std::string& err) {
     Impl& I = *impl_;
     Dflash& F = I.df;
     out.clear();
     if (!F.on || K < 1) return true;
     K = std::min(K, F.block - 1);
-    const int W = K + 1, E = cfg_.n_embd, kvd = F.n_kv * 128, qd = F.n_head * 128;
+    // DSpark: every row drafts (row k the token after d_(k-1)); the block as trained, its first K rows' drafts kept
+    const int W = F.dspark ? F.block : K + 1, E = cfg_.n_embd, kvd = F.n_kv * 128, qd = F.n_head * 128;
     const int cdyn = 2 * F.taps * (E / F.group);
     const int64_t P0 = pos_;
     cudaStream_t s = I.stream;
     try {
         // h = emb([anchor, mask x K])
+        const QMat& emb = F.dspark ? F.ds_embd : I.embd;
         for (int t = 0; t < W; ++t)
-            dequant_f32(I.embd.type, I.embd.dev, t == 0 ? anchor : F.mask_tok, 1, E, F.h + (size_t) t * E, s);
+            dequant_f32(emb.type, emb.dev, t == 0 ? anchor : F.mask_tok, 1, E, F.h + (size_t) t * E, s);
+        if (F.dspark) {
+            for (DfLayer& L : F.layers) {   // plain pre-norm layers: no convolutions
+                q35_rms_rows(F.h, E, L.attn_norm, I.xn, nullptr, W, E, F.eps, s);
+                I.prep(I.xn, E, W);
+                I.mm(L.q, I.q_full);
+                I.mm(L.k, F.kc);
+                I.mm(L.v, F.vc);
+                q35_df_head_norm_rope(I.q_full, W, F.n_head, L.q_norm, F.eps, P0, F.theta, s);
+                q35_df_head_norm_rope(F.kc, W, F.n_kv, L.k_norm, F.eps, P0, F.theta, s);
+                q35_df_attn(I.q_full, L.Kr, L.Vr, F.ring_pos, F.kc, F.vc, W, F.n_head, F.n_kv, P0, F.window,
+                            F.window, I.attn, s, F.attn_part);
+                I.prep(I.attn, qd, W);
+                I.mm(L.o, F.a);
+                q35_add(F.h, F.a, (int64_t) W * E, s);
+                q35_rms_rows(F.h, E, L.ffn_norm, I.xn, nullptr, W, E, F.eps, s);
+                I.prep(I.xn, E, W);
+                I.mm(L.gate, F.g);
+                I.mm(L.up, F.u);
+                dense_swiglu(F.g, F.u, F.hh, (int64_t) W * F.n_ff, s);
+                I.prep(F.hh, F.n_ff, W);
+                I.mm(L.down, F.a);
+                q35_add(F.h, F.a, (int64_t) W * E, s);
+            }
+            q35_rms_rows(F.h, E, F.out_norm, F.hf, nullptr, W, E, F.eps, s);
+            // base logits of the K rows through the drafter's own head; the Markov chain on the device:
+            // d_k = argmax(base_k + W2 . W1[d_(k-1)]), d_(-1) = the anchor
+            const int V = cfg_.n_vocab;
+            I.prep(F.hf, E, K);
+            I.mm(F.ds_head, F.logits);
+            cudaMemcpyAsync(F.ds_tok, &anchor, 4, cudaMemcpyHostToDevice, s);
+            for (int k = 0; k < K; ++k) {
+                q35_df_gather_f16(F.ds_w1, F.rank, F.ds_tok + k, F.ds_x, s);
+                I.prep(F.ds_x, F.rank, 1);
+                I.mm(F.ds_w2, F.ds_lg);
+                q35_add(F.ds_lg, F.logits + (size_t) k * V, V, s);
+                q35_argmax_rows(F.ds_lg, V, V, 1, F.ds_tok + k + 1, s);
+            }
+            out.resize((size_t) K);
+            cudaMemcpyAsync(out.data(), F.ds_tok + 1, (size_t) K * 4, cudaMemcpyDeviceToHost, s);
+            if (cudaStreamSynchronize(s) != cudaSuccess) { err = "dspark: draft failed"; return false; }
+            return true;
+        }
         for (DfLayer& L : F.layers) {
             // attention, wrapped in the attention conv
             q35_rms_rows(F.h, E, L.attn_norm, I.xn, nullptr, W, E, F.eps, s);
@@ -1367,12 +1444,12 @@ bool DenseModel::dflash_draft(int32_t anchor, int K, std::vector<int32_t>& out, 
             q35_df_conv(I.xn, F.dyn, cdyn, L.attn_base, 0, W, E, F.taps, F.group, F.a, s);
             I.prep(F.a, E, W);
             I.mm(L.q, I.q_full);
-            I.mm(L.k, I.kcur);
-            I.mm(L.v, I.vcur);
+            I.mm(L.k, F.kc);
+            I.mm(L.v, F.vc);
             q35_df_head_norm_rope(I.q_full, W, F.n_head, L.q_norm, F.eps, P0, F.theta, s);
-            q35_df_head_norm_rope(I.kcur, W, F.n_kv, L.k_norm, F.eps, P0, F.theta, s);
-            q35_df_attn(I.q_full, L.Kr, L.Vr, F.ring_pos, I.kcur, I.vcur, W, F.n_head, F.n_kv, P0, F.window,
-                        F.window, I.attn, s);
+            q35_df_head_norm_rope(F.kc, W, F.n_kv, L.k_norm, F.eps, P0, F.theta, s);
+            q35_df_attn(I.q_full, L.Kr, L.Vr, F.ring_pos, F.kc, F.vc, W, F.n_head, F.n_kv, P0, F.window,
+                        F.window, I.attn, s, F.attn_part);
             I.prep(I.attn, qd, W);
             I.mm(L.o, I.mix);
             q35_df_conv(I.mix, F.dyn, cdyn, L.attn_base, 1, W, E, F.taps, F.group, F.a, s);

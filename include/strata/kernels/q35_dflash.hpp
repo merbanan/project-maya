@@ -31,7 +31,9 @@ void q35_df_ring_store(const float* K, const float* V, int rows, int kvd, int64_
 /// the ring still holds, and every row of the block (Kb / Vb rows x kvd).  Q rows x n_head x 128 -> out the same.
 void q35_df_attn(const float* Q, const uint16_t* Kr, const uint16_t* Vr, const int64_t* ring_pos, const float* Kb,
                  const float* Vb, int rows, int n_head, int n_kv, int64_t n_past, int ring, int window, float* out,
-                 void* stream);
+                 void* stream, float* scratch = nullptr);
+/// the bytes of q35_df_attn's `scratch` (the split-K form: a kv head's rows together a chunk of the ring)
+int64_t q35_df_attn_scratch(int n_head, int rows, int window);
 /// the top k (k <= 32) of each of `rows` rows of x (row stride ld) among ids [0, n): ids and values, descending
 int64_t q35_df_topk_scratch(int rows, int k);
 void q35_df_topk(const float* x, int64_t ld, int n, int rows, int k, int* ids, float* vals, void* scratch,
@@ -39,5 +41,8 @@ void q35_df_topk(const float* x, int64_t ld, int n, int rows, int k, int* ids, f
 /// the selector walk: tok[i], conf[i] for the rows 0..n-1 (see the header); tables FP16 rows of `rank`
 void q35_df_walk(const int* cand, const float* lg, const float* gate, int k, int rank, const uint16_t* pred_tab,
                  const uint16_t* succ_tab, int anchor, int n, int* tok, float* conf, void* stream);
+
+/// out (rank floats) = row tok[0] (a device int) of an FP16 table of rows of `rank` (DSpark's Markov W1)
+void q35_df_gather_f16(const uint16_t* tab, int rank, const int* tok, float* out, void* stream);
 
 }  // namespace strata::kernels
