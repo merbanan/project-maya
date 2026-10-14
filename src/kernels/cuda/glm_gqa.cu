@@ -1501,10 +1501,51 @@ __device__ __forceinline__ void dec32(const R32& r, const float* lv, __half2* o)
     }
 }
 
+// the same 32 values through a table of code PAIRS (FP16 half2 of the two codebook values): one shared-memory load a
+// pair and one half2 multiply by the scale, instead of two loads, two multiplies and a conversion - the decode is
+// this kernel's limit (memory: every K/V format at ~370 G values/s).  T6: 6 + 6 bits (4096 entries), T4: 4 + 4 (256),
+// T3: 3 + 3 (64).  (The product is rounded twice - the value to FP16, then the scaled one - instead of once.)
+template <int KIND> __host__ __device__ constexpr int lut_n() { return KIND == kT6 ? 4096 : KIND == kT4 ? 256 : KIND == kT3 ? 64 : 1; }
+template <int KIND> __device__ __forceinline__ bool lut_kind() { return KIND == kT6 || KIND == kT4 || KIND == kT3; }
+template <int KIND>
+__device__ __forceinline__ void dec32_lut(const R32& r, const __half2* __restrict__ lut, __half2* o) {
+    const __half2 sc = __float2half2_rn(r.sc);
+    if (KIND == kT3) {
+        const unsigned w0 = r.u[0].x, w1 = r.u[0].y, w2 = r.u[0].z;
+        const unsigned g4[4] = {w0 & 0xffffffu, (w0 >> 24) | ((w1 & 0xffffu) << 8), (w1 >> 16) | ((w2 & 0xffu) << 16),
+                                w2 >> 8};
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) o[4 * k + j] = __hmul2(lut[(g4[k] >> (6 * j)) & 63u], sc);
+    } else {
+        const unsigned lw[4] = {r.u[0].x, r.u[0].y, r.u[0].z, r.u[0].w};
+        const unsigned hw[4] = {r.u[1].x & 0xffffu, r.u[1].x >> 16, r.u[1].y & 0xffffu, r.u[1].y >> 16};
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                unsigned c0 = (lw[k] >> (8 * j)) & 15u, c1 = (lw[k] >> (8 * j + 4)) & 15u;
+                if (KIND == kT6) {
+                    c0 |= ((hw[k] >> (4 * j)) & 3u) << 4;
+                    c1 |= ((hw[k] >> (4 * j + 2)) & 3u) << 4;
+                    o[4 * k + j] = __hmul2(lut[c0 | (c1 << 6)], sc);
+                } else {
+                    o[4 * k + j] = __hmul2(lut[c0 | (c1 << 4)], sc);
+                }
+            }
+    }
+}
+template <int KIND>
+__device__ __forceinline__ void build_lut(__half2* lut, const float* cb, int t, int nt) {
+    constexpr int bits = KIND == kT6 ? 6 : KIND == kT4 ? 4 : 3, m = (1 << bits) - 1;
+    for (int i = t; i < lut_n<KIND>(); i += nt) lut[i] = __floats2half2_rn(cb[i & m], cb[i >> bits]);
+}
+
 constexpr int kMT = 128, kMLdQ = kD + 8, kMLdB = 32 + 8, kMLdS = kMT + 4, kMLdP = kMT + 8;
 template <int KK, int VK, bool QS, bool PS>
 __global__ void __launch_bounds__(128) gqa_attn_mma_kernel(const float* __restrict__ q, GqaKv kv, int n_pos,
-                                                           float scale, int chunk, float* __restrict__ part) {
+                                                           float scale, int chunk, float* __restrict__ part, int use_lut) {
     using namespace nvcuda;
     constexpr int G = 8;
     __shared__ __align__(32) __half sqh[(QS ? 2 : 1) * G * kMLdQ];   // Q, FP16, [head][dim] (QS: then q - its FP16)
@@ -1513,8 +1554,14 @@ __global__ void __launch_bounds__(128) gqa_attn_mma_kernel(const float* __restri
     __shared__ __align__(32) __half sP[(PS ? 2 : 1) * G * kMLdP];    // the probabilities, FP16 [head][key] (PS: + rest)
     __shared__ float scorr[G], smx[G], sls[G];
     __shared__ float scb[2][64];
+    __shared__ __half2 klut[lut_n<KK>()], vlut[lut_n<VK>()];
     const int kvh = blockIdx.x, split = blockIdx.y, t = threadIdx.x, lane = t & 31, w = t >> 5;
     load_cbs(scb, kv.kk, kv.vk, t, 128);
+    if (use_lut) {
+        __syncthreads();
+        if (lut_kind<KK>()) build_lut<KK>(klut, scb[0], t, 128);
+        if (lut_kind<VK>()) build_lut<VK>(vlut, scb[1], t, 128);
+    }
     for (int i = t; i < G * kD; i += 128) {
         const float x = q[(size_t) kvh * G * kD + i] * scale;
         const __half hx = __float2half(x);
@@ -1552,7 +1599,8 @@ __global__ void __launch_bounds__(128) gqa_attn_mma_kernel(const float* __restri
                 if (ok) {
                     R32 r;
                     ld32<KK>(K.codes(bp, kvh), K.scales(bp, kvh), c, r);
-                    dec32<KK>(r, K.lv, h);
+                    if (lut_kind<KK>() && use_lut) dec32_lut<KK>(r, klut, h);
+                    else dec32<KK>(r, K.lv, h);
                 }
                 put(h, ok);
 #pragma unroll
@@ -1613,7 +1661,8 @@ __global__ void __launch_bounds__(128) gqa_attn_mma_kernel(const float* __restri
                     const uint8_t* bp = V.base(ks.pos(i));
                     R32 r;
                     ld32<VK>(V.codes(bp, kvh), V.scales(bp, kvh), w, r);
-                    dec32<VK>(r, V.lv, h);
+                    if (lut_kind<VK>() && use_lut) dec32_lut<VK>(r, vlut, h);
+                    else dec32<VK>(r, V.lv, h);
                 }
                 put(h, ok);
 #pragma unroll
@@ -1748,7 +1797,8 @@ bool gqa_attn(const float* q, const GqaKv& kv, int n_pos, int n_head, float* scr
         // rose 0.062 -> 0.075 (tq6v3), with the two 0.065 as the F32 kernel's (~2% slower).  The probabilities as two
         // as well changed nothing.  (DBG_MMA_SPLIT: 0 none, 1 q, 2 P, 3 both)
         static const int msplit = getenv("DBG_MMA_SPLIT") ? std::atoi(getenv("DBG_MMA_SPLIT")) : 1;
-#define MMA2(a, b, x, y) gqa_attn_mma_kernel<a, b, x, y><<<grid, 128, 0, s>>>(q, kv, n_pos, sc, chunk, part)
+        static const int use_lut = getenv("STRATA_GLM_GQA_LUT") ? std::atoi(getenv("STRATA_GLM_GQA_LUT")) : 1;
+#define MMA2(a, b, x, y) gqa_attn_mma_kernel<a, b, x, y><<<grid, 128, 0, s>>>(q, kv, n_pos, sc, chunk, part, use_lut)
 #define MMA(a, b)                                                                                                    \
     do {                                                                                                             \
         if (msplit == 0) MMA2(a, b, false, false);                                                                    \
