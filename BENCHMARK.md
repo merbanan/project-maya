@@ -73,6 +73,10 @@ Adaptive MTP draft count (default for MoE models: from 5, one more after a full 
 miss; STRATA_DENSE_ADAPTIVE): 35B code answer K5 141.2 -> 168.5, K7 124.6 -> 172.2 tok/s; after 1.6K K5 157.1 -> 177.4.
 (On the dense 27B it lost 2-3%: off there.)
 
+Sampled MTP drafts with the exact min(1, p / q) test (default for MoE models, STRATA_DENSE_SPEC_SAMPLE): 35B code
+answer, top-k 20 / top-p 0.95: T 0.6 148.7 -> 155.5 tok/s (2.56 -> 2.75 a round), T 1.0 130.1 -> 147.7 (2.17 -> 2.56).
+(27B: -2 to -3%, off there.)
+
 ## Gemma 4 E4B - unsloth Q4_K_M, `strata-dense` (2026-10-14)
 
 Greedy tokens match llama.cpp (128 / 128 at a short prompt; at 6-28K the first difference is a near-tie, llama

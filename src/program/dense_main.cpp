@@ -25,6 +25,7 @@
 #include "strata/kernels/dense_kernels.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/q35_kernels.hpp"
+#include "strata/kernels/q35_dflash.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 
 #include <cuda_runtime.h>
@@ -48,6 +49,49 @@
 namespace {
 
 using Clock = std::chrono::steady_clock;
+// The sampler's chain (sampler.cu: top_k -> top_p on the untempered softmax -> min_p -> temperature) over a row's top
+// k (ids / logits, descending): the kept ids and their probabilities - the distribution sample_tokens draws from.
+struct SparseDist {
+    int n = 0;
+    int ids[32];
+    double p[32];
+    double of(int id) const { for (int i = 0; i < n; ++i) if (ids[i] == id) return p[i]; return 0.0; }
+};
+SparseDist sparse_dist(const int* ids, const float* lg, int k, const strata::kernels::SamplerParams& sp) {
+    SparseDist d;
+    int n_keep = k;
+    if (sp.top_p < 1.0f) {
+        double sum = 0.0;
+        for (int i = 0; i < k; ++i) sum += std::exp((double) lg[i] - (double) lg[0]);
+        double cum = 0.0;
+        int cut = k;
+        for (int i = 0; i < k; ++i) {
+            cum += std::exp((double) lg[i] - (double) lg[0]) / sum;
+            if (cum >= (double) sp.top_p) { cut = i + 1; break; }
+        }
+        if (cut < sp.min_keep) cut = std::min(sp.min_keep, k);
+        n_keep = cut;
+    }
+    if (sp.min_p > 0.0f) {
+        const float thresh = lg[0] + std::log(sp.min_p);
+        for (int i = 0; i < n_keep; ++i) if (lg[i] < thresh) { n_keep = i; break; }
+    }
+    const double inv_t = 1.0 / sp.temperature;
+    double sum = 0.0;
+    for (int i = 0; i < n_keep; ++i) sum += std::exp(((double) lg[i] - (double) lg[0]) * inv_t);
+    d.n = n_keep;
+    for (int i = 0; i < n_keep; ++i) {
+        d.ids[i] = ids[i];
+        d.p[i] = std::exp(((double) lg[i] - (double) lg[0]) * inv_t) / sum;
+    }
+    return d;
+}
+int draw(const SparseDist& d, std::mt19937_64& rng) {
+    double u = std::uniform_real_distribution<double>(0.0, 1.0)(rng), cum = 0.0;
+    for (int i = 0; i < d.n; ++i) { cum += d.p[i]; if (u < cum) return d.ids[i]; }
+    return d.ids[d.n - 1];
+}
+
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
 struct Lines {
@@ -321,10 +365,15 @@ int main(int argc, char** argv) {
     int* d_next = nullptr;
     int* d_hist = nullptr;
     float* d_hrows = nullptr;                      // the trunk's hidden rows the MTP block has yet to read
+    int* d_tki = nullptr;                          // sampled drafts: rows' top-k ids / logits and the selection scratch
+    float* d_tkv = nullptr;
+    void* d_tks = nullptr;
     constexpr int kMaxHist = 4096;
     if (cudaMalloc((void**) &d_next, 16 * sizeof(int)) != cudaSuccess ||
         cudaMalloc((void**) &d_hist, kMaxHist * sizeof(int)) != cudaSuccess ||
-        cudaMalloc((void**) &d_hrows, (size_t) 16 * cfg.n_embd * sizeof(float)) != cudaSuccess) {
+        cudaMalloc((void**) &d_hrows, (size_t) 16 * cfg.n_embd * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void**) &d_tki, 16 * 32 * sizeof(int)) != cudaSuccess || cudaMalloc((void**) &d_tkv, 16 * 32 * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&d_tks, (size_t) strata::kernels::q35_df_topk_scratch(16, 32)) != cudaSuccess) {
         std::printf("ERR cannot allocate the sampler buffers\n");
         return 1;
     }
@@ -614,6 +663,28 @@ int main(int argc, char** argv) {
         int anchor = -1;
         double draft_ms = 0;
         // STRATA_DENSE_ADAPTIVE=1: the MTP draft count follows the acceptance (from K down to 1 and back)
+        // STRATA_DENSE_SPEC_SAMPLE=1: MTP drafts SAMPLED from the draft head's distribution q and kept with min(1, p / q),
+        // a rejection resampled from max(0, p - q) - the output is the target's distribution exactly (lithos-metal's
+        // speculative decoding; greedy drafts keep only a match with the target's own draw).  Sampled requests with a
+        // top_k of 1..32 (both distributions live on the rows' top k).
+        // (default on for a MoE model - Qwen3.6-35B-A3B MTP: T 0.6 148.7 -> 155.5, T 1.0 130.1 -> 147.7 tok/s; the dense
+        // 27B lost 2-3%: off there)
+        static const bool spec_env = std::getenv("STRATA_DENSE_SPEC_SAMPLE") ? std::atoi(std::getenv("STRATA_DENSE_SPEC_SAMPLE")) != 0
+                                                                              : cfg.n_expert > 0;
+        const bool spec_s = spec_env && !sp.greedy && !use_df && K > 0 && sp.top_k >= 1 && sp.top_k <= 32;
+        std::mt19937_64 srng(sp.seed * 0x9E3779B97F4A7C15ull + draw_counter + 1);
+        std::vector<SparseDist> qd;
+        auto topk_rows = [&](const float* logits, int ld, int rows, std::vector<SparseDist>& out) -> bool {
+            strata::kernels::q35_df_topk(logits, ld, ld, rows, sp.top_k, d_tki, d_tkv, d_tks, cs);
+            std::vector<int> ids((size_t) rows * sp.top_k);
+            std::vector<float> lg((size_t) rows * sp.top_k);
+            cudaMemcpyAsync(ids.data(), d_tki, ids.size() * 4, cudaMemcpyDeviceToHost, cs);
+            cudaMemcpyAsync(lg.data(), d_tkv, lg.size() * 4, cudaMemcpyDeviceToHost, cs);
+            if (!model.sync(err)) { std::printf("ERR %s\n", err.c_str()); return false; }
+            for (int r = 0; r < rows; ++r)
+                out.push_back(sparse_dist(ids.data() + (size_t) r * sp.top_k, lg.data() + (size_t) r * sp.top_k, sp.top_k, sp));
+            return true;
+        };
         static const bool adaptive = std::getenv("STRATA_DENSE_ADAPTIVE") ? std::atoi(std::getenv("STRATA_DENSE_ADAPTIVE")) != 0
                                                                           : cfg.n_expert > 0;
         int k_cur = K;
@@ -632,6 +703,7 @@ int main(int argc, char** argv) {
             if (adaptive && !use_df) k = std::min(k, k_cur);   // (MTP: each draft is a step of its own)
             k = std::max(0, k);
             std::vector<int32_t> win = {anchor};
+            const long long lookup_rounds_before = lookup_rounds;   // (a lookup round's drafts are not q's draws)
             int32_t lk[16];
             const int nl = k > 0 && lookup_min > 0 ? lookup.propose(k, lk) : 0;
             if (nl > 0 && lookup.last_match() >= lookup_min) {
@@ -652,11 +724,17 @@ int main(int argc, char** argv) {
                 if (!model.mtp_forward(mtp_tok.data(), d_hrows, mtp_p0, (int) mtp_tok.size(), false, err)) {
                     std::printf("ERR %s\n", err.c_str()); failed = true; break;
                 }
+                qd.clear();
                 for (int j = 0; j < k; ++j) {
                     int d = 0;
-                    strata::kernels::q35_argmax_rows(model.mtp_logits(), model.draft_vocab(), model.draft_vocab(), 1, d_next, cs);
-                    cudaMemcpyAsync(&d, d_next, sizeof(int), cudaMemcpyDeviceToHost, cs);
-                    if (!model.sync(err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
+                    if (spec_s) {   // a draw from the draft head's own (filtered) distribution, kept for the accept test
+                        if (!topk_rows(model.mtp_logits(), model.draft_vocab(), 1, qd)) { failed = true; break; }
+                        d = draw(qd.back(), srng);
+                    } else {
+                        strata::kernels::q35_argmax_rows(model.mtp_logits(), model.draft_vocab(), model.draft_vocab(), 1, d_next, cs);
+                        cudaMemcpyAsync(&d, d_next, sizeof(int), cudaMemcpyDeviceToHost, cs);
+                        if (!model.sync(err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
+                    }
                     win.push_back(d);
                     if (j + 1 < k && !model.mtp_forward(&d, model.mtp_hidden(), pos + j, 1, false, err)) {
                         std::printf("ERR %s\n", err.c_str()); failed = true; break;
@@ -669,9 +747,32 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str()); failed = true; break;
             }
             int picks[16];
-            if (!sample_rows(model.logits(), W, picks)) { failed = true; break; }
             int acc = 0;
-            while (acc + 1 < W && win[acc + 1] == picks[acc]) ++acc;
+            if (spec_s && (int) qd.size() == W - 1 && lookup_rounds_before == lookup_rounds) {
+                // the exact test: draft j kept with min(1, p_j / q_j); at the first rejection a draw from
+                // max(0, p_j - q_j); all kept: a draw from p after the last
+                std::vector<SparseDist> pd;
+                if (!topk_rows(model.logits(), cfg.n_vocab, W, pd)) { failed = true; break; }
+                int j = 0;
+                for (; j + 1 < W; ++j) {
+                    const int d = win[j + 1];
+                    const double pj = pd[(size_t) j].of(d), qj = qd[(size_t) j].of(d);
+                    const double u = std::uniform_real_distribution<double>(0.0, 1.0)(srng);
+                    if (qj > 0.0 && u < std::min(1.0, pj / qj)) continue;
+                    SparseDist r = pd[(size_t) j];
+                    double tot = 0.0;
+                    for (int i = 0; i < r.n; ++i) { r.p[i] = std::max(0.0, r.p[i] - qd[(size_t) j].of(r.ids[i])); tot += r.p[i]; }
+                    if (tot > 0.0) { for (int i = 0; i < r.n; ++i) r.p[i] /= tot; picks[j] = draw(r, srng); }
+                    else picks[j] = draw(pd[(size_t) j], srng);
+                    break;
+                }
+                if (j + 1 == W) picks[j] = draw(pd[(size_t) j], srng);
+                acc = j;
+                draw_counter += W;
+            } else {
+                if (!sample_rows(model.logits(), W, picks)) { failed = true; break; }
+                while (acc + 1 < W && win[acc + 1] == picks[acc]) ++acc;
+            }
             if (adaptive && !use_df && W > 1) {   // NInfer-style: one more after a full round, back to what was kept + 1
                 if (acc == W - 1) k_cur = std::min(K, k_cur + 1);
                 else k_cur = std::max(1, std::min(k_cur, acc + 1));
