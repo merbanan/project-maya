@@ -66,13 +66,13 @@ lives. Branches on the fork: `qwen38` (strata-dense: Qwen3.8-27B, Qwen3.6-35B-A3
 
 | Item | Status | Evidence |
 |---|---|---|
-| Niko1221/Strata code, issues and PRs: ideas for this work | reviewed (400 PRs / 600 issues by title, CUDA ones read) | see below |
-| - #2464: Qwen3.6-35B-A3B on a V100 - upstream q36 engine 111 tok/s plain / 154 MTP at 256 tokens, 56-59 at 16K (ours: 99 plain, 168-177 adaptive MTP, 86 / 154 at 28K) | open | the short-context plain gap (111 vs 99): upstream decodes from one captured graph per step (q36_engine.cu) with native_mmvq; compare on the same file |
-| - native_mmvq V100 row table (STRATA_SM70_TABLE, PR 1401; PolyStrata: head 1,094 -> 821 us, decode +10-15% on V100-SXM2) | open | strata-dense / GLM use their own dp4a GEMVs |
-| - #1949: CPU AVX2 dot kernels with accumulators in registers (router 2.1x, expert rows +20-24%) | open | applies to the GLM CPU lane if its dots are Strata's (ours: ggml vec_dot) |
-| - #2227: MTP hnorm on the stream (acceptance 82 -> 86%, decode +2-4% on sm_89) | open | GLM/Qwen MTP heads |
-| - #2357 / #2358: sm_70 argmax_rows (+0.7-0.8%), fused GR norm (+0.5%) | open | small |
-| - #2356: Volta prompt-expert WMMA kernel for IQ2_S / IQ4_NL | open | prefill of IQ quants |
+| Niko1221/Strata code, issues and PRs: ideas for this work | done | 400 PRs / 600 issues filtered by title, the CUDA / V100 ones read, upstream built and measured on this V100 - below |
+| - #2464: Qwen3.6-35B-A3B on a V100 (upstream q36 111 tok/s plain on UD-Q4_K_XL, 56-59 at 16K) | measured: ours is faster | upstream strata-q36 built here (Niko1221/Strata main 296b59d, sm_70), our UD-Q4_K_M file: tg256 94.3 tok/s, pp512 1,685 tok/s; strata-dense 97.8 tok/s decode, 2,333 tok/s prompt (1.6K), 70.3 at 28K vs their 56-59 at 16K |
+| - native_mmvq V100 row table (STRATA_SM70_TABLE, PR 1401) | measured: no gain | upstream strata-q36 on our V100-PCIe: 94.3 -> 93.1 tok/s with it; our dp4a GEMVs are faster already |
+| - #1949: CPU AVX2 dot kernels with accumulators in registers | n/a | a fix of Strata's own AVX2 dots; Maya's CPU lane runs ggml-cpu's vec_dot (lighttransport measured those as fast as a custom kernel) |
+| - #2227: MTP hnorm on the stream | n/a here | Flash-Next's MTP option; GLM's NextN decode needs two GPUs (one GPU drafts with DFlash2), DSv4's MTP already normalises each stream (ds4) |
+| - #2357 / #2358: sm_70 argmax_rows (+0.7-0.8%), fused GR norm (+0.5%) | n/a | kernels of Strata's Flash-Next path (not in our engines) |
+| - #2356: Volta prompt-expert WMMA kernel for IQ2_S / IQ4_NL | n/a | none of our models' experts are IQ2_S / IQ4_NL (GLM / DSv4: IQ2_XXS + Q2_K, Qwen: Q4_K / Q5_K) |
 | - not applicable: the SYCL / HIP / Metal / Arc / gfx PRs, multi-GPU layer splits, setup / serve / MCP changes | - | |
 
 ## Serving / tooling
