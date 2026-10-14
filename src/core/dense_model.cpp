@@ -1212,9 +1212,10 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
         F.n_cand = std::min(cfg_.n_vocab, (int) num("dflash.candidate_vocab", 248077));
         if (const auto* tl = G.get(a + "dflash.target_layer_ids"))
             for (const auto& it : tl->items) F.target_layers.push_back((int) it.u);
-        if (F.dspark) {   // trained on the whole context: a ring of 32K positions (24 KiB a position) unless set
+        if (F.dspark) {   // trained on the whole context, but a ring of 8K positions drafts faster at 28K (162.7 tok/s
+                          // vs 134.5 with 32K: the longer attention costs more than the extra kept drafts gain)
             F.taps = 2;
-            F.window = (int) std::min<int64_t>(max_context_, std::getenv("STRATA_DENSE_DFLASH_CTX") ? F.window : 32768);
+            F.window = (int) std::min<int64_t>(max_context_, std::getenv("STRATA_DENSE_DFLASH_CTX") ? F.window : 8192);
         }
         if (F.n_layer < 1 || F.n_head < 1 || F.n_kv < 1 || F.taps != 2 || F.rank < 32 || F.rank > 1024 ||
             F.rank % 32 || F.top_k < 1 || F.top_k > 32 || F.mask_tok < 0 || F.target_layers.empty() ||

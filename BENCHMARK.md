@@ -19,7 +19,7 @@ Engines: `strata-dense` (branch `qwen38`) for the dense / small-MoE Qwen3.5-arch
 | no drafts | 1,017 (1.6K) / 1,063 (12K, chunk 2048) | 29.1 | one-token GEMV on the packed layout; 33.4 with the dp4a GEMV (`STRATA_DENSE_PACK=0`) |
 | MTP, 3 drafts | | 47.9 | 2.61 tokens a round |
 | MTP, 7 drafts | | 48.7 | 3.20 tokens a round |
-| **DFlash2, 7 drafts** | | **96.6** (code answer) / 69.4 (after a 1.6K prompt) | 4.47 / 3.75 tokens a round |
+| **DFlash2, 7 drafts** | | **96.6** (code answer) / 79.9 (after a 1.6K prompt) | 4.47 / 3.75 tokens a round; 69.4 at 1.6K before the split-K drafter attention |
 | DFlash2, sampled (T 0.6, top-k 20) | | 73.9 | 3.46 tokens a round |
 | DFlash2 through `serve/server.py` (T 0.6) | | 70-90 | |
 
@@ -46,8 +46,13 @@ Verify window cost (1K context): 1 token 37.6 ms, 8 tokens 40.6 ms (`STRATA_DENS
 | no drafts | 2,333 (1.6K) / 2,075 (28K) / 1,443 (94K) | 79.5 (short) / 70.3 (28K) / 57.5 (94K) | needles 3/3 at 28K and 94K |
 | MTP, 3 drafts (unsloth `-MTP-GGUF`) | | 139.2 | 2.78 tokens a round |
 | MTP, 5 drafts | | 135.7 | 3.31 tokens a round |
-| **DFlash2, 7 drafts** (incoai/Qwen3.6-35B-A3B-DFlash2) | | **191.8** (code answer) / 151.9 (after 1.6K) | 4.83 / 4.64 tokens a round |
-| DSpark (LithosAI NVFP4) | | | not yet |
+| DFlash2, 7 drafts (incoai/Qwen3.6-35B-A3B-DFlash2) | | 193.8 (code answer) / 197.1 (after 1.6K) / 162.7 (after 28K) | 4.83 / 5.00 / 4.49 tokens a round |
+| **DSpark, 7 drafts** (LithosAI NVFP4 -> F16 GGUF, Q8_0 at load) | | 193.3 (code answer) / **200.4** (after 1.6K) / 162.7 (after 28K, 8K window) | 4.92 / 5.22 / 4.74 tokens a round; needles 3/3 at 28K |
+
+Drafter changes behind these rows (commit e2a748a): split-K drafter attention (a kv head's rows together a chunk
+of the context: the 1.6K draft pass 10.4 -> 4.0 ms DFlash2, 18.1 -> 4.8 ms DSpark) and drafter K/V buffers of
+their own (the 35B's target K rows are 512 wide, the drafters' 1024: prompt chunks over 1024 rows overwrote the
+drafter context, now 4.64 -> 5.00 tokens a round at 1.6K). Before: DFlash2 151.9 / DSpark 131.3 after 1.6K.
 
 ## DeepSeek-V4 Flash - antirez IQ2_XXS (80.8 GB), GLM fast path (`dsv4`)
 
