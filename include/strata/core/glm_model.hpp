@@ -432,6 +432,17 @@ public:
     bool fast_dsa(int il, int64_t p, std::string& err);     // one DSA mixer (x -> mixer)
     bool fast_gqa(int il, int64_t p, std::string& err);     // hy_v3: one attention mixer (xq -> mixer)
     bool fast_dsv4(int il, int64_t p, std::string& err);    // deepseek4: one attention mixer (x, xq -> mixer)
+    // deepseek4's MTP block (STRATA_DSV4_MTP=<the MTP GGUF>): its layer beside the decode - after every token it
+    // drafts the next one from (that token, the trunk's streams) and counts how often the trunk agrees (the
+    // acceptance a speculative decode would see; with the verify cost of tools/d4verify.py, its speed)
+    struct D4Mtp;
+    D4Mtp* d4mtp_ = nullptr;
+    bool d4_mtp_load(const std::string& path, std::string& err);
+    bool d4_mtp_draft(int32_t token, int64_t pos, int& draft, std::string& err);
+    uint64_t mtp_tries_ = 0, mtp_hits_ = 0;
+    int mtp_pending_ = -1;
+    int64_t mtp_pending_pos_ = -1;   // the position the pending draft is for
+    double mtp_ms_ = 0.0;
     // hy_v3, STRATA_GLM_KV_STREAM=<positions>: the whole cache in host memory, that many positions a layer cached in
     // VRAM, a decode step attending to the best pages (glm_kv_stream.hpp)
     KvStream* kvs_ = nullptr;

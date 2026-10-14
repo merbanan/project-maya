@@ -1338,4 +1338,26 @@ void dsv4_rows_ring(const uint16_t* raw16, const Dsv4Layer& L, int n_swa, int p0
     check("rows_ring");
 }
 
+namespace {
+__global__ void mtp_input_kernel(const float* ep, const float* hp, float* R, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < 4 * n) R[i] = ep[i % n] + hp[i];
+}
+__global__ void mtp_combine_kernel(const float* y, Dsv4MtpW w, int k, const float* sh, float* out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float a = sh ? sh[i] : 0.0f;
+    for (int j = 0; j < k; ++j) a += w.w[j] * y[(size_t) j * n + i];
+    out[i] = a;
+}
+}  // namespace
+void dsv4_mtp_input(const float* ep, const float* hp, float* R, int n, cudaStream_t s) {
+    mtp_input_kernel<<<(4 * n + 255) / 256, 256, 0, s>>>(ep, hp, R, n);
+    check("mtp_input");
+}
+void dsv4_mtp_combine(const float* y, Dsv4MtpW w, int k, const float* sh, float* out, int n, cudaStream_t s) {
+    mtp_combine_kernel<<<(n + 255) / 256, 256, 0, s>>>(y, w, k, sh, out, n);
+    check("mtp_combine");
+}
+
 }  // namespace strata::kernels::glmf

@@ -18,6 +18,7 @@
 #include "glm_kv_stream.hpp"
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -1548,6 +1549,10 @@ bool Glm5Model::fast_setup(std::string& err) {
         }
         F->lane_pending = true;
         if (!defer_lane_ && !fast_setup_finish(err)) return false;
+    }
+    if (const char* mp = getenv("STRATA_DSV4_MTP"); mp != nullptr && mp[0] && g.dsv4() && d4mtp_ == nullptr) {
+        cudaSetDevice(dev_);
+        if (!d4_mtp_load(mp, err)) return false;
     }
     return true;
 }
@@ -4406,6 +4411,23 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         return false;
     }
     last_tok_ = FT->tok_h[0];
+    if (d4mtp_ != nullptr && split_next_ == nullptr) {
+        // the MTP block's shadow draft: did the last one call this token, then the next one
+        if (mtp_pending_ >= 0 && mtp_pending_pos_ == p + 1) {
+            ++mtp_tries_;
+            mtp_hits_ += mtp_pending_ == last_tok_;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        int d = -1;
+        if (!d4_mtp_draft(last_tok_, p + 1, d, err)) return false;
+        mtp_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        mtp_pending_ = d;
+        mtp_pending_pos_ = p + 2;
+        if (mtp_tries_ > 0 && mtp_tries_ % 64 == 0 && mtp_pending_ >= 0)
+            std::fprintf(stderr, "dsv4 mtp: %llu / %llu drafts accepted (%.1f%%), %.2f ms a draft\n",
+                         (unsigned long long) mtp_hits_, (unsigned long long) mtp_tries_,
+                         100.0 * mtp_hits_ / mtp_tries_, mtp_ms_ / (mtp_tries_ + 1));
+    }
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
         if (m->fast_ && m->fast_->prof_on) {
             cudaSetDevice(m->dev_);
@@ -5344,4 +5366,326 @@ bool Glm5Model::forward_fast(const std::vector<int32_t>& tokens, std::vector<flo
     return true;
 }
 
+
+// ---------------------------------------------------------------- deepseek4's MTP block (STRATA_DSV4_MTP)
+// ds4.c metal_graph_eval_mtp_draft_from_hc: the input streams R[s] = e_proj(enorm(emb(token))) + h_proj(hnorm(R_trunk[s]))
+// through one DSv4 layer (an own raw window, no compressor: layer 1's rope), then the mHC head on the block's own
+// hc_head / norm and the trunk's output head.  Its window holds only the block's own rows (from the first decode
+// step on: the prompt never went through it), at positions counted from that step (the rope is relative).
+struct Glm5Model::D4Mtp {
+    std::unique_ptr<strata::GgufFile> f;
+    const float *enorm, *hnorm, *norm, *attn_norm, *ffn_norm, *q_a_norm, *kv_a_norm, *sinks, *ha_scale, *ha_base,
+        *hf_scale, *hf_base, *hh_scale, *hh_base, *router;
+    const uint16_t *ha_fn, *hf_fn, *hh_fn;
+    const void *q_a, *q_b, *kv, *o_a, *o_b, *e_proj, *h_proj, *sh_g, *sh_u, *sh_d;
+    std::vector<float> bias_h;
+    uint8_t* exp_dev = nullptr;              // all 256 experts' [gate | up | down] (null: staged per token)
+    uint8_t* stage_dev = nullptr;            // the staged experts (k of them)
+    uint8_t* stage_h = nullptr;
+    size_t gu_bytes = 0, d_bytes = 0, blob = 0;
+    const uint8_t *src_g = nullptr, *src_u = nullptr, *src_d = nullptr;
+    uint16_t* swa = nullptr;
+    float *R, *R2, *ep, *hp, *ex, *xs, *glog, *eg, *eu, *ey, *shg, *shu, *shy;
+    void *exq, *xsq, *ehq, *shq;
+    float* glog_h = nullptr;
+    float* logits = nullptr;
+    int* tok = nullptr;
+    int* tok_h = nullptr;
+    int64_t last_pos = -2, vpos = 0;
+};
+
+bool Glm5Model::d4_mtp_load(const std::string& path, std::string& err) {
+    const Glm5Geometry& g = g_;
+    FastState* F = fast_;
+    auto* M = new D4Mtp;
+    try {
+        M->f = std::make_unique<strata::GgufFile>(path);
+    } catch (const std::exception& e) {
+        err = std::string("dsv4 mtp: ") + e.what();
+        return false;
+    }
+    size_t total = 0;
+    const auto dev = [&](const std::string& n, int want, const strata::TensorInfo** out = nullptr) -> const void* {
+        const strata::TensorInfo* t = M->f->find("mtp.0." + n);
+        if (t == nullptr || (want >= 0 && (int) t->type != want)) {
+            err = "dsv4 mtp: " + n + (t ? " has an unexpected type" : " missing");
+            return nullptr;
+        }
+        if (out) *out = t;
+        const size_t bytes = ggml_row_size((ggml_type) t->type, (int64_t) t->shape[0]) * (t->elements() / t->shape[0]);
+        void* d = nullptr;
+        if (cudaMalloc(&d, bytes) != cudaSuccess ||
+            cudaMemcpy(d, M->f->tensor_data(*t), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = "dsv4 mtp: no VRAM for " + n;
+            return nullptr;
+        }
+        total += bytes;
+        return d;
+    };
+    const auto f16 = [&](const std::string& n) -> const uint16_t* {
+        const strata::TensorInfo* t = M->f->find("mtp.0." + n);
+        if (t == nullptr || t->type != GGML_TYPE_F32) {
+            err = "dsv4 mtp: " + n + " missing or not F32";
+            return nullptr;
+        }
+        std::vector<ggml_fp16_t> h((size_t) t->elements());
+        ggml_fp32_to_fp16_row((const float*) M->f->tensor_data(*t), h.data(), (int64_t) h.size());
+        void* d = nullptr;
+        if (cudaMalloc(&d, h.size() * 2) != cudaSuccess ||
+            cudaMemcpy(d, h.data(), h.size() * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = "dsv4 mtp: no VRAM for " + n;
+            return nullptr;
+        }
+        total += h.size() * 2;
+        return (const uint16_t*) d;
+    };
+    const int F32 = GGML_TYPE_F32, Q8 = GGML_TYPE_Q8_0;
+#define D4F(v, n) if ((M->v = (const float*) dev(n, F32)) == nullptr) return false
+#define D4Q(v, n) if ((M->v = dev(n, Q8)) == nullptr) return false
+#define D4H(v, n) if ((M->v = f16(n)) == nullptr) return false
+    D4F(enorm, "enorm.weight"); D4F(hnorm, "hnorm.weight"); D4F(norm, "norm.weight");
+    D4F(attn_norm, "attn_norm.weight"); D4F(ffn_norm, "ffn_norm.weight"); D4F(q_a_norm, "attn_q_a_norm.weight");
+    D4F(kv_a_norm, "attn_kv_a_norm.weight"); D4F(sinks, "attn_sinks.weight");
+    D4F(ha_scale, "hc_attn_scale.weight"); D4F(ha_base, "hc_attn_base.weight");
+    D4F(hf_scale, "hc_ffn_scale.weight"); D4F(hf_base, "hc_ffn_base.weight");
+    D4F(hh_scale, "hc_head_scale.weight"); D4F(hh_base, "hc_head_base.weight"); D4F(router, "ffn_gate_inp.weight");
+    D4H(ha_fn, "hc_attn_fn.weight"); D4H(hf_fn, "hc_ffn_fn.weight"); D4H(hh_fn, "hc_head_fn.weight");
+    D4Q(q_a, "attn_q_a.weight"); D4Q(q_b, "attn_q_b.weight"); D4Q(kv, "attn_kv.weight");
+    D4Q(o_a, "attn_output_a.weight"); D4Q(o_b, "attn_output_b.weight"); D4Q(e_proj, "e_proj.weight");
+    D4Q(h_proj, "h_proj.weight"); D4Q(sh_g, "ffn_gate_shexp.weight"); D4Q(sh_u, "ffn_up_shexp.weight");
+    D4Q(sh_d, "ffn_down_shexp.weight");
+#undef D4F
+#undef D4Q
+#undef D4H
+    {
+        const strata::TensorInfo* b = M->f->find("mtp.0.exp_probs_b.bias");
+        if (b == nullptr) { err = "dsv4 mtp: exp_probs_b.bias missing"; return false; }
+        const float* bp = (const float*) M->f->tensor_data(*b);
+        M->bias_h.assign(bp, bp + b->elements());
+    }
+    // the routed experts (Q4_K): all in VRAM when they fit, else the picked ones staged a token
+    const strata::TensorInfo *tg = M->f->find("mtp.0.ffn_gate_exps.weight"), *tu = M->f->find("mtp.0.ffn_up_exps.weight"),
+                             *td = M->f->find("mtp.0.ffn_down_exps.weight");
+    if (!tg || !tu || !td || tg->type != tu->type || !gf::mv_supported((int) tg->type) || !gf::mv_supported((int) td->type)) {
+        err = "dsv4 mtp: routed experts missing or of an unsupported type";
+        return false;
+    }
+    M->gu_bytes = gf::row_bytes((int) tg->type, g.n_embd) * g.n_ff_exp;
+    M->d_bytes = gf::row_bytes((int) td->type, g.n_ff_exp) * g.n_embd;
+    M->blob = 2 * M->gu_bytes + M->d_bytes;
+    M->src_g = M->f->tensor_data(*tg);
+    M->src_u = M->f->tensor_data(*tu);
+    M->src_d = M->f->tensor_data(*td);
+    const int K = g.n_exp_used;
+    if (getenv("STRATA_DSV4_MTP_STAGE") == nullptr &&
+        cudaMalloc(&M->exp_dev, M->blob * (size_t) g.n_expert) == cudaSuccess) {
+        for (int e = 0; e < g.n_expert; ++e) {
+            uint8_t* d = M->exp_dev + (size_t) e * M->blob;
+            cudaMemcpy(d, M->src_g + (size_t) e * M->gu_bytes, M->gu_bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(d + M->gu_bytes, M->src_u + (size_t) e * M->gu_bytes, M->gu_bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(d + 2 * M->gu_bytes, M->src_d + (size_t) e * M->d_bytes, M->d_bytes, cudaMemcpyHostToDevice);
+        }
+        total += M->blob * (size_t) g.n_expert;
+    } else {
+        cudaGetLastError();
+        M->exp_dev = nullptr;
+        if (cudaMalloc(&M->stage_dev, M->blob * (size_t) K) != cudaSuccess ||
+            cudaHostAlloc((void**) &M->stage_h, M->blob * (size_t) K, cudaHostAllocDefault) != cudaSuccess) {
+            err = "dsv4 mtp: no room for the staged experts";
+            return false;
+        }
+        total += M->blob * (size_t) K;
+    }
+    // activations
+    const int E = g.n_embd, FF = g.n_ff_exp;
+    const auto q8 = [](size_t n) { return n / 32 * 36; };
+    const size_t fl = (size_t) 4 * E * 3 + E + E + E + g.n_expert + (size_t) K * FF * 2 + (size_t) K * E + 2 * (size_t) FF + E;
+    float* a = nullptr;
+    if (cudaMalloc(&a, fl * sizeof(float)) != cudaSuccess || cudaMalloc(&M->swa, (size_t) g.n_swa * 512 * 2) != cudaSuccess ||
+        cudaMalloc(&M->exq, q8(E)) != cudaSuccess || cudaMalloc(&M->xsq, q8(4 * (size_t) E)) != cudaSuccess ||
+        cudaMalloc(&M->ehq, q8((size_t) K * FF)) != cudaSuccess || cudaMalloc(&M->shq, q8(FF)) != cudaSuccess ||
+        cudaMalloc(&M->tok, sizeof(int)) != cudaSuccess || cudaMalloc(&M->logits, (size_t) g.n_vocab * sizeof(float)) != cudaSuccess ||
+        cudaHostAlloc((void**) &M->tok_h, sizeof(int), cudaHostAllocDefault) != cudaSuccess ||
+        cudaHostAlloc((void**) &M->glog_h, g.n_expert * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+        err = "dsv4 mtp: activation buffers did not allocate";
+        return false;
+    }
+    M->R = a; a += 4 * (size_t) E;
+    M->R2 = a; a += 4 * (size_t) E;
+    M->hp = a; a += 4 * (size_t) E;
+    M->ep = a; a += E;
+    M->ex = a; a += E;
+    M->xs = a; a += E;
+    M->glog = a; a += g.n_expert;
+    M->eg = a; a += (size_t) K * FF;
+    M->eu = a; a += (size_t) K * FF;
+    M->ey = a; a += (size_t) K * E;
+    M->shg = a; a += FF;
+    M->shu = a; a += FF;
+    M->shy = a;
+    (void) F;
+    d4mtp_ = M;
+    std::fprintf(stderr, "dsv4 mtp: %s - %.2f GB of VRAM, experts %s\n", path.c_str(), total / 1e9,
+                 M->exp_dev ? "resident" : "staged a token");
+    return true;
+}
+
+// one draft: (token at position pos, the trunk's streams at pos - 1 in state_) -> the block's argmax at pos + 1
+bool Glm5Model::d4_mtp_draft(int32_t token, int64_t pos, int& draft, std::string& err) {
+    D4Mtp* M = d4mtp_;
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const int E = g.n_embd, HD = g.head_dim, K = g.n_exp_used, FF = g.n_ff_exp;
+    if (pos != M->last_pos + 1) M->vpos = 0;   // a new run (a prompt in between): the block's window starts over
+    M->last_pos = pos;
+    const int vp = (int) M->vpos++;
+    // ---- the input streams
+    const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
+    tt->to_float(pack_emb_src_ + (size_t) token * ggml_row_size((ggml_type) pack_emb_type_, E), F->emb_h, E);
+    cudaMemcpyAsync(F->emb, F->emb_h, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(M->ex, F->emb, (size_t) E * sizeof(float), cudaMemcpyDeviceToDevice, s);
+    gf::rms_q8(M->ex, nullptr, M->enorm, g.norm_eps, E, M->xs, M->exq, s);
+    gf::MvJob j[gf::kMaxMvJobs];
+    int nj = 0;
+    j[nj++] = {M->e_proj, M->exq, nullptr, M->ep, nullptr, 1.0f, GGML_TYPE_Q8_0, E, E};
+    for (int h = 0; h < 4; ++h) {
+        float* r = M->R2 + (size_t) h * E;
+        cudaMemcpyAsync(r, state_ + (size_t) h * E, (size_t) E * sizeof(float), cudaMemcpyDeviceToDevice, s);
+        gf::rms_q8(r, nullptr, M->hnorm, g.norm_eps, E, M->xs, (uint8_t*) M->xsq + (size_t) h * (E / 32) * 36, s);
+        j[nj++] = {M->h_proj, (uint8_t*) M->xsq + (size_t) h * (E / 32) * 36, nullptr, M->hp + (size_t) h * E, nullptr,
+                   1.0f, GGML_TYPE_Q8_0, E, E};
+    }
+    if (!gf::mv(j, nj, s)) { err = "dsv4 mtp: e/h proj"; return false; }
+    gf::dsv4_mtp_input(M->ep, M->hp, M->R, E, s);
+    // ---- the attention half
+    gf::HcArgs h;
+    h.block_out = nullptr;
+    h.R_old = M->R;
+    h.R_new = M->R2;
+    h.post_in = F->post;
+    h.comb_in = F->comb;
+    h.pre = F->pre;
+    h.post = F->post;
+    h.comb = F->comb;
+    h.w_fn = M->ha_fn;
+    h.w_f16 = true;
+    h.w_scale = M->ha_scale;
+    h.w_base = M->ha_base;
+    h.norm_w = M->attn_norm;
+    h.norm_eps = g.norm_eps;
+    h.hc_eps = g.hc_eps;
+    h.iters = g.sinkhorn_iters;
+    h.n_embd = E;
+    h.x = F->x;
+    h.xq = F->xq;
+    h.part = F->part;
+    h.counter = F->counter;
+    gf::hc(h, s);
+    nj = 0;
+    j[nj++] = {M->q_a, F->xq, nullptr, F->d4_qr, nullptr, 1.0f, GGML_TYPE_Q8_0, E, g.q_lora};
+    j[nj++] = {M->kv, F->xq, nullptr, F->d4_kv, nullptr, 1.0f, GGML_TYPE_Q8_0, E, HD};
+    if (!gf::mv(j, nj, s)) { err = "dsv4 mtp: q_a / kv"; return false; }
+    gf::dsv4_qr_norm(F->d4_qr, M->q_a_norm, g.norm_eps, g.q_lora, F->d4_qrn, F->d4_qrn_q8, s);
+    j[0] = {M->q_b, F->d4_qrn_q8, nullptr, F->d4_q, nullptr, 1.0f, GGML_TYPE_Q8_0, g.q_lora, g.n_head * HD};
+    if (!gf::mv(j, 1, s)) { err = "dsv4 mtp: q_b"; return false; }
+    gf::Dsv4Layer L;
+    L.swa = M->swa;
+    L.ratio = 0;
+    const gf::Dsv4Rope& rope = F->d4_rope[1];
+    const gf::Dsv4KvArgs ka{F->d4_kv, M->kv_a_norm, nullptr, nullptr, nullptr, nullptr,
+                            nullptr, nullptr, nullptr, nullptr, g.norm_eps, g.n_swa};
+    gf::dsv4_kv_update(ka, L, rope, vp, s);
+    gf::dsv4_attn(F->d4_q, M->sinks, L, g.n_swa, vp, nullptr, 0, rope, g.norm_eps, g.n_head, F->d4_heads, s);
+    gf::quantize_q8_1(F->d4_heads, F->d4_heads_q8, g.n_head * HD, s);
+    const int GD = g.n_head / g.o_groups * HD;
+    const size_t wrow = gf::row_bytes(GGML_TYPE_Q8_0, GD);
+    for (int gr = 0; gr < g.o_groups; ++gr)
+        j[gr] = {(const uint8_t*) M->o_a + (size_t) gr * g.o_lora * wrow,
+                 (const uint8_t*) F->d4_heads_q8 + (size_t) gr * (GD / 32) * 36, nullptr, F->d4_low + (size_t) gr * g.o_lora,
+                 nullptr, 1.0f, GGML_TYPE_Q8_0, GD, g.o_lora};
+    if (!gf::mv(j, g.o_groups, s)) { err = "dsv4 mtp: output a"; return false; }
+    gf::quantize_q8_1(F->d4_low, F->d4_low_q8, g.o_groups * g.o_lora, s);
+    j[0] = {M->o_b, F->d4_low_q8, nullptr, F->mixer, nullptr, 1.0f, GGML_TYPE_Q8_0, g.o_groups * g.o_lora, E};
+    if (!gf::mv(j, 1, s)) { err = "dsv4 mtp: output b"; return false; }
+    // ---- the FFN half: R2 = post x mixer + comb . R, its normed read in x / xq
+    h.block_out = F->mixer;
+    h.R_old = M->R;
+    h.R_new = M->R2;
+    h.w_fn = M->hf_fn;
+    h.w_scale = M->hf_scale;
+    h.w_base = M->hf_base;
+    h.norm_w = M->ffn_norm;
+    gf::hc(h, s);
+    nj = 0;
+    j[nj++] = {M->router, nullptr, F->x, M->glog, nullptr, 1.0f, gf::kTypeF32, E, g.n_expert};
+    j[nj++] = {M->sh_g, F->xq, nullptr, M->shg, nullptr, 1.0f, GGML_TYPE_Q8_0, E, FF};
+    j[nj++] = {M->sh_u, F->xq, nullptr, M->shu, nullptr, 1.0f, GGML_TYPE_Q8_0, E, FF};
+    if (!gf::mv(j, nj, s)) { err = "dsv4 mtp: router / shared"; return false; }
+    gf::swiglu_q8(M->shg, M->shu, g.swiglu_shexp, FF, M->shq, s);
+    j[0] = {M->sh_d, M->shq, nullptr, M->shy, nullptr, 1.0f, GGML_TYPE_Q8_0, FF, E};
+    if (!gf::mv(j, 1, s)) { err = "dsv4 mtp: shared down"; return false; }
+    cudaMemcpyAsync(M->glog_h, M->glog, g.n_expert * sizeof(float), cudaMemcpyDeviceToHost, s);
+    cudaStreamSynchronize(s);
+    // the route (ds4: probs = sqrt(softplus(logit)), picks on probs + bias, weights the picks' probs normalised x scale)
+    std::vector<float> pr((size_t) g.n_expert), key((size_t) g.n_expert);
+    for (int e = 0; e < g.n_expert; ++e) {
+        const float l = M->glog_h[e];
+        pr[(size_t) e] = std::sqrt(l > 20.0f ? l : std::log1p(std::exp(l)));
+        key[(size_t) e] = pr[(size_t) e] + M->bias_h[(size_t) e];
+    }
+    std::vector<int> id((size_t) g.n_expert);
+    for (int e = 0; e < g.n_expert; ++e) id[(size_t) e] = e;
+    std::partial_sort(id.begin(), id.begin() + K, id.end(), [&](int x, int y) { return key[(size_t) x] > key[(size_t) y]; });
+    float sum = 0.0f;
+    for (int k = 0; k < K; ++k) sum += pr[(size_t) id[(size_t) k]];
+    gf::Dsv4MtpW wt{};
+    for (int k = 0; k < K; ++k) wt.w[k] = pr[(size_t) id[(size_t) k]] / sum * g.w_scale;
+    const int gt = M->f->find("mtp.0.ffn_gate_exps.weight")->type, dt = M->f->find("mtp.0.ffn_down_exps.weight")->type;
+    const uint8_t* blob[8];
+    if (M->exp_dev) {
+        for (int k = 0; k < K; ++k) blob[k] = M->exp_dev + (size_t) id[(size_t) k] * M->blob;
+    } else {
+        for (int k = 0; k < K; ++k) {
+            const int e = id[(size_t) k];
+            uint8_t* hb = M->stage_h + (size_t) k * M->blob;
+            std::memcpy(hb, M->src_g + (size_t) e * M->gu_bytes, M->gu_bytes);
+            std::memcpy(hb + M->gu_bytes, M->src_u + (size_t) e * M->gu_bytes, M->gu_bytes);
+            std::memcpy(hb + 2 * M->gu_bytes, M->src_d + (size_t) e * M->d_bytes, M->d_bytes);
+            blob[k] = M->stage_dev + (size_t) k * M->blob;
+        }
+        cudaMemcpyAsync(M->stage_dev, M->stage_h, M->blob * (size_t) K, cudaMemcpyHostToDevice, s);
+    }
+    for (int k0 = 0; k0 < K; k0 += 4) {
+        nj = 0;
+        for (int k = k0; k < std::min(K, k0 + 4); ++k) {
+            j[nj++] = {blob[k], F->xq, nullptr, M->eg + (size_t) k * FF, nullptr, 1.0f, gt, E, FF};
+            j[nj++] = {blob[k] + M->gu_bytes, F->xq, nullptr, M->eu + (size_t) k * FF, nullptr, 1.0f, gt, E, FF};
+        }
+        if (!gf::mv(j, nj, s)) { err = "dsv4 mtp: expert gate / up"; return false; }
+    }
+    for (int k = 0; k < K; ++k)
+        gf::swiglu_q8(M->eg + (size_t) k * FF, M->eu + (size_t) k * FF, g.swiglu_exp, FF,
+                      (uint8_t*) M->ehq + (size_t) k * (FF / 32) * 36, s);
+    for (int k = 0; k < K; ++k)
+        j[k] = {blob[k] + 2 * M->gu_bytes, (uint8_t*) M->ehq + (size_t) k * (FF / 32) * 36, nullptr, M->ey + (size_t) k * E,
+                nullptr, 1.0f, dt, FF, E};
+    if (!gf::mv(j, K, s)) { err = "dsv4 mtp: expert down"; return false; }
+    gf::dsv4_mtp_combine(M->ey, wt, K, M->shy, F->ffn, E, s);
+    gf::hc_post(F->ffn, M->R2, F->post, F->comb, E, M->R, s);
+    // ---- the head
+    gf::dsv4_hc_head(M->R, M->hh_fn, M->hh_scale, M->hh_base, g.hc_eps, M->norm, g.norm_eps, E, F->head_x, F->head_xq, s);
+    const WSlot& ow = ws_map_.at("output.weight");
+    gf::MvJob o = {ow.q, F->head_xq, F->head_x, M->logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
+    if (ow.type == 0) o.w = ow.f32;
+    if (!gf::mv(&o, 1, s)) { err = "dsv4 mtp: output head"; return false; }
+    gf::argmax(M->logits, g.n_vocab, M->tok, s);
+    cudaMemcpyAsync(M->tok_h, M->tok, sizeof(int), cudaMemcpyDeviceToHost, s);
+    if (cudaStreamSynchronize(s) != cudaSuccess || cudaGetLastError() != cudaSuccess) {
+        err = "dsv4 mtp: the draft failed";
+        return false;
+    }
+    draft = M->tok_h[0];
+    return true;
+}
 }  // namespace strata::core

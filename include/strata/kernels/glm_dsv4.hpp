@@ -97,4 +97,10 @@ void dsv4_rows_attn(const float* q, const float* sinks, const Dsv4Layer& L, cons
 /// The sub-batch's last n_swa raw rows into the layer's ring.
 void dsv4_rows_ring(const uint16_t* raw16, const Dsv4Layer& L, int n_swa, int p0, int T, cudaStream_t s);
 
+/// the MTP block's input streams: R[s] = ep + hp[s] (4 streams of n)
+void dsv4_mtp_input(const float* ep, const float* hp, float* R, int n, cudaStream_t s);
+/// out = sum_j w[j] y[j] (k rows of n) + sh
+struct Dsv4MtpW { float w[8]; };
+void dsv4_mtp_combine(const float* y, Dsv4MtpW w, int k, const float* sh, float* out, int n, cudaStream_t s);
+
 }  // namespace strata::kernels::glmf
