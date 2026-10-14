@@ -467,9 +467,14 @@ void g4_attn(const float* q, const G4Kv& kv, int p0, int T, int n_head, int n_kv
     if (n_head % n_kv != 0 || n_head / n_kv > 8) throw std::invalid_argument("g4_attn: geometry");
     cudaStream_t s = (cudaStream_t) stream;
     static const bool dec = std::getenv("STRATA_G4_DEC") == nullptr || std::atoi(std::getenv("STRATA_G4_DEC")) != 0;
-    if (T == 1 && dec && n_head / n_kv == 4) {   // one token: the split-K SIMT form (the tile form pads 4 rows to 16+)
-        if (D == 256) return launch_dec<256, 4>(q, kv, p0, n_head, n_kv, window, scale, out, scratch, s);
-        if (D == 512) return launch_dec<512, 4>(q, kv, p0, n_head, n_kv, window, scale, out, scratch, s);
+    if (T == 1 && dec && (n_head / n_kv == 4 || n_head / n_kv == 2)) {   // one token: the split-K SIMT form
+        if (n_head / n_kv == 4) {                                         // (the tile form pads the rows to 16+)
+            if (D == 256) return launch_dec<256, 4>(q, kv, p0, n_head, n_kv, window, scale, out, scratch, s);
+            if (D == 512) return launch_dec<512, 4>(q, kv, p0, n_head, n_kv, window, scale, out, scratch, s);
+        } else {
+            if (D == 256) return launch_dec<256, 2>(q, kv, p0, n_head, n_kv, window, scale, out, scratch, s);
+            if (D == 512) return launch_dec<512, 2>(q, kv, p0, n_head, n_kv, window, scale, out, scratch, s);
+        }
     }
     if (D == 256) launch_attn<256, 256, 4>(q, kv, p0, T, n_head, n_kv, window, scale, out, scratch, s);
     else if (D == 512) launch_attn<512, 256, 2>(q, kv, p0, T, n_head, n_kv, window, scale, out, scratch, s);

@@ -231,6 +231,22 @@ struct DenseModel::Impl {
     float *ple_proj_norm = nullptr, *rope_freqs = nullptr;
     float* ple_model_f = nullptr;                   // (STRATA_G4_F32)
     bool g4_f32 = false;
+    // the Gemma 4 assistant (gemma4-assistant GGUF, STRATA_DENSE_MTP): 4 small layers on the target's last K/V of
+    // each kind, its own tied 256-wide head; a draft step at the anchor's position
+    struct G4ALayer {
+        float *attn_norm = nullptr, *q_norm = nullptr, *post_attn = nullptr, *ffn_norm = nullptr, *post_ffw = nullptr;
+        QMat q, o, gate, up, down;
+        float out_scale = 1.0f;
+        int D = 0;
+        bool swa = false;
+    };
+    std::unique_ptr<strata::GgufFile> asst_file;
+    std::vector<G4ALayer> asst;
+    QMat asst_pre, asst_post, asst_embd;
+    float* asst_norm = nullptr;
+    int asst_E = 0, asst_H = 0, asst_ff = 0;
+    float *a_h = nullptr, *a_n = nullptr, *a_q = nullptr, *a_qr = nullptr, *a_att = nullptr, *a_o = nullptr,
+          *a_g = nullptr, *a_u = nullptr;
     float *ple_rows = nullptr, *ple_proj_out = nullptr, *ple = nullptr, *ple_g = nullptr;
 
     QMat embd;                                      // token_embd, on the device (rows dequantized per token)
@@ -1289,6 +1305,54 @@ bool DenseModel::mtp_forward(const int32_t* toks, const float* hidden, int64_t p
     Impl& I = *impl_;
     Layer& M = I.mtp;
     if (!M.attn) { err = "dense model: no MTP block"; return false; }
+    if (I.gemma) {   // the assistant: the last row only (it keeps no cache), at the anchor's position
+        if (T < 1 || pos_ < 1) { err = "gemma4: an assistant step needs context"; return false; }
+        cudaStream_t s = I.stream;
+        const int E = cfg_.n_embd, AE = I.asst_E, AH = I.asst_H, NL = cfg_.n_layer, HK = cfg_.n_head_kv;
+        const float eps = cfg_.rms_eps;
+        try {
+            dequant_f32(I.embd.type, I.embd.dev, toks[T - 1], 1, E, I.mtp_cat, s);
+            g4_scale(I.mtp_cat, sqrtf((float) E), E, s);
+            cudaMemcpyAsync(I.mtp_cat + E, hidden + (size_t) (T - 1) * E, (size_t) E * 4, cudaMemcpyDeviceToDevice, s);
+            I.prep(I.mtp_cat, 2 * E, 1);
+            I.mm(I.asst_pre, I.a_h);
+            const int64_t pa = pos_;   // the anchor's position; keys [0, pa)
+            for (auto& L : I.asst) {
+                const Layer& src = I.layers[(size_t) (NL - (L.swa ? 2 : 1))];
+                const Layer& KV = src.kv_src >= 0 ? I.layers[(size_t) src.kv_src] : src;
+                q35_rms_rows(I.a_h, AE, L.attn_norm, I.a_n, nullptr, 1, AE, eps, s);
+                I.prep(I.a_n, AE, 1);
+                I.mm(L.q, I.a_q);
+                g4_attn_prep(I.a_q, nullptr, nullptr, 1, AH, HK, L.D, L.q_norm, nullptr, eps,
+                             L.swa ? I.rope_swa : cfg_.rope_base, L.swa ? nullptr : I.rope_freqs, (int) pa, I.a_qr, G4Kv{}, s);
+                // the query at pa over keys < pa: the attention's "position" pa - 1 (the window one shorter to match)
+                g4_attn(I.a_qr, KV.g4kv, (int) pa - 1, 1, AH, HK, L.D, L.swa ? I.n_swa - 1 : 0, 1.0f, I.a_att,
+                        I.attn_scratch, s);
+                I.prep(I.a_att, AH * L.D, 1);
+                I.mm(L.o, I.a_o);
+                q35_rms_rows(I.a_o, AE, L.post_attn, I.a_o, nullptr, 1, AE, eps, s);
+                q35_add(I.a_h, I.a_o, AE, s);
+                q35_rms_rows(I.a_h, AE, L.ffn_norm, I.a_n, nullptr, 1, AE, eps, s);
+                I.prep(I.a_n, AE, 1);
+                I.mm(L.gate, I.a_g);
+                I.mm(L.up, I.a_u);
+                g4_gelu_mul(I.a_g, I.a_u, I.a_g, I.asst_ff, s);
+                I.prep(I.a_g, I.asst_ff, 1);
+                I.mm(L.down, I.a_o);
+                q35_rms_rows(I.a_o, AE, L.post_ffw, I.a_o, nullptr, 1, AE, eps, s);
+                g4_add_scale(I.a_h, I.a_o, L.out_scale, AE, s);
+            }
+            q35_rms_rows(I.a_h, AE, I.asst_norm, I.a_n, nullptr, 1, AE, eps, s);
+            I.prep(I.a_n, AE, 1);
+            I.mm(I.asst_embd, I.mtp_logits);
+            I.mm(I.asst_post, I.mtp_h);
+            (void) p0; (void) all_logits;
+            return true;
+        } catch (const std::exception& e) {
+            err = std::string("gemma4 assistant: ") + e.what();
+            return false;
+        }
+    }
     if (T < 1 || T > I.chunk || p0 + T > max_context_) { err = "dense model: MTP rows outside the context"; return false; }
     if (all_logits && T > kMaxCols) { err = "dense model: MTP logits of every row up to 8 rows"; return false; }
     cudaStream_t s = I.stream;
@@ -1888,6 +1952,67 @@ bool DenseModel::load_gemma4(int64_t max_context, std::string& err) {
     if (!I.gemm.init(I.stream, std::max<int64_t>((int64_t) cfg_.n_ff * E, (int64_t) NL * P * E), err)) return false;
     if (const char* e = std::getenv("STRATA_DENSE_MMT_MIN")) I.mmt_min = std::max(1, std::atoi(e));
     if (const char* e = std::getenv("STRATA_DENSE_PACKED_DP4A")) I.packed_dp4a = std::atoi(e) != 0;
+    if (const char* mp = std::getenv("STRATA_DENSE_MTP")) {   // the assistant
+        I.asst_file.reset(new strata::GgufFile(mp));
+        const strata::GgufFile& A = *I.asst_file;
+        const auto* aa = A.get("general.architecture");
+        if (!aa || aa->s != "gemma4-assistant") { err = std::string("gemma4: ") + mp + " is not a gemma4-assistant GGUF"; return false; }
+        const std::string q = "gemma4-assistant.";
+        auto anum = [&](const std::string& k) { const auto* m = A.get(q + k); return m ? (int) m->num() : 0; };
+        I.asst_E = anum("embedding_length");
+        I.asst_H = anum("attention.head_count");
+        I.asst_ff = anum("feed_forward_length");
+        const int AL = anum("block_count"), AD_f = anum("attention.key_length"), AD_s = anum("attention.key_length_swa");
+        const auto* apat = A.get(q + "attention.sliding_window_pattern");
+        if (anum("embedding_length_out") != E || anum("attention.head_count_kv") != HK || AD_f != D_full || AD_s != D_swa ||
+            !apat || (int) apat->items.size() < AL || I.asst_E % 256 || I.asst_ff % 256) {
+            err = "gemma4: the assistant's geometry does not match the model";
+            return false;
+        }
+        auto af = [&](const std::string& n) -> const Found* {
+            static std::vector<std::unique_ptr<Found>> keep;
+            const auto* t = A.find(n);
+            if (!t) return nullptr;
+            keep.emplace_back(new Found{&A, t});
+            return keep.back().get();
+        };
+        const int AE = I.asst_E, AH = I.asst_H;
+        I.asst.resize((size_t) AL);
+        for (int l = 0; l < AL; ++l) {
+            auto& L = I.asst[(size_t) l];
+            const std::string p = "blk." + std::to_string(l) + ".";
+            L.swa = apat->items[(size_t) l].u != 0;
+            L.D = L.swa ? D_swa : D_full;
+            if (!I.upload_floats(af(p + "attn_norm.weight"), p + "attn_norm.weight", AE, &L.attn_norm, err) ||
+                !I.upload_floats(af(p + "attn_q_norm.weight"), p + "attn_q_norm.weight", L.D, &L.q_norm, err) ||
+                !I.upload_floats(af(p + "post_attention_norm.weight"), p + "post_attention_norm.weight", AE, &L.post_attn, err) ||
+                !I.upload_floats(af(p + "ffn_norm.weight"), p + "ffn_norm.weight", AE, &L.ffn_norm, err) ||
+                !I.upload_floats(af(p + "post_ffw_norm.weight"), p + "post_ffw_norm.weight", AE, &L.post_ffw, err) ||
+                !I.upload_mat(af(p + "attn_q.weight"), p + "attn_q.weight", AE, AH * L.D, L.q, total, err) ||
+                !I.upload_mat(af(p + "attn_output.weight"), p + "attn_output.weight", AH * L.D, AE, L.o, total, err) ||
+                !I.upload_mat(af(p + "ffn_gate.weight"), p + "ffn_gate.weight", AE, I.asst_ff, L.gate, total, err) ||
+                !I.upload_mat(af(p + "ffn_up.weight"), p + "ffn_up.weight", AE, I.asst_ff, L.up, total, err) ||
+                !I.upload_mat(af(p + "ffn_down.weight"), p + "ffn_down.weight", I.asst_ff, AE, L.down, total, err))
+                return false;
+            if (const auto* t = A.find(p + "layer_output_scale.weight")) L.out_scale = *(const float*) A.tensor_data(*t);
+        }
+        if (!I.upload_mat(af("nextn.pre_projection.weight"), "nextn.pre_projection.weight", 2 * E, AE, I.asst_pre, total, err) ||
+            !I.upload_mat(af("nextn.post_projection.weight"), "nextn.post_projection.weight", AE, E, I.asst_post, total, err) ||
+            !I.upload_mat(af("token_embd.weight"), "assistant token_embd.weight", AE, cfg_.n_vocab, I.asst_embd, total, err, false) ||
+            !I.upload_floats(af("output_norm.weight"), "assistant output_norm.weight", AE, &I.asst_norm, err))
+            return false;
+        const int AQ = AH * D_full;
+        if (!I.alloc(&I.a_h, (uint64_t) AE * 4, err, "asst") || !I.alloc(&I.a_n, (uint64_t) AE * 4, err, "asst") ||
+            !I.alloc(&I.a_q, (uint64_t) AQ * 4, err, "asst") || !I.alloc(&I.a_qr, (uint64_t) AQ * 4, err, "asst") ||
+            !I.alloc(&I.a_att, (uint64_t) AQ * 4, err, "asst") || !I.alloc(&I.a_o, (uint64_t) AE * 4, err, "asst") ||
+            !I.alloc(&I.a_g, (uint64_t) I.asst_ff * 4, err, "asst") || !I.alloc(&I.a_u, (uint64_t) I.asst_ff * 4, err, "asst") ||
+            !I.alloc(&I.mtp_cat, (uint64_t) 2 * E * 4, err, "asst") || !I.alloc(&I.mtp_h, (uint64_t) kMaxCols * E * 4, err, "asst") ||
+            !I.alloc(&I.mtp_logits, (uint64_t) kMaxCols * cfg_.n_vocab * 4, err, "asst"))
+            return false;
+        I.mtp.attn = true;   // (has_mtp)
+        weight_bytes_ = total;
+        std::fprintf(stderr, "strata-dense: gemma4 assistant %s: %d layers of %d\n", mp, AL, AE);
+    }
     reset();
     std::string serr;
     if (!sync(serr)) { err = serr; return false; }

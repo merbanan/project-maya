@@ -69,6 +69,20 @@ filler (chunk 2048). Greedy unless noted.
 
 At 28K the block drafters' extra draft pass costs about what their longer runs gain: MTP with 5 drafts ties them.
 
+## Gemma 4 E4B - unsloth Q4_K_M, `strata-dense` (2026-10-14)
+
+Greedy tokens match llama.cpp (128 / 128 at a short prompt; at 6-28K the first difference is a near-tie, llama
+margin 0.06-0.33). Assistant drafts: `STRATA_DENSE_MTP=mtp-gemma-4-E4B-it.gguf` (the 4-layer gemma4-assistant on the
+target's K/V), `STRATA_DENSE_DRAFT=K`.
+
+| Setting | Prompt (tok/s) | Decode (tok/s) | Notes |
+|---|---:|---:|---|
+| llama.cpp | 287 (32) / 3,449 (1.5K) / 3,676 (5.6K) / 3,140 (26K) | 92.5 / 92.5 / 91.1 / 85.2 | |
+| no drafts | 579 (32) / 4,303 (1.5K) / 4,668 (5.6K) / 2,695 (26K) | **98.8 - 100.1** / 85.6 / 80.3 / **85.3** (26K) | |
+| assistant, 2 drafts | | **161.3** | 2.37 tokens a round |
+| assistant, 3 drafts | | 152.0 / 150.3 (after 1.5K) | 2.69 / 2.64 |
+| assistant, 4 drafts | | 157.6 | 2.91 |
+
 ## DeepSeek-V4 Flash - antirez IQ2_XXS (80.8 GB), GLM fast path (`dsv4`)
 
 Fresh run 2026-10-14 (dsv4 6d39cfc: tensor-core prompt indexer and attention, parallel compressors), needles 3/3
