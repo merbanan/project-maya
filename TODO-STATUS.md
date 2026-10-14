@@ -30,7 +30,7 @@ lives. Branches on the fork: `qwen38` (strata-dense: Qwen3.8-27B, Qwen3.6-35B-A3
 | Hy3 attention, V side in registers | done, opt-in | STRATA_GLM_GQA_REG=2 (cffeaaf): correct, 3.6x slower (60.3 vs 16.8 ms) - off |
 | Gemma head-512 prompt attention | done | 2,693 -> 3,826 (26K), 1,106 -> 1,993 (94K) tok/s, needles 3/3 (196cc14, 9a93286) |
 | GLM route (1Cat #1147 fused router top-k + quant) | done | router + shared gate/up one multi-GEMV, route + shared SwiGLU + Q8 one kernel; table reads parallel: moe_route 1.61-1.74 -> 1.52 ms (cb48441 / fd32e62) |
-| 1Cat mHC fusion (#1172/1166/1159) | present | hc3 grid-barrier kernel (one launch a step) |
+| 1Cat mHC fusion (#1172/1166/1159) | present, measured | hc3 fused kernel vs the old form (STRATA_GLM_HC1=1), DSv4 2K: hc_attn + hc_ffn 1.60 vs 2.96 ms a token, decode 28.37 / 27.74 vs 27.65 / 27.07 tok/s, needles 3/3 |
 | 1Cat TC MLA prefill (#1125) | present | WMMA MLA prompt attention on by default |
 | 1Cat verify-row reuse (#1142/1157) | n/a | no GLM MTP on this box |
 | project-maya #92 / #131 / #132 / #118 | done | picked onto hy3 / dsv4 / qwen38; #118 opt-in |
