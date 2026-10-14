@@ -82,6 +82,7 @@ struct Layer {
     G4Kv g4kv;
     float *ffn_pre_norm = nullptr, *post_ffw_norm = nullptr, *ple_norm = nullptr;
     QMat inp_gate, ple_proj;
+    QMat attn_gate;                                 // Muse Glimmer: the attention output gate (sigmoid)
     float *inp_gate_f = nullptr, *ple_proj_f = nullptr;   // (STRATA_G4_F32: the F32 rows, exact)
     float out_scale = 1.0f;
     // the MTP (nextn) block's own
@@ -104,6 +105,8 @@ struct Dflash {
     // DSpark (LithosAI): no convolutions, no selector; its own embedding and head, a Markov head
     // d_k = argmax(head(h_k) + W2 . W1[d_(k-1)]); every block row drafts (row 0: the anchor's)
     bool dspark = false;
+    bool plain = false;                               // plain DFlash (arch "dflash": no conv, no selector; the target's
+                                                      // head on rows 1..K, as llama.cpp's dflash.cpp)
     QMat ds_embd, ds_head, ds_w2;
     uint16_t* ds_w1 = nullptr;                        // [vocab][rank] FP16
     float *ds_x = nullptr, *ds_lg = nullptr;          // the chain's W1 row and one row's logits
@@ -224,7 +227,9 @@ struct DenseModel::Impl {
     int kv_mode = 0;                                // the K / V cache: 0 FP16, 1 K8V4 (STRATA_DENSE_KV / --kv)
 
     // Gemma 4: the per-layer embeddings (the token table, the model projection and its norm), rope bases, window
-    bool gemma = false;
+    bool gemma = false, muse = false;
+    float logit_scale = 1.0f;
+    float* attn_gate_out = nullptr;
     int ple_dim = 0, n_swa = 0;
     float rope_swa = 1e4f, softcap = 0.0f;
     QMat ple_tok, ple_model;
@@ -615,6 +620,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         cfg_.arch = arch->s;
         const std::string a = cfg_.arch + ".";
         if (cfg_.arch == "gemma4") return load_gemma4(max_context, err);
+        if (cfg_.arch == "muse-glimmer") return load_muse(max_context, err);
         if (cfg_.arch.rfind("qwen3", 0) != 0) {
             err = "dense model: architecture '" + cfg_.arch + "' is not a qwen35 dense model";
             return false;
@@ -1150,6 +1156,7 @@ bool DenseModel::forward(const int32_t* tokens, int T, bool verify, int want, st
     for (int t = 0; t < T; ++t)
         if (tokens[t] < 0 || tokens[t] >= cfg_.n_vocab) { err = "dense model: token id outside the vocabulary"; return false; }
     if (I.gemma) return forward_gemma4(tokens, T, verify, want, err);
+    if (I.muse) return forward_muse(tokens, T, verify, want, err);
     cudaStream_t s = I.stream;
     const int C = cfg_.conv_channels(), V = cfg_.value_dim(), E = cfg_.n_embd;
     const int KH = cfg_.ssm_k_heads, VH = cfg_.ssm_v_heads;
@@ -1399,11 +1406,12 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
         I.df_file.reset(new strata::GgufFile(path));
         const strata::GgufFile& G = *I.df_file;
         const auto* arch = G.get("general.architecture");
-        if (!arch || (arch->s != "qwen35-dflash-draft" && arch->s != "qwen35-dspark-draft")) {
-            err = "dflash: " + path + " is not a qwen35-dflash-draft / qwen35-dspark-draft GGUF";
+        if (!arch || (arch->s != "qwen35-dflash-draft" && arch->s != "qwen35-dspark-draft" && arch->s != "dflash")) {
+            err = "dflash: " + path + " is not a qwen35-dflash-draft / qwen35-dspark-draft / dflash GGUF";
             return false;
         }
         F.dspark = arch->s == "qwen35-dspark-draft";
+        F.plain = arch->s == "dflash";
         const std::string a = arch->s + ".";
         auto num = [&](const std::string& k, double def) -> double {
             const auto* v = G.get(a + k);
@@ -1431,6 +1439,14 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
         F.n_cand = std::min(cfg_.n_vocab, (int) num("dflash.candidate_vocab", 248077));
         if (const auto* tl = G.get(a + "dflash.target_layer_ids"))
             for (const auto& it : tl->items) F.target_layers.push_back((int) it.u);
+        if (F.plain) {   // its own key names
+            F.block = (int) num("block_size", 16);
+            if (const auto* m = G.get("tokenizer.ggml.mask_token_id")) F.mask_tok = (int) m->u;
+            if (const auto* tl = G.get(a + "target_layers"))
+                for (const auto& it : tl->items) F.target_layers.push_back((int) it.u);
+            F.taps = 2;
+            F.rank = 32;   // (unused)
+        }
         if (F.dspark) {   // trained on the whole context, but a ring of 8K positions drafts faster at 28K (162.7 tok/s
                           // vs 134.5 with 32K: the longer attention costs more than the extra kept drafts gain)
             F.taps = 2;
@@ -1438,7 +1454,7 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
         }
         if (F.n_layer < 1 || F.n_head < 1 || F.n_kv < 1 || F.taps != 2 || F.rank < 32 || F.rank > 1024 ||
             F.rank % 32 || F.top_k < 1 || F.top_k > 32 || F.mask_tok < 0 || F.target_layers.empty() ||
-            F.block < 2 || F.block > 9 || (int) num("attention.key_length", 128) != 128) {
+            F.block < 2 || F.block > (F.plain || F.dspark ? 16 : 9) || (int) num("attention.key_length", 128) != 128) {
             err = "dflash: unsupported drafter geometry (DFlash2 with a selector, head size 128, block 2..9)";
             return false;
         }
@@ -1474,9 +1490,10 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
             return true;
         };
         const int qd = F.n_head * 128, kvd = F.n_kv * 128, cdyn = 2 * F.taps * (E / F.group);
-        if (!mat("dflash.fc.weight", NF * E, E, F.fc) ||
-            (!F.dspark && !mat("dflash.selector.hproj.weight", E, F.rank, F.hproj)) ||
-            !f32("dflash.hidden_norm.weight", E, &F.hidden_norm) || !f32("output_norm.weight", E, &F.out_norm))
+        if (!mat(F.plain ? "fc.weight" : "dflash.fc.weight", NF * E, E, F.fc) ||
+            (!F.dspark && !F.plain && !mat("dflash.selector.hproj.weight", E, F.rank, F.hproj)) ||
+            !f32(F.plain ? "enc.output_norm.weight" : "dflash.hidden_norm.weight", E, &F.hidden_norm) ||
+            !f32("output_norm.weight", E, &F.out_norm))
             return false;
         if (F.dspark) {
             const auto* t1 = find("dspark.markov_w1");
@@ -1492,7 +1509,7 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
                 return false;
         }
         for (const char* n : {"dflash.selector.pred_cb", "dflash.selector.succ_cb"}) {
-            if (F.dspark) break;
+            if (F.dspark || F.plain) break;
             const auto* t = find(n);
             if (!t || t->type != kF16 || t->shape.size() != 2 || t->shape[0] != (uint64_t) F.rank ||
                 t->shape[1] != (uint64_t) cfg_.n_vocab) {
@@ -1511,12 +1528,12 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
             const std::string P = "blk." + std::to_string(il) + ".";
             if (!f32(P + "attn_norm.weight", E, &L.attn_norm) || !f32(P + "ffn_norm.weight", E, &L.ffn_norm) ||
                 !f32(P + "attn_q_norm.weight", 128, &L.q_norm) || !f32(P + "attn_k_norm.weight", 128, &L.k_norm) ||
-                (!F.dspark && !f32(P + "attn_conv.base", (uint64_t) 2 * F.taps * E, &L.attn_base)) ||
-                (!F.dspark && !f32(P + "ffn_conv.base", (uint64_t) 2 * F.taps * E, &L.ffn_base)) ||
+                (!F.dspark && !F.plain && !f32(P + "attn_conv.base", (uint64_t) 2 * F.taps * E, &L.attn_base)) ||
+                (!F.dspark && !F.plain && !f32(P + "ffn_conv.base", (uint64_t) 2 * F.taps * E, &L.ffn_base)) ||
                 !mat(P + "attn_q.weight", E, qd, L.q) || !mat(P + "attn_k.weight", E, kvd, L.k) ||
                 !mat(P + "attn_v.weight", E, kvd, L.v) || !mat(P + "attn_output.weight", qd, E, L.o) ||
-                (!F.dspark && !mat(P + "attn_conv.proj.weight", E, cdyn, L.attn_conv)) ||
-                (!F.dspark && !mat(P + "ffn_conv.proj.weight", E, cdyn, L.ffn_conv)) ||
+                (!F.dspark && !F.plain && !mat(P + "attn_conv.proj.weight", E, cdyn, L.attn_conv)) ||
+                (!F.dspark && !F.plain && !mat(P + "ffn_conv.proj.weight", E, cdyn, L.ffn_conv)) ||
                 !mat(P + "ffn_gate.weight", E, F.n_ff, L.gate) || !mat(P + "ffn_up.weight", E, F.n_ff, L.up) ||
                 !mat(P + "ffn_down.weight", F.n_ff, E, L.down))
                 return false;
@@ -1559,7 +1576,7 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
         if (cudaDeviceSynchronize() != cudaSuccess) { err = "dflash: upload failed"; return false; }
         F.on = true;
         std::fprintf(stderr, "strata-dense: %s drafter %s: %d layers, block %d, %.2f GiB (Q8_0), window %d, "
-                     "target layers", F.dspark ? "DSpark" : "DFlash2", path.c_str(), F.n_layer, F.block, total / 1073741824.0, F.window);
+                     "target layers", F.dspark ? "DSpark" : F.plain ? "DFlash" : "DFlash2", path.c_str(), F.n_layer, F.block, total / 1073741824.0, F.window);
         for (int l : F.target_layers) std::fprintf(stderr, " %d", l);
         std::fprintf(stderr, "\n");
         return true;
@@ -1597,7 +1614,7 @@ bool DenseModel::dflash_inject(int n, int64_t p0, std::string& err) {
     }
 }
 
-const char* DenseModel::dflash_kind() const { return impl_->df.dspark ? "DSpark" : "DFlash2"; }
+const char* DenseModel::dflash_kind() const { return impl_->df.dspark ? "DSpark" : impl_->df.plain ? "DFlash" : "DFlash2"; }
 
 bool DenseModel::dflash_draft(int32_t anchor, int K, std::vector<int32_t>& out, std::string& err) {
     Impl& I = *impl_;
@@ -1606,7 +1623,12 @@ bool DenseModel::dflash_draft(int32_t anchor, int K, std::vector<int32_t>& out, 
     if (!F.on || K < 1) return true;
     K = std::min(K, F.block - 1);
     // DSpark: every row drafts (row k the token after d_(k-1)); the block as trained, its first K rows' drafts kept
-    const int W = F.dspark ? F.block : K + 1, E = cfg_.n_embd, kvd = F.n_kv * 128, qd = F.n_head * 128;
+    K = std::min(K, kMaxCols - 1);   // (a verify pass takes up to 8 rows)
+    // DSpark: the block as trained; plain DFlash: up to 8 rows (STRATA_DENSE_DFLASH_ROWS; more rows leave the GEMVs
+    // for the dequantizing GEMM - 16 rows cost 20 ms a draft on Muse Glimmer's 6656-wide drafter)
+    static const int plain_rows = std::getenv("STRATA_DENSE_DFLASH_ROWS") ? std::atoi(std::getenv("STRATA_DENSE_DFLASH_ROWS")) : kMaxCols;
+    const int W = F.dspark ? F.block : F.plain ? std::max(K + 1, std::min(F.block, plain_rows)) : K + 1;
+    const int E = cfg_.n_embd, kvd = F.n_kv * 128, qd = F.n_head * 128;
     const int cdyn = 2 * F.taps * (E / F.group);
     const int64_t P0 = pos_;
     cudaStream_t s = I.stream;
@@ -1615,7 +1637,7 @@ bool DenseModel::dflash_draft(int32_t anchor, int K, std::vector<int32_t>& out, 
         const QMat& emb = F.dspark ? F.ds_embd : I.embd;
         for (int t = 0; t < W; ++t)
             dequant_f32(emb.type, emb.dev, t == 0 ? anchor : F.mask_tok, 1, E, F.h + (size_t) t * E, s);
-        if (F.dspark) {
+        if (F.dspark || F.plain) {
             for (DfLayer& L : F.layers) {   // plain pre-norm layers: no convolutions
                 q35_rms_rows(F.h, E, L.attn_norm, I.xn, nullptr, W, E, F.eps, s);
                 I.prep(I.xn, E, W);
@@ -1639,6 +1661,16 @@ bool DenseModel::dflash_draft(int32_t anchor, int K, std::vector<int32_t>& out, 
                 q35_add(F.h, F.a, (int64_t) W * E, s);
             }
             q35_rms_rows(F.h, E, F.out_norm, F.hf, nullptr, W, E, F.eps, s);
+            if (F.plain) {   // rows 1..K through the target's head, their arg-max
+                const int V = cfg_.n_vocab;
+                I.prep(F.hf + E, E, K);
+                I.mm(I.head, F.logits);
+                q35_argmax_rows(F.logits, V, V, K, F.tok, s);
+                out.resize((size_t) K);
+                cudaMemcpyAsync(out.data(), F.tok, (size_t) K * 4, cudaMemcpyDeviceToHost, s);
+                if (cudaStreamSynchronize(s) != cudaSuccess) { err = "dflash: draft failed"; return false; }
+                return true;
+            }
             // base logits of the K rows through the drafter's own head; the Markov chain on the device:
             // d_k = argmax(base_k + W2 . W1[d_(k-1)]), d_(-1) = the anchor
             const int V = cfg_.n_vocab;
@@ -2108,6 +2140,199 @@ bool DenseModel::forward_gemma4(const int32_t* tokens, int T, bool verify, int w
         return true;
     } catch (const std::exception& e) {
         err = std::string("gemma4: ") + e.what();
+        return false;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------- Muse Glimmer
+// llama.cpp src/models/muse-glimmer.cpp: a dense transformer, 3 sliding-window (rope) + 1 global (NoPE) layers,
+// gated attention (32 / 2 heads of 128), sandwich norms, SwiGLU, a logit scale and soft cap
+bool DenseModel::load_muse(int64_t max_context, std::string& err) {
+    Impl& I = *impl_;
+    I.muse = true;
+    const strata::GgufFile& g0 = *I.files.front();
+    const std::string a = "muse-glimmer.";
+    int64_t v = 0;
+    auto need = [&](const char* key, int& dst) {
+        if (!meta_int(g0, a + key, v)) { err = std::string("muse: missing ") + a + key; return false; }
+        dst = (int) v;
+        return true;
+    };
+    int pattern = 4;
+    if (!need("block_count", cfg_.n_layer) || !need("embedding_length", cfg_.n_embd) ||
+        !need("feed_forward_length", cfg_.n_ff) || !need("attention.head_count", cfg_.n_head) ||
+        !need("attention.head_count_kv", cfg_.n_head_kv) || !need("attention.key_length", cfg_.head_dim) ||
+        !need("attention.sliding_window", I.n_swa))
+        return false;
+    if (meta_int(g0, a + "attention.sliding_window_pattern", v)) pattern = (int) v;
+    if (const auto* e = g0.get(a + "attention.layer_norm_rms_epsilon")) cfg_.rms_eps = (float) e->num();
+    if (const auto* e = g0.get(a + "rope.freq_base")) cfg_.rope_base = (float) e->num();
+    I.rope_swa = cfg_.rope_base;
+    if (const auto* e = g0.get(a + "rope.freq_base_swa")) I.rope_swa = (float) e->num();
+    if (const auto* e = g0.get(a + "final_logit_softcapping")) I.softcap = (float) e->num();
+    if (const auto* e = g0.get(a + "logit_scale")) I.logit_scale = (float) e->num();
+    if (const auto* e = g0.get("tokenizer.ggml.eos_token_id")) cfg_.eos_id = (int32_t) e->u;
+    const int NL = cfg_.n_layer, E = cfg_.n_embd, H = cfg_.n_head, HK = cfg_.n_head_kv, D = cfg_.head_dim;
+    cfg_.n_rot = D;
+    if (D != 128 || H % HK || H / HK > 16 || E % 256 || cfg_.n_ff % 256 || pattern < 1) {
+        err = "muse: unsupported geometry (head 128, up to 16 query heads a KV head, widths of 256)";
+        return false;
+    }
+    const Found* tok = I.find("token_embd.weight");
+    if (!tok || tok->tensor->shape.size() != 2 || tok->tensor->shape[0] != (uint64_t) E) {
+        err = "muse: token_embd.weight missing or not [n_embd, n_vocab]";
+        return false;
+    }
+    cfg_.n_vocab = (int) tok->tensor->shape[1];
+    max_context_ = max_context;
+    if (cudaStreamCreate(&I.stream) != cudaSuccess) { err = "muse: CUDA stream"; return false; }
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    {   // (every layer keeps the whole context's K/V: the sliding ones only read their window)
+        const uint64_t kv_need = (uint64_t) NL * 2 * HK * D * max_context * 2;
+        const uint64_t act = (uint64_t) I.chunk * (8ull * E + 4ull * cfg_.n_ff + 6ull * H * D) * 4 +
+                             (uint64_t) kMaxCols * cfg_.n_vocab * 4 + 1024ull * 1024 * 1024;
+        if ((uint64_t) free_b < kv_need + act) {
+            err = "muse: the K/V cache for a context of " + std::to_string(max_context) + " needs " +
+                  std::to_string(kv_need >> 20) + " MiB; " + std::to_string(free_b >> 20) + " MiB are free";
+            return false;
+        }
+        I.budget = (uint64_t) free_b - kv_need - act;
+    }
+    uint64_t total = 0;
+    I.layers.resize((size_t) NL);
+    for (int l = 0; l < NL; ++l) {
+        Layer& L = I.layers[(size_t) l];
+        const std::string p = "blk." + std::to_string(l) + ".";
+        L.attn = true;
+        L.swa = l % pattern < pattern - 1;
+        L.D = D;
+        if (!I.upload_floats(I.find(p + "attn_norm.weight"), p + "attn_norm.weight", E, &L.attn_norm, err) ||
+            !I.upload_floats(I.find(p + "post_attention_norm.weight"), p + "post_attention_norm.weight", E, &L.post_norm, err) ||
+            !I.upload_floats(I.find(p + "ffn_norm.weight"), p + "ffn_norm.weight", E, &L.ffn_pre_norm, err) ||
+            !I.upload_floats(I.find(p + "post_ffw_norm.weight"), p + "post_ffw_norm.weight", E, &L.post_ffw_norm, err) ||
+            !I.upload_floats(I.find(p + "attn_q_norm.weight"), p + "attn_q_norm.weight", D, &L.q_norm, err) ||
+            !I.upload_floats(I.find(p + "attn_k_norm.weight"), p + "attn_k_norm.weight", D, &L.k_norm, err) ||
+            !I.upload_mat(I.find(p + "attn_q.weight"), p + "attn_q.weight", E, H * D, L.q, total, err) ||
+            !I.upload_mat(I.find(p + "attn_k.weight"), p + "attn_k.weight", E, HK * D, L.k, total, err) ||
+            !I.upload_mat(I.find(p + "attn_v.weight"), p + "attn_v.weight", E, HK * D, L.v, total, err) ||
+            !I.upload_mat(I.find(p + "attn_gate.weight"), p + "attn_gate.weight", E, H * D, L.attn_gate, total, err) ||
+            !I.upload_mat(I.find(p + "attn_output.weight"), p + "attn_output.weight", H * D, E, L.o, total, err) ||
+            !I.upload_mat(I.find(p + "ffn_gate.weight"), p + "ffn_gate.weight", E, cfg_.n_ff, L.ffn_gate, total, err) ||
+            !I.upload_mat(I.find(p + "ffn_up.weight"), p + "ffn_up.weight", E, cfg_.n_ff, L.ffn_up, total, err) ||
+            !I.upload_mat(I.find(p + "ffn_down.weight"), p + "ffn_down.weight", cfg_.n_ff, E, L.ffn_down, total, err))
+            return false;
+        const uint64_t cells = (uint64_t) HK * max_context;
+        if (!I.alloc(&L.g4kv.k, cells * D * 2, err, "K cache") || !I.alloc(&L.g4kv.v, cells * D * 2, err, "V cache"))
+            return false;
+        L.g4kv.max_ctx = (int) max_context;
+        kv_bytes_ += cells * D * 4;
+    }
+    if (!I.upload_mat(tok, "token_embd.weight", E, cfg_.n_vocab, I.embd, total, err, false) ||
+        !I.upload_floats(I.find("output_norm.weight"), "output_norm.weight", E, &I.output_norm, err))
+        return false;
+    if (const Found* h = I.find("output.weight")) {
+        if (!I.upload_mat(h, "output.weight", E, cfg_.n_vocab, I.head, total, err, true, false)) return false;
+    } else {
+        I.head = I.embd;
+    }
+    I.head_draft = I.head;
+    weight_bytes_ = total;
+    host_bytes_ = I.host_bytes;
+    const uint64_t R = (uint64_t) I.chunk, f = 4;
+    const int max_in = std::max({E, cfg_.n_ff, H * D});
+    I.max_in = std::max(max_in, 5 * E);   // (a DFlash drafter's fc reads 5 target rows)
+    bool ok = I.alloc(&I.q8_1, native_q8_1_bytes(I.max_in, kMaxCols), err, "q8_1 scratch") &&
+              I.alloc(&I.xh, R * I.max_in * 2, err, "fp16 activations") &&
+              I.alloc(&I.x, R * E * f, err, "x") && I.alloc(&I.xn, R * E * f, err, "xn") &&
+              I.alloc(&I.mix, R * E * f, err, "mix") && I.alloc(&I.hn, R * E * f, err, "hidden") &&
+              I.alloc(&I.q_full, R * H * D * f, err, "q") && I.alloc(&I.qcur, R * H * D * f, err, "qcur") &&
+              I.alloc(&I.kcur, R * HK * D * f, err, "kcur") && I.alloc(&I.vcur, R * HK * D * f, err, "vcur") &&
+              I.alloc(&I.attn, R * H * D * f, err, "attn") && I.alloc(&I.attn_gate_out, R * H * D * f, err, "gate") &&
+              I.alloc(&I.ffn_g, R * cfg_.n_ff * f, err, "ffn_g") && I.alloc(&I.ffn_u, R * cfg_.n_ff * f, err, "ffn_u") &&
+              I.alloc(&I.ffn_h, R * cfg_.n_ff * f, err, "ffn_h") &&
+              I.alloc(&I.logits, (uint64_t) kMaxCols * cfg_.n_vocab * f, err, "logits") &&
+              I.alloc(&I.attn_scratch, (uint64_t) g4_attn_scratch_floats(kMaxCols, H, D, (int) max_context) * f, err,
+                      "attention scratch") &&
+              I.alloc(&I.tok_dev, R * 4, err, "tokens") &&
+              I.alloc(&I.xh8, (uint64_t) 8 * I.max_in * 2, err, "fp16 rows") &&
+              I.alloc(&I.mmt_part, (uint64_t) q35_mmt_part_floats(std::max({cfg_.n_vocab, cfg_.n_ff, H * D})) * f, err,
+                      "GEMV partials");
+    if (!ok) return false;
+    if (!I.gemm.init(I.stream, (int64_t) cfg_.n_ff * E, err)) return false;
+    if (const char* e = std::getenv("STRATA_DENSE_MMT_MIN")) I.mmt_min = std::max(1, std::atoi(e));
+    if (const char* e = std::getenv("STRATA_DENSE_PACKED_DP4A")) I.packed_dp4a = std::atoi(e) != 0;
+    reset();
+    std::string serr;
+    if (!sync(serr)) { err = serr; return false; }
+    std::fprintf(stderr, "strata-dense: muse-glimmer, %d layers (%d of %d with a window of %d), %d / %d heads of %d, "
+                 "%.2f GiB of weights, K/V %.2f GiB, prompt chunks of %d tokens\n", NL, pattern - 1, pattern, I.n_swa,
+                 H, HK, D, total / 1073741824.0, kv_bytes_ / 1073741824.0, I.chunk);
+    return true;
+}
+
+bool DenseModel::forward_muse(const int32_t* tokens, int T, bool verify, int want, std::string& err) {
+    Impl& I = *impl_;
+    cudaStream_t s = I.stream;
+    const int E = cfg_.n_embd, NL = cfg_.n_layer, H = cfg_.n_head, HK = cfg_.n_head_kv, D = cfg_.head_dim;
+    const float eps = cfg_.rms_eps, post_eps = 1e-8f;
+    const int64_t p0 = pos_;
+    try {
+        I.mark(s);
+        for (int t = 0; t < T; ++t) dequant_f32(I.embd.type, I.embd.dev, tokens[t], 1, E, I.x + (size_t) t * E, s);
+        q35_rms_rows(I.x, E, nullptr, I.x, nullptr, T, E, eps, s);   // the embedding's norm (no weight)
+        I.stage("embed", s);
+        for (int l = 0; l < NL; ++l) {
+            Layer& L = I.layers[(size_t) l];
+            q35_rms_rows(I.x, E, L.attn_norm, I.xn, nullptr, T, E, eps, s);
+            I.prep(I.xn, E, T);
+            I.mm(L.q, I.q_full);
+            I.mm(L.k, I.kcur);
+            I.mm(L.v, I.vcur);
+            I.mm(L.attn_gate, I.attn_gate_out);
+            I.stage("attn_qkv", s);
+            g4_attn_prep(I.q_full, I.kcur, I.vcur, T, H, HK, D, L.q_norm, L.k_norm, eps, I.rope_swa, nullptr, (int) p0,
+                         I.qcur, L.g4kv, s, L.swa ? 2 : 0, false);
+            g4_attn(I.qcur, L.g4kv, (int) p0, T, H, HK, D, L.swa ? I.n_swa : 0, 1.0f / sqrtf((float) D), I.attn,
+                    I.attn_scratch, s);
+            g4_sigmoid_mul(I.attn, I.attn_gate_out, (int64_t) T * H * D, s);
+            I.stage("attn_core", s);
+            I.prep(I.attn, H * D, T);
+            I.mm(L.o, I.mix);
+            q35_rms_rows(I.mix, E, L.post_norm, I.mix, nullptr, T, E, post_eps, s);
+            q35_add(I.x, I.mix, (int64_t) T * E, s);
+            I.stage("attn_out", s);
+            q35_rms_rows(I.x, E, L.ffn_pre_norm, I.xn, nullptr, T, E, eps, s);
+            I.prep(I.xn, E, T);
+            I.mm(L.ffn_gate, I.ffn_g);
+            I.mm(L.ffn_up, I.ffn_u);
+            dense_swiglu(I.ffn_g, I.ffn_u, I.ffn_h, (int64_t) T * cfg_.n_ff, s);
+            I.prep(I.ffn_h, cfg_.n_ff, T);
+            I.mm(L.ffn_down, I.mix);
+            q35_rms_rows(I.mix, E, L.post_ffw_norm, I.mix, nullptr, T, E, post_eps, s);
+            q35_add(I.x, I.mix, (int64_t) T * E, s);
+            I.stage("ffn", s);
+            if (I.df.on)   // the drafter's features: the residual at the input of its target layers
+                for (size_t j = 0; j < I.df.target_layers.size(); ++j)
+                    if (I.df.target_layers[j] == l + 1)
+                        cudaMemcpy2DAsync(I.df.feat + j * E, I.df.target_layers.size() * E * 4, I.x, (size_t) E * 4,
+                                          (size_t) E * 4, T, cudaMemcpyDeviceToDevice, s);
+        }
+        q35_rms_rows(I.x, E, I.output_norm, I.hn, nullptr, T, E, eps, s);
+        if (want != kNone) {
+            const int rows = want == kAll ? T : 1;
+            I.prep(want == kAll ? I.hn : I.hn + (size_t) (T - 1) * E, E, rows);
+            I.mm(I.head, I.logits);
+            g4_scale(I.logits, I.logit_scale, (int64_t) rows * cfg_.n_vocab, s);
+            if (I.softcap > 0.0f) g4_softcap(I.logits, cfg_.n_vocab, cfg_.n_vocab, rows, I.softcap, s);
+        }
+        I.stage("head", s);
+        I.prof_flush(T);
+        if (verify) pending_ = T;
+        else pos_ += T;
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("muse: ") + e.what();
         return false;
     }
 }

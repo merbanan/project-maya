@@ -43,7 +43,7 @@ __device__ __forceinline__ float gelu_tanh(float x) {
 __global__ void prep_kernel(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
                             int n_head, int n_kv, const float* __restrict__ q_norm, const float* __restrict__ k_norm,
                             float eps, float rope_base, const float* __restrict__ ff, int p0, float* __restrict__ q_out,
-                            G4Kv kv) {
+                            G4Kv kv, int rope_mode, int v_norm) {
     __shared__ float red[32];
     __shared__ float row[512];
     const int D = blockDim.x, t = blockIdx.x, hh = blockIdx.y, d = threadIdx.x, pos = p0 + t;
@@ -54,18 +54,29 @@ __global__ void prep_kernel(const float* __restrict__ q, const float* __restrict
     const float val = src[d];
     const float inv = rsqrtf(block_sum(val * val, red) / (float) D + eps);
     if (is_v) {
-        kv.v[((size_t) head * kv.max_ctx + pos) * D + d] = __half_as_ushort(__float2half(val * inv));
+        kv.v[((size_t) head * kv.max_ctx + pos) * D + d] = __half_as_ushort(__float2half(v_norm ? val * inv : val));
         return;
     }
     row[d] = val * inv * (is_q ? q_norm[d] : k_norm[d]);
     __syncthreads();
-    const int half = D / 2, pair = d < half ? d : d - half;
-    float theta = (float) pos * powf(rope_base, -2.0f * (float) pair / (float) D);
-    if (ff) theta /= ff[pair];
-    float s, c;
-    sincosf(theta, &s, &c);
-    const float a = row[pair], b = row[pair + half];
-    const float r = d < half ? a * c - b * s : a * s + b * c;
+    float r = row[d];
+    if (rope_mode == 1) {   // NeoX: (i, i + D / 2)
+        const int half = D / 2, pair = d < half ? d : d - half;
+        float theta = (float) pos * powf(rope_base, -2.0f * (float) pair / (float) D);
+        if (ff) theta /= ff[pair];
+        float s, c;
+        sincosf(theta, &s, &c);
+        const float a = row[pair], b = row[pair + half];
+        r = d < half ? a * c - b * s : a * s + b * c;
+    } else if (rope_mode == 2) {   // the plain form: (2 i, 2 i + 1)
+        const int pair = d >> 1;
+        float theta = (float) pos * powf(rope_base, -2.0f * (float) pair / (float) D);
+        if (ff) theta /= ff[pair];
+        float s, c;
+        sincosf(theta, &s, &c);
+        const float a = row[2 * pair], b = row[2 * pair + 1];
+        r = (d & 1) == 0 ? a * c - b * s : a * s + b * c;
+    }
     if (is_q) q_out[((size_t) t * n_head + head) * D + d] = r;
     else kv.k[((size_t) head * kv.max_ctx + pos) * D + d] = __half_as_ushort(__float2half(r));
 }
@@ -284,6 +295,10 @@ __global__ void add_scale_kernel(float* __restrict__ x, const float* __restrict_
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = (x[i] + y[i]) * s;
 }
+__global__ void sigmoid_mul_kernel(float* __restrict__ x, const float* __restrict__ g, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] *= 1.0f / (1.0f + __expf(-g[i]));
+}
 __global__ void scale_kernel(float* __restrict__ x, float s, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] *= s;
@@ -303,7 +318,7 @@ template <int D, int G>
 __global__ void __launch_bounds__(128) dec_kernel(const float* __restrict__ q, G4Kv kv, int pos, int n_head, int window,
                                                   int kbase, int split_len, float scale, float* __restrict__ out,
                                                   float* __restrict__ part_o, float* __restrict__ part_ml, bool round_h) {
-    constexpr int PL = D / 32;   // dims a lane: 8 or 16 (lane l: dims 8 l' .. as uint4 chunks)
+    constexpr int PL = D / 32;   // dims a lane: 4, 8 or 16 (D 128: lane l the 4 dims 4 l ..; else chunks of 8)
     __shared__ float sm_m[4][G], sm_l[4][G];
     __shared__ float sm_o[4][G][D];
     const int kvh = blockIdx.x, split = blockIdx.y, n_split = gridDim.y;
@@ -311,15 +326,15 @@ __global__ void __launch_bounds__(128) dec_kernel(const float* __restrict__ q, G
     const int lo = window > 0 ? max(0, pos - window + 1) : 0;
     const int ks = max(lo, kbase + split * split_len), ke = min(pos + 1, kbase + (split + 1) * split_len);
     // the lane's dims: chunk c (8 halves) at c * 256 + lane * 8 (D 512: 2 chunks; D 256: 1)
+    auto dim = [&](int j) { return D == 128 ? lane * 4 + j : (j / 8) * 256 + lane * 8 + (j % 8); };   // lane's j-th dim
     float qv[G][PL];
 #pragma unroll
     for (int g = 0; g < G; ++g)
 #pragma unroll
-        for (int c = 0; c < PL / 8; ++c)
-#pragma unroll
-            for (int j = 0; j < 8; ++j)
-                qv[g][c * 8 + j] = round_h ? __half2float(__float2half(q[(size_t) (kvh * G + g) * D + c * 256 + lane * 8 + j] * scale))
-                                           : q[(size_t) (kvh * G + g) * D + c * 256 + lane * 8 + j] * scale;
+        for (int j = 0; j < PL; ++j) {
+            const float x = q[(size_t) (kvh * G + g) * D + dim(j)] * scale;
+            qv[g][j] = round_h ? __half2float(__float2half(x)) : x;
+        }
     float m[G], l[G], acc[G][PL];
 #pragma unroll
     for (int g = 0; g < G; ++g) {
@@ -332,17 +347,29 @@ __global__ void __launch_bounds__(128) dec_kernel(const float* __restrict__ q, G
         const __half* kr = (const __half*) kv.k + ((size_t) kvh * kv.max_ctx + key) * D;
         const __half* vr = (const __half*) kv.v + ((size_t) kvh * kv.max_ctx + key) * D;
         float kf[PL], vf[PL];
-#pragma unroll
-        for (int c = 0; c < PL / 8; ++c) {
-            const uint4 ku = __ldg((const uint4*) (kr + c * 256 + lane * 8));
-            const uint4 vu = __ldg((const uint4*) (vr + c * 256 + lane * 8));
+        if (D == 128) {
+            const uint2 ku = __ldg((const uint2*) (kr + lane * 4)), vu = __ldg((const uint2*) (vr + lane * 4));
             const __half2* k2 = (const __half2*) &ku;
             const __half2* v2 = (const __half2*) &vu;
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
+            for (int j = 0; j < 2; ++j) {
                 const float2 a = __half22float2(k2[j]), b = __half22float2(v2[j]);
-                kf[c * 8 + 2 * j] = a.x; kf[c * 8 + 2 * j + 1] = a.y;
-                vf[c * 8 + 2 * j] = b.x; vf[c * 8 + 2 * j + 1] = b.y;
+                kf[2 * j] = a.x; kf[2 * j + 1] = a.y;
+                vf[2 * j] = b.x; vf[2 * j + 1] = b.y;
+            }
+        } else {
+#pragma unroll
+            for (int c = 0; c < (PL >= 8 ? PL / 8 : 1); ++c) {
+                const uint4 ku = __ldg((const uint4*) (kr + c * 256 + lane * 8));
+                const uint4 vu = __ldg((const uint4*) (vr + c * 256 + lane * 8));
+                const __half2* k2 = (const __half2*) &ku;
+                const __half2* v2 = (const __half2*) &vu;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 a = __half22float2(k2[j]), b = __half22float2(v2[j]);
+                    kf[c * 8 + 2 * j] = a.x; kf[c * 8 + 2 * j + 1] = a.y;
+                    vf[c * 8 + 2 * j] = b.x; vf[c * 8 + 2 * j + 1] = b.y;
+                }
             }
         }
 #pragma unroll
@@ -367,9 +394,7 @@ __global__ void __launch_bounds__(128) dec_kernel(const float* __restrict__ q, G
 #pragma unroll
     for (int g = 0; g < G; ++g)
 #pragma unroll
-        for (int c = 0; c < PL / 8; ++c)
-#pragma unroll
-            for (int j = 0; j < 8; ++j) sm_o[w][g][c * 256 + lane * 8 + j] = acc[g][c * 8 + j];
+        for (int j = 0; j < PL; ++j) sm_o[w][g][dim(j)] = acc[g][j];
     __syncthreads();
     for (int i = threadIdx.x; i < G * D; i += 128) {
         const int g = i / D, d = i % D;
@@ -449,11 +474,11 @@ void launch_attn(const float* q, const G4Kv& kv, int p0, int T, int n_head, int 
 
 void g4_attn_prep(const float* q, const float* k, const float* v, int T, int n_head, int n_kv, int D,
                   const float* q_norm, const float* k_norm, float eps, float rope_base, const float* ff, int p0,
-                  float* q_out, const G4Kv& kv, void* stream) {
-    if (D != 256 && D != 512) throw std::invalid_argument("g4_attn_prep: head size 256 or 512");
+                  float* q_out, const G4Kv& kv, void* stream, int rope_mode, bool v_norm) {
+    if (D != 128 && D != 256 && D != 512) throw std::invalid_argument("g4_attn_prep: head size 128, 256 or 512");
     const int heads = n_head + (kv.k ? 2 * n_kv : 0);
     prep_kernel<<<dim3(T, heads), D, 0, (cudaStream_t) stream>>>(q, k, v, n_head, n_kv, q_norm, k_norm, eps, rope_base,
-                                                                 ff, p0, q_out, kv);
+                                                                 ff, p0, q_out, kv, rope_mode, v_norm ? 1 : 0);
     check("g4_attn_prep");
 }
 
@@ -464,9 +489,11 @@ int64_t g4_attn_scratch_floats(int T, int n_head, int D, int max_ctx) {
 
 void g4_attn(const float* q, const G4Kv& kv, int p0, int T, int n_head, int n_kv, int D, int window, float scale,
              float* out, float* scratch, void* stream) {
-    if (n_head % n_kv != 0 || n_head / n_kv > 8) throw std::invalid_argument("g4_attn: geometry");
+    if (n_head % n_kv != 0 || n_head / n_kv > 16) throw std::invalid_argument("g4_attn: geometry");
     cudaStream_t s = (cudaStream_t) stream;
     static const bool dec = std::getenv("STRATA_G4_DEC") == nullptr || std::atoi(std::getenv("STRATA_G4_DEC")) != 0;
+    if (T == 1 && dec && D == 128 && n_head / n_kv == 16)
+        return launch_dec<128, 16>(q, kv, p0, n_head, n_kv, window, scale, out, scratch, s);
     if (T == 1 && dec && (n_head / n_kv == 4 || n_head / n_kv == 2)) {   // one token: the split-K SIMT form
         if (n_head / n_kv == 4) {                                         // (the tile form pads the rows to 16+)
             if (D == 256) return launch_dec<256, 4>(q, kv, p0, n_head, n_kv, window, scale, out, scratch, s);
@@ -476,9 +503,10 @@ void g4_attn(const float* q, const G4Kv& kv, int p0, int T, int n_head, int n_kv
             if (D == 512) return launch_dec<512, 2>(q, kv, p0, n_head, n_kv, window, scale, out, scratch, s);
         }
     }
-    if (D == 256) launch_attn<256, 256, 4>(q, kv, p0, T, n_head, n_kv, window, scale, out, scratch, s);
+    if (D == 128) launch_attn<128, 128, 4>(q, kv, p0, T, n_head, n_kv, window, scale, out, scratch, s);
+    else if (D == 256) launch_attn<256, 256, 4>(q, kv, p0, T, n_head, n_kv, window, scale, out, scratch, s);
     else if (D == 512) launch_attn<512, 256, 2>(q, kv, p0, T, n_head, n_kv, window, scale, out, scratch, s);
-    else throw std::invalid_argument("g4_attn: head size 256 or 512");
+    else throw std::invalid_argument("g4_attn: head size 128, 256 or 512");
 }
 
 void g4_gelu_mul(const float* g, const float* u, float* out, int64_t n, void* stream) {
@@ -498,6 +526,10 @@ void g4_gelu_ple(float* g, const float* ple, int l, int n_layer, int T, void* st
 void g4_add_scale(float* x, const float* y, float s, int64_t n, void* stream) {
     add_scale_kernel<<<blocks(n, 256), 256, 0, (cudaStream_t) stream>>>(x, y, s, n);
     check("g4_add_scale");
+}
+void g4_sigmoid_mul(float* x, const float* g, int64_t n, void* stream) {
+    sigmoid_mul_kernel<<<blocks(n, 256), 256, 0, (cudaStream_t) stream>>>(x, g, n);
+    check("g4_sigmoid_mul");
 }
 void g4_scale(float* x, float s, int64_t n, void* stream) {
     scale_kernel<<<blocks(n, 256), 256, 0, (cudaStream_t) stream>>>(x, s, n);

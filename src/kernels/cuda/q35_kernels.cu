@@ -46,7 +46,7 @@ __global__ void rms_rows_kernel(const float* __restrict__ x, int ldx, const floa
     for (int i = threadIdx.x; i < cols; i += blockDim.x) acc += xr[i] * xr[i];
     const float scale = rsqrtf(block_sum(acc, sh) / (float) cols + eps);
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        const float v = xr[i] * scale * w[i];
+        const float v = xr[i] * scale * (w ? w[i] : 1.0f);   // (no weight: a plain rms norm)
         if (of) of[(size_t) blockIdx.x * cols + i] = v;
         if (oh) oh[(size_t) blockIdx.x * cols + i] = __float2half(v);
     }

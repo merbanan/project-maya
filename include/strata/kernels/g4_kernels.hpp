@@ -13,15 +13,16 @@ struct G4Kv {
     int max_ctx = 0;
 };
 
-/// T tokens at p0 + t: q heads (rows of n_head * D) rms * q_norm then NeoX rope over all D dims (theta = pos *
-/// base^(-2i/D) / ff[i], ff null: 1) -> q_out; with kv.k: k rows rms * k_norm + rope, v rows rms (no weight), both
-/// into the cache at their positions.  D 256 or 512.
+/// T tokens at p0 + t: q heads (rows of n_head * D) rms * q_norm then rope over all D dims (theta = pos *
+/// base^(-2i/D) / ff[i], ff null: 1; rope_mode 1 NeoX, 2 the plain (2i, 2i+1) pairs, 0 none) -> q_out; with kv.k:
+/// k rows rms * k_norm + rope, v rows (rms, no weight, when v_norm), both into the cache at their positions.
+/// D 128, 256 or 512.
 void g4_attn_prep(const float* q, const float* k, const float* v, int T, int n_head, int n_kv, int D,
                   const float* q_norm, const float* k_norm, float eps, float rope_base, const float* ff, int p0,
-                  float* q_out, const G4Kv& kv, void* stream);
+                  float* q_out, const G4Kv& kv, void* stream, int rope_mode = 1, bool v_norm = true);
 
 /// out rows (n_head * D) = softmax(scale q k^T) V over the cells [max(0, pos - window + 1), pos] (window 0: all);
-/// tensor cores, split over the keys when the rows are few.  n_head / n_kv <= 8.
+/// tensor cores, split over the keys when the rows are few.  n_head / n_kv <= 16.
 int64_t g4_attn_scratch_floats(int T, int n_head, int D, int max_ctx);
 void g4_attn(const float* q, const G4Kv& kv, int p0, int T, int n_head, int n_kv, int D, int window, float scale,
              float* out, float* scratch, void* stream);
@@ -36,6 +37,8 @@ void g4_ple(const float* proj, const float* tok, const float* w, float eps, int 
 void g4_gelu_ple(float* g, const float* ple, int l, int n_layer, int T, void* stream);
 /// x = (x + y) * s, n values
 void g4_add_scale(float* x, const float* y, float s, int64_t n, void* stream);
+/// x *= sigmoid(g), n values
+void g4_sigmoid_mul(float* x, const float* g, int64_t n, void* stream);
 /// x *= s, n values
 void g4_scale(float* x, float s, int64_t n, void* stream);
 /// x = cap * tanh(x / cap), rows of n (stride ld)

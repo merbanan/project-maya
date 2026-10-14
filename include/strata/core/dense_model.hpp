@@ -141,6 +141,8 @@ public:
 private:
     bool load_gemma4(int64_t max_context, std::string& err);                 ///< (after the files are indexed)
     bool forward_gemma4(const int32_t* tokens, int T, bool verify, int want, std::string& err);
+    bool load_muse(int64_t max_context, std::string& err);
+    bool forward_muse(const int32_t* tokens, int T, bool verify, int want, std::string& err);
     DenseConfig cfg_;
     int64_t max_context_ = 0, pos_ = 0;
     int pending_ = 0;                  ///< tokens of the last verify pass, waiting for commit()

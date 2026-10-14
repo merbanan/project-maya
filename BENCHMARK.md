@@ -83,6 +83,19 @@ target's K/V), `STRATA_DENSE_DRAFT=K`.
 | assistant, 3 drafts | | 152.0 / 150.3 (after 1.5K) | 2.69 / 2.64 |
 | assistant, 4 drafts | | 157.6 | 2.91 |
 
+## Muse Glimmer 30B - unsloth UD-Q4_K_XL (15.9 GB), `strata-dense` (2026-10-14)
+
+Dense, 52 layers (3 sliding-window + 1 global, NoPE), gated attention 32 / 2 heads of 128. Greedy tokens follow
+llama.cpp until a near-tie (llama margin 0.03-0.29). DFlash: the bundled `dflash-kquant.gguf` (5 layers, block 16;
+run with 8 rows), `STRATA_DENSE_DFLASH=dflash-kquant.gguf`.
+
+| Setting | Prompt (tok/s) | Decode (tok/s) | Notes |
+|---|---:|---:|---|
+| llama.cpp | 166 (29) / 774 (1.4K) / 826 (11K) | 37.4 / 37.2 / 36.8 | |
+| no drafts | 134 (29) / 981-1,008 (1.4K) / 1,156 (11K) | 34.8 / 33.5-35.1 (1.4K) | |
+| **DFlash, 7 drafts, 8 rows** | | **82.4** / 84.7 (after 1.4K) | 3.36 / 3.54 tokens a round, draft pass 5.1 ms |
+| DFlash, 7 drafts, 16 rows | | 63.5 | 3.54 tokens a round, draft pass 20.5 ms (the GEMM path) |
+
 ## DeepSeek-V4 Flash - antirez IQ2_XXS (80.8 GB), GLM fast path (`dsv4`)
 
 Fresh run 2026-10-14 (dsv4 6d39cfc: tensor-core prompt indexer and attention, parallel compressors), needles 3/3
