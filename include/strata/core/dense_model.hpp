@@ -48,7 +48,7 @@
 namespace strata::core {
 
 struct DenseConfig {
-    std::string arch;            ///< general.architecture ("qwen35")
+    std::string arch;            ///< general.architecture ("qwen35", "qwen35moe", "gemma4")
     int n_layer = 0, n_embd = 0, n_ff = 0, n_vocab = 0;
     int n_head = 0, n_head_kv = 0, head_dim = 0, n_rot = 0;
     int ssm_d_conv = 0, ssm_state = 0, ssm_k_heads = 0, ssm_v_heads = 0;
@@ -139,6 +139,8 @@ public:
     struct Impl;
 
 private:
+    bool load_gemma4(int64_t max_context, std::string& err);                 ///< (after the files are indexed)
+    bool forward_gemma4(const int32_t* tokens, int T, bool verify, int want, std::string& err);
     DenseConfig cfg_;
     int64_t max_context_ = 0, pos_ = 0;
     int pending_ = 0;                  ///< tokens of the last verify pass, waiting for commit()

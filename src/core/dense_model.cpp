@@ -5,6 +5,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/dense_kernels.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
+#include "strata/kernels/g4_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/q35_dflash.hpp"
 #include "strata/kernels/q35_kernels.hpp"
@@ -45,6 +46,7 @@ struct QMat {
     int type = -1;
     int n_in = 0, n_out = 0;
     bool packed = false;                            // in q35_mmtp's packed layout (else GGUF rows)
+    bool fp16_act = false;                          // FP16 activations at every width (no Q8_1: an unnormed input)
 };
 
 struct Layer {
@@ -72,6 +74,16 @@ struct Layer {
     int type_gate = -1, type_up = -1, type_down = -1;
     QMat sh_gate_m, sh_up, sh_down;
     QMat sh_gu;                                     // [gate rows | up rows] of the shared expert (one GEMV)
+    // Gemma 4: sliding-window (head 256) or full (head 512) attention, KV of its own or of layer kv_src; the FFN's
+    // pre / post norms; the per-layer input's gate and projection; the layer's output scale
+    int D = 0;
+    bool swa = false;
+    int kv_src = -1;
+    G4Kv g4kv;
+    float *ffn_pre_norm = nullptr, *post_ffw_norm = nullptr, *ple_norm = nullptr;
+    QMat inp_gate, ple_proj;
+    float *inp_gate_f = nullptr, *ple_proj_f = nullptr;   // (STRATA_G4_F32: the F32 rows, exact)
+    float out_scale = 1.0f;
     // the MTP (nextn) block's own
     QMat eh_proj;
     float *enorm = nullptr, *hnorm = nullptr, *head_norm = nullptr;
@@ -153,6 +165,28 @@ std::vector<uint8_t> f16_to_q8_0(const uint16_t* src, int64_t n_in, int64_t n_ou
     return out;
 }
 
+// F32 rows (n_out of n_in) -> Q8_0 blocks, the same rounding
+std::vector<uint8_t> f32_to_q8_0(const float* src, int64_t n_in, int64_t n_out) {
+    std::vector<uint8_t> out((size_t) (n_in / 32) * n_out * 34);
+    const int64_t nb = n_in / 32 * n_out;
+    const int nt = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    std::vector<std::thread> th;
+    for (int t = 0; t < nt; ++t)
+        th.emplace_back([&, t] {
+            for (int64_t b = t; b < nb; b += nt) {
+                float amax = 0.0f;
+                for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(src[b * 32 + i]));
+                const float d = amax / 127.0f, id = d ? 1.0f / d : 0.0f;
+                uint8_t* o = out.data() + b * 34;
+                const uint16_t dh = f32_to_f16(d);
+                std::memcpy(o, &dh, 2);
+                for (int i = 0; i < 32; ++i) o[2 + i] = (uint8_t) (int8_t) std::lround(src[b * 32 + i] * id);
+            }
+        });
+    for (auto& x : th) x.join();
+    return out;
+}
+
 // A tensor of one GGUF file, found by name across the shards.
 struct Found {
     const strata::GgufFile* file = nullptr;
@@ -188,6 +222,16 @@ struct DenseModel::Impl {
     int chunk = 512;                                // the largest T of a forward pass
     int max_in = 0;                                 // the widest input the activation conversions are sized for
     int kv_mode = 0;                                // the K / V cache: 0 FP16, 1 K8V4 (STRATA_DENSE_KV / --kv)
+
+    // Gemma 4: the per-layer embeddings (the token table, the model projection and its norm), rope bases, window
+    bool gemma = false;
+    int ple_dim = 0, n_swa = 0;
+    float rope_swa = 1e4f, softcap = 0.0f;
+    QMat ple_tok, ple_model;
+    float *ple_proj_norm = nullptr, *rope_freqs = nullptr;
+    float* ple_model_f = nullptr;                   // (STRATA_G4_F32)
+    bool g4_f32 = false;
+    float *ple_rows = nullptr, *ple_proj_out = nullptr, *ple = nullptr, *ple_g = nullptr;
 
     QMat embd;                                      // token_embd, on the device (rows dequantized per token)
     float* output_norm = nullptr;
@@ -430,7 +474,7 @@ struct DenseModel::Impl {
             }
             return;
         }
-        if (w.packed && cur_T < mmt_min && packed_dp4a && q35_mmtp_dp4a_supported(w.type)) {
+        if (w.packed && cur_T < mmt_min && packed_dp4a && !w.fp16_act && q35_mmtp_dp4a_supported(w.type)) {
             if (!q8_ready) { native_quantize_q8_1(cur_x, q8_1, cur_n, cur_T, stream); q8_ready = true; }
             q35_mmtp_dp4a(w.type, w.dev, q8_1, y, w.n_in, w.n_out, cur_T, mmt_part, stream);
             return;
@@ -440,7 +484,7 @@ struct DenseModel::Impl {
             q35_mmtp(w.type, w.dev, xh8, y, w.n_in, w.n_out, cur_T, mmt_part, stream);
             return;
         }
-        if (mmt_on && (cur_T >= mmt_min || mmt1) && q35_mmt_supported(w.type)) {
+        if (mmt_on && (cur_T >= mmt_min || mmt1 || w.fp16_act) && q35_mmt_supported(w.type)) {
             if (!h8_ready) { q35_mmt_prep(cur_x, cur_n, cur_T, xh8, stream); h8_ready = true; }
             q35_mmt(w.type, w.dev, xh8, y, w.n_in, w.n_out, cur_T, mmt_part, stream);
             return;
@@ -554,6 +598,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         if (!arch) { err = "dense model: missing general.architecture"; return false; }
         cfg_.arch = arch->s;
         const std::string a = cfg_.arch + ".";
+        if (cfg_.arch == "gemma4") return load_gemma4(max_context, err);
         if (cfg_.arch.rfind("qwen3", 0) != 0) {
             err = "dense model: architecture '" + cfg_.arch + "' is not a qwen35 dense model";
             return false;
@@ -1088,6 +1133,7 @@ bool DenseModel::forward(const int32_t* tokens, int T, bool verify, int want, st
     if (pos_ + T > max_context_) { err = "dense model: the context is full"; return false; }
     for (int t = 0; t < T; ++t)
         if (tokens[t] < 0 || tokens[t] >= cfg_.n_vocab) { err = "dense model: token id outside the vocabulary"; return false; }
+    if (I.gemma) return forward_gemma4(tokens, T, verify, want, err);
     cudaStream_t s = I.stream;
     const int C = cfg_.conv_channels(), V = cfg_.value_dim(), E = cfg_.n_embd;
     const int KH = cfg_.ssm_k_heads, VH = cfg_.ssm_v_heads;
@@ -1658,6 +1704,287 @@ bool DenseModel::ckpt_restore(int slot, int64_t pos, std::string& err) {
     pos_ = pos;
     pending_ = 0;
     return sync(err);
+}
+
+// ---------------------------------------------------------------------------------------------------- Gemma 4
+// llama.cpp src/models/gemma4.cpp (E2B / E4B: dense FFN, per-layer embeddings, shared K/V in the last layers)
+bool DenseModel::load_gemma4(int64_t max_context, std::string& err) {
+    Impl& I = *impl_;
+    I.gemma = true;
+    // GGUF rows by default: llama.cpp's dp4a GEMV at one token is faster here than the packed form and matches
+    // llama.cpp's greedy tokens (128 / 128); STRATA_DENSE_PACK=1 packs
+    if (!std::getenv("STRATA_DENSE_PACK")) I.pack_on = false;
+    const strata::GgufFile& g0 = *I.files.front();
+    const std::string a = "gemma4.";
+    int64_t v = 0;
+    auto need = [&](const char* key, int& dst) {
+        if (!meta_int(g0, a + key, v)) { err = std::string("gemma4: missing ") + a + key; return false; }
+        dst = (int) v;
+        return true;
+    };
+    int D_full = 0, D_swa = 0, shared = 0;
+    if (!need("block_count", cfg_.n_layer) || !need("embedding_length", cfg_.n_embd) ||
+        !need("feed_forward_length", cfg_.n_ff) || !need("attention.head_count", cfg_.n_head) ||
+        !need("attention.head_count_kv", cfg_.n_head_kv) || !need("attention.key_length", D_full) ||
+        !need("attention.key_length_swa", D_swa) || !need("attention.sliding_window", I.n_swa) ||
+        !need("embedding_length_per_layer_input", I.ple_dim))
+        return false;
+    if (meta_int(g0, a + "attention.shared_kv_layers", v)) shared = (int) v;
+    if (const auto* e = g0.get(a + "attention.layer_norm_rms_epsilon")) cfg_.rms_eps = (float) e->num();
+    if (const auto* e = g0.get(a + "rope.freq_base")) cfg_.rope_base = (float) e->num();
+    if (const auto* e = g0.get(a + "rope.freq_base_swa")) I.rope_swa = (float) e->num();
+    if (const auto* e = g0.get(a + "final_logit_softcapping")) I.softcap = (float) e->num();
+    if (const auto* e = g0.get("tokenizer.ggml.eos_token_id")) cfg_.eos_id = (int32_t) e->u;
+    const auto* pat = g0.get(a + "attention.sliding_window_pattern");
+    const int NL = cfg_.n_layer, E = cfg_.n_embd, H = cfg_.n_head, HK = cfg_.n_head_kv, P = I.ple_dim;
+    if (!pat || (int) pat->items.size() < NL) {
+        err = "gemma4: attention.sliding_window_pattern missing or short (the GGUF reader keeps 64 array items)";
+        return false;
+    }
+    if (P != 256 || (D_full != 256 && D_full != 512) || D_swa != 256 || H % HK || H / HK > 8 || E % 256 || cfg_.n_ff % 256) {
+        err = "gemma4: unsupported geometry (per-layer inputs of 256, heads 256 / 512, widths of 256)";
+        return false;
+    }
+    cfg_.head_dim = D_full;
+    cfg_.n_rot = D_full;
+    const Found* tok = I.find("token_embd.weight");
+    if (!tok || tok->tensor->shape.size() != 2 || tok->tensor->shape[0] != (uint64_t) E) {
+        err = "gemma4: token_embd.weight missing or not [n_embd, n_vocab]";
+        return false;
+    }
+    cfg_.n_vocab = (int) tok->tensor->shape[1];
+    max_context_ = max_context;
+    if (cudaStreamCreate(&I.stream) != cudaSuccess) { err = "gemma4: CUDA stream"; return false; }
+    const int kv_from = NL - shared;   // layers from here use the K/V of the last earlier layer of their kind
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    {
+        uint64_t kv_need = 0;
+        for (int l = 0; l < kv_from; ++l) kv_need += (uint64_t) 2 * HK * (pat->items[(size_t) l].u ? D_swa : D_full) * max_context * 2;
+        const uint64_t act = (uint64_t) I.chunk * (8ull * E + 4ull * cfg_.n_ff + 4ull * NL * P + 4ull * H * D_full) * 4 +
+                             (uint64_t) kMaxCols * cfg_.n_vocab * 4 + 1024ull * 1024 * 1024;
+        if ((uint64_t) free_b < kv_need + act) {
+            err = "gemma4: the K/V cache for a context of " + std::to_string(max_context) + " needs " +
+                  std::to_string(kv_need >> 20) + " MiB; " + std::to_string(free_b >> 20) + " MiB are free";
+            return false;
+        }
+        I.budget = (uint64_t) free_b - kv_need - act;
+    }
+    uint64_t total = 0;
+    // a float matrix (F32 / F16 / BF16) as Q8_0 rows
+    auto floatmat = [&](const std::string& n, int n_in, int n_out, QMat& out) {
+        const Found* f = I.find(n);
+        if (!f || f->tensor->shape.size() != 2 || f->tensor->shape[0] != (uint64_t) n_in || f->tensor->shape[1] != (uint64_t) n_out) {
+            err = "gemma4: " + n + " missing or not [" + std::to_string(n_in) + ", " + std::to_string(n_out) + "]";
+            return false;
+        }
+        if (f->tensor->type != kF32 && f->tensor->type != kF16 && f->tensor->type != kBF16)
+            return I.upload_mat(f, n, n_in, n_out, out, total, err);
+        const uint64_t cnt = (uint64_t) n_in * n_out;
+        std::vector<float> host(cnt);
+        const uint8_t* src = f->file->tensor_data(*f->tensor);
+        if (f->tensor->type == kF32) std::memcpy(host.data(), src, cnt * 4);
+        else if (f->tensor->type == kF16) strata::dequantize_f16(src, host.data(), (int) cnt);
+        else strata::dequantize_bf16(src, host.data(), (int) cnt);
+        const std::vector<uint8_t> q = f32_to_q8_0(host.data(), n_in, n_out);
+        void* dev = nullptr;
+        if (!I.alloc(&dev, q.size(), err, n.c_str())) return false;
+        cudaMemcpy(dev, q.data(), q.size(), cudaMemcpyHostToDevice);
+        out = QMat{dev, 8, n_in, n_out};
+        total += q.size();
+        return I.pack(out, true, err);
+    };
+    I.g4_f32 = std::getenv("STRATA_G4_F32") != nullptr;
+    I.layers.resize((size_t) NL);
+    for (int l = 0; l < NL; ++l) {
+        Layer& L = I.layers[(size_t) l];
+        const std::string p = "blk." + std::to_string(l) + ".";
+        L.attn = true;
+        L.swa = pat->items[(size_t) l].u != 0;
+        L.D = L.swa ? D_swa : D_full;
+        const int D = L.D;
+        if (l >= kv_from) {
+            L.kv_src = kv_from - (L.swa ? 2 : 1);
+            if (L.kv_src < 0 || I.layers[(size_t) L.kv_src].swa != L.swa) { err = "gemma4: shared K/V layer"; return false; }
+        }
+        if (!I.upload_floats(I.find(p + "attn_norm.weight"), p + "attn_norm.weight", E, &L.attn_norm, err) ||
+            !I.upload_floats(I.find(p + "post_attention_norm.weight"), p + "post_attention_norm.weight", E, &L.post_norm, err) ||
+            !I.upload_floats(I.find(p + "ffn_norm.weight"), p + "ffn_norm.weight", E, &L.ffn_pre_norm, err) ||
+            !I.upload_floats(I.find(p + "post_ffw_norm.weight"), p + "post_ffw_norm.weight", E, &L.post_ffw_norm, err) ||
+            !I.upload_floats(I.find(p + "post_norm.weight"), p + "post_norm.weight", E, &L.ple_norm, err) ||
+            !I.upload_floats(I.find(p + "attn_q_norm.weight"), p + "attn_q_norm.weight", D, &L.q_norm, err) ||
+            !I.upload_mat(I.find(p + "attn_q.weight"), p + "attn_q.weight", E, H * D, L.q, total, err) ||
+            !I.upload_mat(I.find(p + "attn_output.weight"), p + "attn_output.weight", H * D, E, L.o, total, err) ||
+            !I.upload_mat(I.find(p + "ffn_gate.weight"), p + "ffn_gate.weight", E, cfg_.n_ff, L.ffn_gate, total, err) ||
+            !I.upload_mat(I.find(p + "ffn_up.weight"), p + "ffn_up.weight", E, cfg_.n_ff, L.ffn_up, total, err) ||
+            !I.upload_mat(I.find(p + "ffn_down.weight"), p + "ffn_down.weight", cfg_.n_ff, E, L.ffn_down, total, err) ||
+            !floatmat(p + "inp_gate.weight", E, P, L.inp_gate) || !floatmat(p + "proj.weight", P, E, L.ple_proj))
+            return false;
+        L.inp_gate.fp16_act = L.ple_proj.fp16_act = true;   // (the residual stream: Q8_1 rows lose too much, measured)
+        if (I.g4_f32 && (!I.upload_floats(I.find(p + "inp_gate.weight"), p + "inp_gate.weight", (uint64_t) E * P, &L.inp_gate_f, err) ||
+                         !I.upload_floats(I.find(p + "proj.weight"), p + "proj.weight", (uint64_t) E * P, &L.ple_proj_f, err)))
+            return false;
+        if (L.kv_src < 0) {
+            if (!I.upload_floats(I.find(p + "attn_k_norm.weight"), p + "attn_k_norm.weight", D, &L.k_norm, err) ||
+                !I.upload_mat(I.find(p + "attn_k.weight"), p + "attn_k.weight", E, HK * D, L.k, total, err))
+                return false;
+            const Found* fv = I.find(p + "attn_v.weight");
+            if (fv && !I.upload_mat(fv, p + "attn_v.weight", E, HK * D, L.v, total, err)) return false;
+            if (!fv) L.v = L.k;   // (no v_proj: V is K's projection)
+            const uint64_t cells = (uint64_t) HK * max_context;
+            if (!I.alloc(&L.g4kv.k, cells * D * 2, err, "K cache") || !I.alloc(&L.g4kv.v, cells * D * 2, err, "V cache"))
+                return false;
+            L.g4kv.max_ctx = (int) max_context;
+            kv_bytes_ += cells * D * 4;
+        }
+        if (const Found* f = I.find(p + "layer_output_scale.weight")) L.out_scale = *(const float*) f->file->tensor_data(*f->tensor);
+    }
+    // the input and output side: the tied head reads token_embd's GGUF rows (the embedding rows are dequantized)
+    if (!I.upload_mat(tok, "token_embd.weight", E, cfg_.n_vocab, I.embd, total, err, false) ||
+        !I.upload_floats(I.find("output_norm.weight"), "output_norm.weight", E, &I.output_norm, err))
+        return false;
+    I.head = I.find("output.weight") ? QMat{} : I.embd;
+    if (const Found* h = I.find("output.weight"))
+        if (!I.upload_mat(h, "output.weight", E, cfg_.n_vocab, I.head, total, err, true, false)) return false;
+    I.head_draft = I.head;
+    {   // per-layer token embeddings: GGUF rows of NL * P (dequantized per token), the model projection, its norm
+        const Found* pt = I.find("per_layer_token_embd.weight");
+        if (!pt || !I.upload_mat(pt, "per_layer_token_embd.weight", NL * P, cfg_.n_vocab, I.ple_tok, total, err, false) ||
+            !floatmat("per_layer_model_proj.weight", E, NL * P, I.ple_model) ||
+            !I.upload_floats(I.find("per_layer_proj_norm.weight"), "per_layer_proj_norm.weight", P, &I.ple_proj_norm, err))
+            return false;
+        I.ple_model.fp16_act = true;
+        if (I.g4_f32 && !I.upload_floats(I.find("per_layer_model_proj.weight"), "per_layer_model_proj.weight",
+                                         (uint64_t) E * NL * P, &I.ple_model_f, err))
+            return false;
+        if (const Found* rf = I.find("rope_freqs.weight"))
+            if (!I.upload_floats(rf, "rope_freqs.weight", D_full / 2, &I.rope_freqs, err)) return false;
+    }
+    weight_bytes_ = total;
+    host_bytes_ = I.host_bytes;
+    // activations
+    const uint64_t R = (uint64_t) I.chunk, f = 4;
+    const int max_in = std::max({E, cfg_.n_ff, H * D_full, NL * P});
+    I.max_in = max_in;
+    bool ok = I.alloc(&I.q8_1, native_q8_1_bytes(max_in, kMaxCols), err, "q8_1 scratch") &&
+              I.alloc(&I.xh, R * max_in * 2, err, "fp16 activations") &&
+              I.alloc(&I.x, R * E * f, err, "x") && I.alloc(&I.xn, R * E * f, err, "xn") &&
+              I.alloc(&I.mix, R * E * f, err, "mix") && I.alloc(&I.hn, R * E * f, err, "hidden") &&
+              I.alloc(&I.q_full, R * H * D_full * f, err, "q") && I.alloc(&I.qcur, R * H * D_full * f, err, "qcur") &&
+              I.alloc(&I.kcur, R * HK * D_full * f, err, "kcur") && I.alloc(&I.vcur, R * HK * D_full * f, err, "vcur") &&
+              I.alloc(&I.attn, R * H * D_full * f, err, "attn") &&
+              I.alloc(&I.ffn_g, R * cfg_.n_ff * f, err, "ffn_g") && I.alloc(&I.ffn_u, R * cfg_.n_ff * f, err, "ffn_u") &&
+              I.alloc(&I.ffn_h, R * cfg_.n_ff * f, err, "ffn_h") &&
+              I.alloc(&I.ple_rows, R * NL * P * f, err, "ple") && I.alloc(&I.ple_proj_out, R * NL * P * f, err, "ple") &&
+              I.alloc(&I.ple, R * NL * P * f, err, "ple") && I.alloc(&I.ple_g, R * P * f, err, "ple") &&
+              I.alloc(&I.logits, (uint64_t) kMaxCols * cfg_.n_vocab * f, err, "logits") &&
+              I.alloc(&I.attn_scratch, (uint64_t) g4_attn_scratch_floats(kMaxCols, H, D_full, (int) max_context) * f, err,
+                      "attention scratch") &&
+              I.alloc(&I.tok_dev, R * 4, err, "tokens") &&
+              I.alloc(&I.xh8, (uint64_t) 8 * max_in * 2, err, "fp16 rows") &&
+              I.alloc(&I.mmt_part, (uint64_t) q35_mmt_part_floats(std::max({cfg_.n_vocab, cfg_.n_ff, NL * P})) * f, err,
+                      "GEMV partials");
+    if (!ok) return false;
+    if (!I.gemm.init(I.stream, std::max<int64_t>((int64_t) cfg_.n_ff * E, (int64_t) NL * P * E), err)) return false;
+    if (const char* e = std::getenv("STRATA_DENSE_MMT_MIN")) I.mmt_min = std::max(1, std::atoi(e));
+    if (const char* e = std::getenv("STRATA_DENSE_PACKED_DP4A")) I.packed_dp4a = std::atoi(e) != 0;
+    reset();
+    std::string serr;
+    if (!sync(serr)) { err = serr; return false; }
+    std::fprintf(stderr, "strata-dense: gemma4, %d layers (%d with their own K/V), heads %d / %d, window %d, %.2f GiB "
+                 "of weights, K/V %.2f GiB, prompt chunks of %d tokens\n", NL, kv_from, D_swa, D_full, I.n_swa,
+                 total / 1073741824.0, kv_bytes_ / 1073741824.0, I.chunk);
+    return true;
+}
+
+bool DenseModel::forward_gemma4(const int32_t* tokens, int T, bool verify, int want, std::string& err) {
+    Impl& I = *impl_;
+    cudaStream_t s = I.stream;
+    const int E = cfg_.n_embd, NL = cfg_.n_layer, H = cfg_.n_head, HK = cfg_.n_head_kv, P = I.ple_dim;
+    const float eps = cfg_.rms_eps;
+    const int64_t p0 = pos_;
+    try {
+        I.mark(s);
+        // embeddings * sqrt(E); the per-layer inputs: (rms(W_proj x / sqrt E) * w + ple_tok * sqrt P) / sqrt 2
+        for (int t = 0; t < T; ++t) {
+            dequant_f32(I.embd.type, I.embd.dev, tokens[t], 1, E, I.x + (size_t) t * E, s);
+            dequant_f32(I.ple_tok.type, I.ple_tok.dev, tokens[t], 1, (int64_t) NL * P, I.ple_rows + (size_t) t * NL * P, s);
+        }
+        g4_scale(I.x, sqrtf((float) E), (int64_t) T * E, s);
+        if (I.ple_model_f) q35_gemv_f32_cols(I.ple_model_f, I.x, E, I.ple_proj_out, E, NL * P, T, s);
+        else {
+            I.prep(I.x, E, T);
+            I.mm(I.ple_model, I.ple_proj_out);
+        }
+        g4_ple(I.ple_proj_out, I.ple_rows, I.ple_proj_norm, eps, E, NL, T, I.ple, s);
+        I.stage("embed", s);
+        for (int l = 0; l < NL; ++l) {
+            Layer& L = I.layers[(size_t) l];
+            const int D = L.D;
+            const Layer& KV = L.kv_src >= 0 ? I.layers[(size_t) L.kv_src] : L;
+            // attention: q (and k / v when the layer keeps its own), norms + rope, the core, the output projection
+            q35_rms_rows(I.x, E, L.attn_norm, I.xn, nullptr, T, E, eps, s);
+            I.prep(I.xn, E, T);
+            I.mm(L.q, I.q_full);
+            G4Kv kvw;   // (no k / v rows: the shared layers read their source's cache)
+            if (L.kv_src < 0) {
+                I.mm(L.k, I.kcur);
+                I.mm(L.v, I.vcur);
+                kvw = L.g4kv;
+            }
+            I.stage("attn_qkv", s);
+            g4_attn_prep(I.q_full, I.kcur, I.vcur, T, H, HK, D, L.q_norm, L.k_norm, eps, L.swa ? I.rope_swa : cfg_.rope_base,
+                         L.swa ? nullptr : I.rope_freqs, (int) p0, I.qcur, kvw, s);
+            g4_attn(I.qcur, KV.g4kv, (int) p0, T, H, HK, D, L.swa ? I.n_swa : 0, 1.0f, I.attn, I.attn_scratch, s);
+            I.stage("attn_core", s);
+            I.prep(I.attn, H * D, T);
+            I.mm(L.o, I.mix);
+            q35_rms_rows(I.mix, E, L.post_norm, I.mix, nullptr, T, E, eps, s);
+            q35_add(I.x, I.mix, (int64_t) T * E, s);
+            I.stage("attn_out", s);
+            // the FFN: x += post_ffw_norm(down(gelu(gate) * up)) of ffn_norm(x)
+            q35_rms_rows(I.x, E, L.ffn_pre_norm, I.xn, nullptr, T, E, eps, s);
+            I.prep(I.xn, E, T);
+            I.mm(L.ffn_gate, I.ffn_g);
+            I.mm(L.ffn_up, I.ffn_u);
+            g4_gelu_mul(I.ffn_g, I.ffn_u, I.ffn_h, (int64_t) T * cfg_.n_ff, s);
+            I.prep(I.ffn_h, cfg_.n_ff, T);
+            I.mm(L.ffn_down, I.mix);
+            q35_rms_rows(I.mix, E, L.post_ffw_norm, I.mix, nullptr, T, E, eps, s);
+            q35_add(I.x, I.mix, (int64_t) T * E, s);
+            I.stage("ffn", s);
+            // the per-layer input: x = (x + post_norm(proj(gelu(inp_gate x) * ple_l))) * out_scale
+            if (L.inp_gate_f) q35_gemv_f32_cols(L.inp_gate_f, I.x, E, I.ple_g, E, P, T, s);
+            else {
+                I.prep(I.x, E, T);
+                I.mm(L.inp_gate, I.ple_g);
+            }
+            g4_gelu_ple(I.ple_g, I.ple, l, NL, T, s);
+            if (L.ple_proj_f) q35_gemv_f32_cols(L.ple_proj_f, I.ple_g, P, I.mix, P, E, T, s);
+            else {
+                I.prep(I.ple_g, P, T);
+                I.mm(L.ple_proj, I.mix);
+            }
+            q35_rms_rows(I.mix, E, L.ple_norm, I.mix, nullptr, T, E, eps, s);
+            g4_add_scale(I.x, I.mix, L.out_scale, (int64_t) T * E, s);
+            I.stage("ple", s);
+        }
+        q35_rms_rows(I.x, E, I.output_norm, I.hn, nullptr, T, E, eps, s);
+        if (want != kNone) {
+            const int rows = want == kAll ? T : 1;
+            I.prep(want == kAll ? I.hn : I.hn + (size_t) (T - 1) * E, E, rows);
+            I.mm(I.head, I.logits);
+            if (I.softcap > 0.0f) g4_softcap(I.logits, cfg_.n_vocab, cfg_.n_vocab, rows, I.softcap, s);
+        }
+        I.stage("head", s);
+        I.prof_flush(T);
+        if (verify) pending_ = T;
+        else pos_ += T;
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("gemma4: ") + e.what();
+        return false;
+    }
 }
 
 }  // namespace strata::core

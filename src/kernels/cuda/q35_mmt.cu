@@ -483,16 +483,19 @@ template <int TYPE> __device__ __forceinline__ float sb_dot(const uint32_t* w, c
         for (int j = 0; j < 8; ++j) {
             const int* u; float d8, s8;
             q8b(xq, sb * 8 + j, u, d8, s8);
-            int sumi = 0;
+            int sumi = 0, sumu = 0;   // (the min term: the quantized inputs' sum, as llama.cpp's - the FP16 sum of
+                                       // the original inputs rounds too coarsely on large activations, measured)
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 uint32_t v = (w[QS + 8 * (j / 2) + i] >> (4 * (j & 1))) & 0x0f0f0f0fu;
                 if (TYPE == 13) v |= ((w[4 + i] >> j) & 0x01010101u) << 4;
                 sumi = __dp4a((int) v, u[i], sumi);
+                sumu = __dp4a(0x01010101, u[i], sumu);
             }
+            (void) s8;
             int sc, m;
             k4_scale_min(j, sc8, sc, m);
-            acc += d * (float) sc * d8 * (float) sumi - dm * (float) m * s8;
+            acc += d * (float) sc * d8 * (float) sumi - dm * (float) m * d8 * (float) sumu;
         }
     } else if (TYPE == 14) {   // Q6_K: ql[128], qh[64], scales[16] (int8), d
         const float d = __half2float(__ushort_as_half((unsigned short) (w[52] & 0xffff)));
