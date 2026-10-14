@@ -132,6 +132,22 @@ At 83.5% the expected tokens a round are 1.84 / 2.53 / 3.6 / 4.9: 0.38-0.87x on 
 A gain needs a multi-row token path (dense weights read once, the CPU lane over both rows): ~1.2x at best by the
 decode split (dense ~9 ms, experts ~23 ms a token).
 
+MTP speculative decode (dsv4 5a6bddc, `STRATA_DSV4_MTP=<GGUF>`; two rows a round, dense GEMVs shared by mv2,
+tokens = plain decode's with fixed tiers): 87-89% of drafts accepted, a round 55-59 ms (verify 51-55, drafts 3.1-3.6)
+for ~1.88 tokens. tools/d4mtp.py, 3 prompts x 256 tokens:
+
+| Setting | Plain (tok/s) | MTP spec (tok/s) |
+|---|---:|---:|
+| equal pools (`STRATA_GLM_VRAM_GB=27`) | 29.7 / 29.7 / 30.5 | **31.6 / 31.9 / 32.7** |
+| default pool, MTP experts Q4_K (3.81 GB kept out) | 31.4 / 31.4 / 32.6 | 32.1 / 31.6 / 33.3 |
+| default pool, MTP experts q3_k (2.95 GB) | 31.0 / 31.9 / 33.2 | 32.1 / 30.3 / 33.9 |
+| default pool, MTP experts q2_k (2.30 GB) | 31.7 / 31.7 / 33.0 | 32.9 / 30.0 / 34.1 |
+| 28K prompts | 26.3 / 26.3 / 26.3 | 26.5 / 24.2 / 25.8 |
+
+Round profile: dense GEMVs 10.3 ms (one row 10.0), MoE side 34.5 ms (one row 17.6: CPU-lane wait 14.3, fetch 6.1) -
+the expert pipeline is CPU-lane bound and costs both rows in full, so the gain is the shared dense reads minus the
+VRAM the MTP block takes from the pool: even at default settings.
+
 DSv4 decode profile at 2K (35.0 ms a token): CPU-lane wait 8.3, grouped output GEMVs 5.1, attention 3.6, expert
 fetch 3.5, q_b 3.2, expert gate/up + down 4.2, router + shared 1.8, projections 1.7, route 1.5, mHC 1.6. A Q8_0 GEMV
 with 2 / 4 / 8 loads a lane in flight: 27.5 / 27.5 / 26.5 tok/s vs 28.4-28.6 - slower, not kept.

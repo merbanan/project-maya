@@ -25,14 +25,14 @@ lives. Branches on the fork: `qwen38` (strata-dense: Qwen3.8-27B, Qwen3.6-35B-A3
 | Adaptive K (MTP) | done | default for MoE: 35B MTP K5 141 -> 168, K7 125 -> 172 tok/s; off for dense (27B -3%) |
 | Sampled-draft p/q acceptance (lithos) | done | MTP drafts sampled from q, exact min(1,p/q) + residual: 35B T0.6 148.7 -> 155.5, T1.0 130.1 -> 147.7 tok/s; default for MoE |
 | DSv4 prompt indexer on tensor cores | done | d4_index 11.2 -> 2.1 s, d4_attn 12.7 -> 6.0 s at 26K (6d39cfc) |
-| DSv4 MTP | done, opt-in (slower) | MTP block built (dsv4 0caeb94, STRATA_DSV4_MTP): 83.5% of drafts accepted, 1.81 ms a draft, trunk tokens unchanged (fixed tiers). Verify of 1 / 2 / 4 / 8 drafts: token path 1.95 / 2.75 / 4.44 / 8.05 steps, batched prompt path 4.61 / 4.60 / 4.78 / 5.53 (~150 ms fixed) -> 0.38-0.87x: speculation off. Needs a multi-row token path (~1.2x at best) |
+| DSv4 MTP | done, opt-in (even) | MTP block + speculative decode, two rows a round (dsv4 0caeb94, 5a6bddc; on with STRATA_DSV4_MTP): exact (384/384 tokens), 87-89% accepted. Equal pools 31.6-32.7 vs 29.7-30.5 tok/s (+6%); default pool even (32.1-32.3 vs 32.0-32.1, MTP experts q3_k/q2_k via STRATA_DSV4_MTP_EXPERTS), 28K even. The MoE side is CPU-lane bound and costs both rows |
 | Hy3 long-context attention | done | code-pair LUT (1d72f3b) + K fragments in registers (2f13857): 36.1 -> 33.5 ms at 66K |
 | Hy3 attention, V side in registers | done, opt-in | STRATA_GLM_GQA_REG=2 (cffeaaf): correct, 3.6x slower (60.3 vs 16.8 ms) - off |
 | Gemma head-512 prompt attention | done | 2,693 -> 3,826 (26K), 1,106 -> 1,993 (94K) tok/s, needles 3/3 (196cc14, 9a93286) |
 | GLM route (1Cat #1147 fused router top-k + quant) | done | router + shared gate/up one multi-GEMV, route + shared SwiGLU + Q8 one kernel; table reads parallel: moe_route 1.61-1.74 -> 1.52 ms (cb48441 / fd32e62) |
 | 1Cat mHC fusion (#1172/1166/1159) | present, measured | hc3 fused kernel vs the old form (STRATA_GLM_HC1=1), DSv4 2K: hc_attn + hc_ffn 1.60 vs 2.96 ms a token, decode 28.37 / 27.74 vs 27.65 / 27.07 tok/s, needles 3/3 |
 | 1Cat TC MLA prefill (#1125) | present | WMMA MLA prompt attention on by default |
-| 1Cat verify-row reuse (#1142/1157) | n/a | DSv4 MTP verify loses (above); no GLM MTP on this box |
+| 1Cat verify-row reuse (#1142/1157) | done (DSv4) | the DSv4 verify keeps an accepted row's state (no recompute); a rejected row only has its compressor windows put back (5a6bddc) |
 | project-maya #92 / #131 / #132 / #118 | done | picked onto hy3 / dsv4 / qwen38; #118 opt-in |
 | Expert prefetch / fetch overlap (FreeToken, ox-boost) | done, opt-in | STRATA_GLM_PREFETCH_N / _RANK / _AT, STRATA_GLM_FETCH_OVERLAP / _PRIO: all slower here (Hy3 20.2-21.8 vs 22.5 tok/s) |
 | FreeToken CPU-vs-PCIe decision per miss | present | CPU lane calibration (0.13 ms CPU vs 0.55 ms PCIe an expert) |
