@@ -1501,6 +1501,18 @@ __device__ __forceinline__ void dec32(const R32& r, const float* lv, __half2* o)
     }
 }
 
+// mma.sync.m8n8k4 (sm_70) .row.col f16 x f16 -> f32, the layout measured on a V100 (the qwen38 branch's probe/mma884.cu):
+// 4 quadpairs (lanes 4q..4q+3, 16+4q..16+4q+3), each an 8x8x4 product; lane L owns A row (L % 4) + 4 (L >= 16) and
+// B column L; its c0..c7 are (A row of lane r, B column of lane c) for r in {b + (j & 1) + 16 hi, +2},
+// c in {b + (j & 2), +1, +16, +17} (j = L % 4, hi = L >= 16, b = 4 (L / 4 % 4)) in the order (r0,c0) (r0,c1) (r1,c0)
+// (r1,c1) (r0,c2) (r0,c3) (r1,c2) (r1,c3)
+__device__ __forceinline__ void mma884(float* c, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+                 "{%0,%1,%2,%3,%4,%5,%6,%7};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+}
+
 // the same 32 values through a table of code PAIRS (FP16 half2 of the two codebook values): one shared-memory load a
 // pair and one half2 multiply by the scale, instead of two loads, two multiplies and a conversion - the decode is
 // this kernel's limit (memory: every K/V format at ~370 G values/s).  T6: 6 + 6 bits (4096 entries), T4: 4 + 4 (256),
@@ -1545,7 +1557,8 @@ __device__ __forceinline__ void build_lut(__half2* lut, const float* cb, int t, 
 constexpr int kMT = 128, kMLdQ = kD + 8, kMLdB = 32 + 8, kMLdS = kMT + 4, kMLdP = kMT + 8;
 template <int KK, int VK, bool QS, bool PS>
 __global__ void __launch_bounds__(128) gqa_attn_mma_kernel(const float* __restrict__ q, GqaKv kv, int n_pos,
-                                                           float scale, int chunk, float* __restrict__ part, int use_lut) {
+                                                           float scale, int chunk, float* __restrict__ part, int use_lut,
+                                                           int use_reg) {
     using namespace nvcuda;
     constexpr int G = 8;
     __shared__ __align__(32) __half sqh[(QS ? 2 : 1) * G * kMLdQ];   // Q, FP16, [head][dim] (QS: then q - its FP16)
@@ -1591,6 +1604,48 @@ __global__ void __launch_bounds__(128) gqa_attn_mma_kernel(const float* __restri
             const int i = k0 + 32 * w + lane;
             const bool ok = i < k_hi && ks.ok(i);
             const uint8_t* bp = ok ? K.base(ks.pos(i)) : nullptr;
+            if (use_reg) {   // K straight from the lane's registers into mma.m8n8k4 (no shared-memory round trip)
+                float cr[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                const int g = (lane & 3) + ((lane >> 4) << 2);
+                const __half* qa = sqh + g * kMLdQ;
+#pragma unroll 1
+                for (int c = 0; c < kD / 32; ++c) {
+                    __half2 h[16];
+                    if (ok) {
+                        R32 r;
+                        ld32<KK>(K.codes(bp, kvh), K.scales(bp, kvh), c, r);
+                        if (lut_kind<KK>() && use_lut) dec32_lut<KK>(r, klut, h);
+                        else dec32<KK>(r, K.lv, h);
+                    } else {
+#pragma unroll
+                        for (int i = 0; i < 16; ++i) h[i] = __float2half2_rn(0.0f);
+                    }
+                    __syncwarp();   // (mma.sync.aligned: the whole warp, reconverged after the masked lanes' branch)
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const uint32_t b0 = *(const uint32_t*) &h[2 * i], b1 = *(const uint32_t*) &h[2 * i + 1];
+                        const uint2 av = *(const uint2*) (qa + 32 * c + 4 * i);
+                        mma884(cr, av.x, av.y, b0, b1);
+                        if (QS) {
+                            const uint2 al = *(const uint2*) (qa + G * kMLdQ + 32 * c + 4 * i);
+                            mma884(cr, al.x, al.y, b0, b1);
+                        }
+                    }
+                }
+                const int j = lane & 3, hi = lane >> 4, bb = 4 * ((lane >> 2) & 3);
+                const int r0 = bb + (j & 1) + 16 * hi, cc = bb + (j & 2);
+                const int rl[2] = {r0, r0 + 2}, cl[4] = {cc, cc + 1, cc + 16, cc + 17};
+                const int ci[8][2] = {{0, 0}, {0, 1}, {1, 0}, {1, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}};
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int rlane = rl[ci[i][0]], gg = (rlane & 3) + ((rlane >> 4) << 2);
+                    sS[gg * kMLdS + 32 * w + cl[ci[i][1]]] = cr[i];
+                }
+                __syncwarp();
+                if (!ok)
+#pragma unroll
+                    for (int gg = 0; gg < G; ++gg) sS[gg * kMLdS + 32 * w + lane] = -INFINITY;
+            } else {
             wmma::fragment<wmma::accumulator, 8, 32, 16, float> acc;
             wmma::fill_fragment(acc, 0.0f);
 #pragma unroll 1
@@ -1621,6 +1676,7 @@ __global__ void __launch_bounds__(128) gqa_attn_mma_kernel(const float* __restri
             if (!ok)
 #pragma unroll
                 for (int g = 0; g < G; ++g) sS[g * kMLdS + 32 * w + lane] = -INFINITY;
+            }
         }
         __syncthreads();
 #pragma unroll
@@ -1798,7 +1854,9 @@ bool gqa_attn(const float* q, const GqaKv& kv, int n_pos, int n_head, float* scr
         // as well changed nothing.  (DBG_MMA_SPLIT: 0 none, 1 q, 2 P, 3 both)
         static const int msplit = getenv("DBG_MMA_SPLIT") ? std::atoi(getenv("DBG_MMA_SPLIT")) : 1;
         static const int use_lut = getenv("STRATA_GLM_GQA_LUT") ? std::atoi(getenv("STRATA_GLM_GQA_LUT")) : 1;
-#define MMA2(a, b, x, y) gqa_attn_mma_kernel<a, b, x, y><<<grid, 128, 0, s>>>(q, kv, n_pos, sc, chunk, part, use_lut)
+        // the scores' K fragments from registers (mma.m8n8k4) instead of staged for wmma (STRATA_GLM_GQA_REG=0: wmma)
+        static const int use_reg = getenv("STRATA_GLM_GQA_REG") ? std::atoi(getenv("STRATA_GLM_GQA_REG")) : 1;
+#define MMA2(a, b, x, y) gqa_attn_mma_kernel<a, b, x, y><<<grid, 128, 0, s>>>(q, kv, n_pos, sc, chunk, part, use_lut, use_reg)
 #define MMA(a, b)                                                                                                    \
     do {                                                                                                             \
         if (msplit == 0) MMA2(a, b, false, false);                                                                    \
