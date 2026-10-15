@@ -10,7 +10,9 @@ namespace strata::kernels {
 struct G4Kv {
     uint16_t* k = nullptr;
     uint16_t* v = nullptr;
-    int max_ctx = 0;
+    int max_ctx = 0;   // cells a KV head
+    int ring = 0;      // > 0: a ring of `ring` (= max_ctx) cells, position p in cell p % ring (a sliding-window layer
+                       // that keeps the window and a chunk; the caller never reads a position the ring has dropped)
 };
 
 /// T tokens at p0 + t: q heads (rows of n_head * D) rms * q_norm then rope over all D dims (theta = pos *

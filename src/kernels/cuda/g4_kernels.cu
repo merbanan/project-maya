@@ -40,6 +40,9 @@ __device__ __forceinline__ float gelu_tanh(float x) {
 }
 
 // block (token, head), D threads: q / k: rms * weight, NeoX rope over D; v: rms
+// a cache position's cell: the position itself, or its slot in a ring of kv.ring cells (a sliding-window layer)
+__device__ __forceinline__ int g4_cell(const G4Kv& kv, int pos) { return kv.ring > 0 ? pos % kv.ring : pos; }
+
 __global__ void prep_kernel(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
                             int n_head, int n_kv, const float* __restrict__ q_norm, const float* __restrict__ k_norm,
                             float eps, float rope_base, const float* __restrict__ ff, int p0, float* __restrict__ q_out,
@@ -54,7 +57,7 @@ __global__ void prep_kernel(const float* __restrict__ q, const float* __restrict
     const float val = src[d];
     const float inv = rsqrtf(block_sum(val * val, red) / (float) D + eps);
     if (is_v) {
-        kv.v[((size_t) head * kv.max_ctx + pos) * D + d] = __half_as_ushort(__float2half(v_norm ? val * inv : val));
+        kv.v[((size_t) head * kv.max_ctx + g4_cell(kv, pos)) * D + d] = __half_as_ushort(__float2half(v_norm ? val * inv : val));
         return;
     }
     row[d] = val * inv * (is_q ? q_norm[d] : k_norm[d]);
@@ -78,7 +81,7 @@ __global__ void prep_kernel(const float* __restrict__ q, const float* __restrict
         r = (d & 1) == 0 ? a * c - b * s : a * s + b * c;
     }
     if (is_q) q_out[((size_t) t * n_head + head) * D + d] = r;
-    else kv.k[((size_t) head * kv.max_ctx + pos) * D + d] = __half_as_ushort(__float2half(r));
+    else kv.k[((size_t) head * kv.max_ctx + g4_cell(kv, pos)) * D + d] = __half_as_ushort(__float2half(r));
 }
 
 // ---- the attention: q35_kernels.cu's attn_tc_kernel, generic in the head size (AD), the output dims a block
@@ -144,13 +147,13 @@ __global__ void __launch_bounds__(AW * 32) attn_kernel(const float* __restrict__
         for (int i = tid; i < AK * (AD / 8); i += AW * 32) {
             const int r = i / (AD / 8), d = (i % (AD / 8)) * 8, key = k0 + r;
             uint4 v4 = make_uint4(0, 0, 0, 0);
-            if (key < ke) v4 = __ldg((const uint4*) (kv.k + ((size_t) kvh * kv.max_ctx + key) * AD + d));
+            if (key < ke) v4 = __ldg((const uint4*) (kv.k + ((size_t) kvh * kv.max_ctx + g4_cell(kv, key)) * AD + d));
             *(uint4*) (sK + r * LDQ + d) = v4;
         }
         for (int i = tid; i < AK * (VD / 8); i += AW * 32) {
             const int r = i / (VD / 8), d = (i % (VD / 8)) * 8, key = k0 + r;
             uint4 v4 = make_uint4(0, 0, 0, 0);
-            if (key < ke) v4 = __ldg((const uint4*) (kv.v + ((size_t) kvh * kv.max_ctx + key) * AD + voff + d));
+            if (key < ke) v4 = __ldg((const uint4*) (kv.v + ((size_t) kvh * kv.max_ctx + g4_cell(kv, key)) * AD + voff + d));
             *(uint4*) (sV + r * LDV + d) = v4;
         }
         __syncthreads();
@@ -344,8 +347,8 @@ __global__ void __launch_bounds__(128) dec_kernel(const float* __restrict__ q, G
         for (int j = 0; j < PL; ++j) acc[g][j] = 0.0f;
     }
     for (int key = ks + w; key < ke; key += 4) {
-        const __half* kr = (const __half*) kv.k + ((size_t) kvh * kv.max_ctx + key) * D;
-        const __half* vr = (const __half*) kv.v + ((size_t) kvh * kv.max_ctx + key) * D;
+        const __half* kr = (const __half*) kv.k + ((size_t) kvh * kv.max_ctx + g4_cell(kv, key)) * D;
+        const __half* vr = (const __half*) kv.v + ((size_t) kvh * kv.max_ctx + g4_cell(kv, key)) * D;
         float kf[PL], vf[PL];
         if (D == 128) {
             const uint2 ku = __ldg((const uint2*) (kr + lane * 4)), vu = __ldg((const uint2*) (vr + lane * 4));
@@ -500,7 +503,7 @@ __global__ void __launch_bounds__(128) attn512_kernel(const float* __restrict__ 
             const int r = i / (AD / 8), d = (i % (AD / 8)) * 8, key = k0 + r;
             uint4 kq = make_uint4(0, 0, 0, 0), vq = kq;
             if (key < ke) {
-                const size_t cell = ((size_t) kvh * kv.max_ctx + key) * AD + d;
+                const size_t cell = ((size_t) kvh * kv.max_ctx + g4_cell(kv, key)) * AD + d;
                 kq = __ldg((const uint4*) (kv.k + cell));
                 vq = __ldg((const uint4*) (kv.v + cell));
             }

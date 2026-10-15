@@ -994,6 +994,7 @@ void DenseModel::reset() {
         if (L.conv_state) cudaMemsetAsync(L.conv_state, 0, cbytes, I.stream);
     }
     if (I.df.on) cudaMemsetAsync(I.df.ring_pos, 0xff, (size_t) I.df.window * 8, I.stream);   // the drafter's context
+    I.ring_hi = -1;
     pos_ = 0;
     pending_ = 0;
 }
@@ -1812,6 +1813,11 @@ bool DenseModel::ckpt_restore(int slot, int64_t pos, std::string& err) {
         err = "dense model: no such checkpoint";
         return false;
     }
+    // a sliding-window ring keeps positions (ring_hi - swa_ring, ring_hi]: the window behind `pos` must be among them
+    if (I.swa_ring > 0 && pos - I.n_swa <= I.ring_hi - I.swa_ring) {
+        err = "dense model: the checkpoint's window has left the sliding-window ring";
+        return false;
+    }
     const uint8_t* h = I.ckpt[(size_t) slot];
     for (auto& [p, b] : ckpt_parts(I, cfg_)) {
         cudaMemcpyAsync(p, h, b, cudaMemcpyHostToDevice, I.stream);
@@ -1842,9 +1848,18 @@ bool DenseModel::load_gemma4(int64_t max_context, std::string& err) {
     if (!need("block_count", cfg_.n_layer) || !need("embedding_length", cfg_.n_embd) ||
         !need("feed_forward_length", cfg_.n_ff) || !need("attention.head_count", cfg_.n_head) ||
         !need("attention.head_count_kv", cfg_.n_head_kv) || !need("attention.key_length", D_full) ||
-        !need("attention.key_length_swa", D_swa) || !need("attention.sliding_window", I.n_swa) ||
-        !need("embedding_length_per_layer_input", I.ple_dim))
+        !need("attention.key_length_swa", D_swa) || !need("attention.sliding_window", I.n_swa))
         return false;
+    // a sliding-window layer's cells: the window, a prompt chunk and a verify window (a chunk writes its rows before it
+    // reads the window behind its first one), in steps of 256; the whole context when that is no smaller
+    // (STRATA_DENSE_SWA_RING=0: always the whole context)
+    auto swa_cells = [&](int64_t max_context) -> int64_t {
+        static const bool ring_on = !std::getenv("STRATA_DENSE_SWA_RING") || std::atoi(std::getenv("STRATA_DENSE_SWA_RING")) != 0;
+        const int64_t r = ((int64_t) I.n_swa + I.chunk + kMaxCols + 255) / 256 * 256;
+        return ring_on && r < max_context ? r : max_context;
+    };
+    // (the E-series' per-layer inputs; the 31B has none)
+    I.ple_dim = meta_int(g0, a + "embedding_length_per_layer_input", v) ? (int) v : 0;
     if (meta_int(g0, a + "attention.shared_kv_layers", v)) shared = (int) v;
     if (const auto* e = g0.get(a + "attention.layer_norm_rms_epsilon")) cfg_.rms_eps = (float) e->num();
     if (const auto* e = g0.get(a + "rope.freq_base")) cfg_.rope_base = (float) e->num();
@@ -1857,8 +1872,20 @@ bool DenseModel::load_gemma4(int64_t max_context, std::string& err) {
         err = "gemma4: attention.sliding_window_pattern missing or short (the GGUF reader keeps 64 array items)";
         return false;
     }
-    if (P != 256 || (D_full != 256 && D_full != 512) || D_swa != 256 || H % HK || H / HK > 8 || E % 256 || cfg_.n_ff % 256) {
-        err = "gemma4: unsupported geometry (per-layer inputs of 256, heads 256 / 512, widths of 256)";
+    // K/V heads a layer: one number, or an array (the 31B: 16 on the sliding layers, 4 on the full ones)
+    std::vector<int> hk_of((size_t) NL, HK);
+    if (const auto* hkv = g0.get(a + "attention.head_count_kv"); hkv && (int) hkv->items.size() >= NL)
+        for (int l = 0; l < NL; ++l) hk_of[(size_t) l] = (int) hkv->items[(size_t) l].u;
+    int HK_max = 0;
+    for (int l = 0; l < NL; ++l) {
+        HK_max = std::max(HK_max, hk_of[(size_t) l]);
+        if (hk_of[(size_t) l] <= 0 || H % hk_of[(size_t) l] || H / hk_of[(size_t) l] > 8) {
+            err = "gemma4: layer " + std::to_string(l) + " has an unsupported K/V head count";
+            return false;
+        }
+    }
+    if ((P != 0 && P != 256) || (D_full != 256 && D_full != 512) || D_swa != 256 || E % 256 || cfg_.n_ff % 256) {
+        err = "gemma4: unsupported geometry (per-layer inputs of 256 or none, heads 256 / 512, widths of 256)";
         return false;
     }
     cfg_.head_dim = D_full;
@@ -1876,7 +1903,10 @@ bool DenseModel::load_gemma4(int64_t max_context, std::string& err) {
     cudaMemGetInfo(&free_b, &total_b);
     {
         uint64_t kv_need = 0;
-        for (int l = 0; l < kv_from; ++l) kv_need += (uint64_t) 2 * HK * (pat->items[(size_t) l].u ? D_swa : D_full) * max_context * 2;
+        for (int l = 0; l < kv_from; ++l) {
+            const bool sw = pat->items[(size_t) l].u != 0;
+            kv_need += (uint64_t) 2 * hk_of[(size_t) l] * (sw ? D_swa : D_full) * (sw ? swa_cells(max_context) : max_context) * 2;
+        }
         const uint64_t act = (uint64_t) I.chunk * (8ull * E + 4ull * cfg_.n_ff + 4ull * NL * P + 4ull * H * D_full) * 4 +
                              (uint64_t) kMaxCols * cfg_.n_vocab * 4 + 1024ull * 1024 * 1024;
         if ((uint64_t) free_b < kv_need + act) {
@@ -1918,7 +1948,8 @@ bool DenseModel::load_gemma4(int64_t max_context, std::string& err) {
         L.attn = true;
         L.swa = pat->items[(size_t) l].u != 0;
         L.D = L.swa ? D_swa : D_full;
-        const int D = L.D;
+        L.HK = hk_of[(size_t) l];
+        const int D = L.D, HK = L.HK;
         if (l >= kv_from) {
             L.kv_src = kv_from - (L.swa ? 2 : 1);
             if (L.kv_src < 0 || I.layers[(size_t) L.kv_src].swa != L.swa) { err = "gemma4: shared K/V layer"; return false; }
@@ -1927,17 +1958,18 @@ bool DenseModel::load_gemma4(int64_t max_context, std::string& err) {
             !I.upload_floats(I.find(p + "post_attention_norm.weight"), p + "post_attention_norm.weight", E, &L.post_norm, err) ||
             !I.upload_floats(I.find(p + "ffn_norm.weight"), p + "ffn_norm.weight", E, &L.ffn_pre_norm, err) ||
             !I.upload_floats(I.find(p + "post_ffw_norm.weight"), p + "post_ffw_norm.weight", E, &L.post_ffw_norm, err) ||
-            !I.upload_floats(I.find(p + "post_norm.weight"), p + "post_norm.weight", E, &L.ple_norm, err) ||
             !I.upload_floats(I.find(p + "attn_q_norm.weight"), p + "attn_q_norm.weight", D, &L.q_norm, err) ||
             !I.upload_mat(I.find(p + "attn_q.weight"), p + "attn_q.weight", E, H * D, L.q, total, err) ||
             !I.upload_mat(I.find(p + "attn_output.weight"), p + "attn_output.weight", H * D, E, L.o, total, err) ||
             !I.upload_mat(I.find(p + "ffn_gate.weight"), p + "ffn_gate.weight", E, cfg_.n_ff, L.ffn_gate, total, err) ||
             !I.upload_mat(I.find(p + "ffn_up.weight"), p + "ffn_up.weight", E, cfg_.n_ff, L.ffn_up, total, err) ||
-            !I.upload_mat(I.find(p + "ffn_down.weight"), p + "ffn_down.weight", cfg_.n_ff, E, L.ffn_down, total, err) ||
-            !floatmat(p + "inp_gate.weight", E, P, L.inp_gate) || !floatmat(p + "proj.weight", P, E, L.ple_proj))
+            !I.upload_mat(I.find(p + "ffn_down.weight"), p + "ffn_down.weight", cfg_.n_ff, E, L.ffn_down, total, err))
+            return false;
+        if (P > 0 && (!I.upload_floats(I.find(p + "post_norm.weight"), p + "post_norm.weight", E, &L.ple_norm, err) ||
+                      !floatmat(p + "inp_gate.weight", E, P, L.inp_gate) || !floatmat(p + "proj.weight", P, E, L.ple_proj)))
             return false;
         L.inp_gate.fp16_act = L.ple_proj.fp16_act = true;   // (the residual stream: Q8_1 rows lose too much, measured)
-        if (I.g4_f32 && (!I.upload_floats(I.find(p + "inp_gate.weight"), p + "inp_gate.weight", (uint64_t) E * P, &L.inp_gate_f, err) ||
+        if (P > 0 && I.g4_f32 && (!I.upload_floats(I.find(p + "inp_gate.weight"), p + "inp_gate.weight", (uint64_t) E * P, &L.inp_gate_f, err) ||
                          !I.upload_floats(I.find(p + "proj.weight"), p + "proj.weight", (uint64_t) E * P, &L.ple_proj_f, err)))
             return false;
         if (L.kv_src < 0) {
@@ -1947,10 +1979,14 @@ bool DenseModel::load_gemma4(int64_t max_context, std::string& err) {
             const Found* fv = I.find(p + "attn_v.weight");
             if (fv && !I.upload_mat(fv, p + "attn_v.weight", E, HK * D, L.v, total, err)) return false;
             if (!fv) L.v = L.k;   // (no v_proj: V is K's projection)
-            const uint64_t cells = (uint64_t) HK * max_context;
+            // a sliding-window layer keeps a ring of the window + a prompt chunk + a verify window (swa_cells)
+            const int64_t per = L.swa ? swa_cells(max_context) : max_context;
+            const uint64_t cells = (uint64_t) HK * per;
             if (!I.alloc(&L.g4kv.k, cells * D * 2, err, "K cache") || !I.alloc(&L.g4kv.v, cells * D * 2, err, "V cache"))
                 return false;
-            L.g4kv.max_ctx = (int) max_context;
+            L.g4kv.max_ctx = (int) per;
+            L.g4kv.ring = per < max_context ? (int) per : 0;
+            if (L.g4kv.ring) I.swa_ring = L.g4kv.ring;
             kv_bytes_ += cells * D * 4;
         }
         if (const Found* f = I.find(p + "layer_output_scale.weight")) L.out_scale = *(const float*) f->file->tensor_data(*f->tensor);
@@ -1963,7 +1999,9 @@ bool DenseModel::load_gemma4(int64_t max_context, std::string& err) {
     if (const Found* h = I.find("output.weight"))
         if (!I.upload_mat(h, "output.weight", E, cfg_.n_vocab, I.head, total, err, true, false)) return false;
     I.head_draft = I.head;
-    {   // per-layer token embeddings: GGUF rows of NL * P (dequantized per token), the model projection, its norm
+    if (const Found* rf = I.find("rope_freqs.weight"))
+        if (!I.upload_floats(rf, "rope_freqs.weight", D_full / 2, &I.rope_freqs, err)) return false;
+    if (P > 0) {   // per-layer token embeddings: GGUF rows of NL * P (dequantized per token), the model projection, its norm
         const Found* pt = I.find("per_layer_token_embd.weight");
         if (!pt || !I.upload_mat(pt, "per_layer_token_embd.weight", NL * P, cfg_.n_vocab, I.ple_tok, total, err, false) ||
             !floatmat("per_layer_model_proj.weight", E, NL * P, I.ple_model) ||
@@ -1973,8 +2011,6 @@ bool DenseModel::load_gemma4(int64_t max_context, std::string& err) {
         if (I.g4_f32 && !I.upload_floats(I.find("per_layer_model_proj.weight"), "per_layer_model_proj.weight",
                                          (uint64_t) E * NL * P, &I.ple_model_f, err))
             return false;
-        if (const Found* rf = I.find("rope_freqs.weight"))
-            if (!I.upload_floats(rf, "rope_freqs.weight", D_full / 2, &I.rope_freqs, err)) return false;
     }
     weight_bytes_ = total;
     host_bytes_ = I.host_bytes;
@@ -1987,12 +2023,12 @@ bool DenseModel::load_gemma4(int64_t max_context, std::string& err) {
               I.alloc(&I.x, R * E * f, err, "x") && I.alloc(&I.xn, R * E * f, err, "xn") &&
               I.alloc(&I.mix, R * E * f, err, "mix") && I.alloc(&I.hn, R * E * f, err, "hidden") &&
               I.alloc(&I.q_full, R * H * D_full * f, err, "q") && I.alloc(&I.qcur, R * H * D_full * f, err, "qcur") &&
-              I.alloc(&I.kcur, R * HK * D_full * f, err, "kcur") && I.alloc(&I.vcur, R * HK * D_full * f, err, "vcur") &&
+              I.alloc(&I.kcur, R * HK_max * D_full * f, err, "kcur") && I.alloc(&I.vcur, R * HK_max * D_full * f, err, "vcur") &&
               I.alloc(&I.attn, R * H * D_full * f, err, "attn") &&
               I.alloc(&I.ffn_g, R * cfg_.n_ff * f, err, "ffn_g") && I.alloc(&I.ffn_u, R * cfg_.n_ff * f, err, "ffn_u") &&
               I.alloc(&I.ffn_h, R * cfg_.n_ff * f, err, "ffn_h") &&
-              I.alloc(&I.ple_rows, R * NL * P * f, err, "ple") && I.alloc(&I.ple_proj_out, R * NL * P * f, err, "ple") &&
-              I.alloc(&I.ple, R * NL * P * f, err, "ple") && I.alloc(&I.ple_g, R * P * f, err, "ple") &&
+              (P == 0 || (I.alloc(&I.ple_rows, R * NL * P * f, err, "ple") && I.alloc(&I.ple_proj_out, R * NL * P * f, err, "ple") &&
+                          I.alloc(&I.ple, R * NL * P * f, err, "ple") && I.alloc(&I.ple_g, R * P * f, err, "ple"))) &&
               I.alloc(&I.logits, (uint64_t) kMaxCols * cfg_.n_vocab * f, err, "logits") &&
               I.alloc(&I.attn_scratch, (uint64_t) g4_attn_scratch_floats(kMaxCols, H, D_full, (int) max_context) * f, err,
                       "attention scratch") &&
@@ -2085,15 +2121,18 @@ bool DenseModel::forward_gemma4(const int32_t* tokens, int T, bool verify, int w
         // embeddings * sqrt(E); the per-layer inputs: (rms(W_proj x / sqrt E) * w + ple_tok * sqrt P) / sqrt 2
         for (int t = 0; t < T; ++t) {
             dequant_f32(I.embd.type, I.embd.dev, tokens[t], 1, E, I.x + (size_t) t * E, s);
-            dequant_f32(I.ple_tok.type, I.ple_tok.dev, tokens[t], 1, (int64_t) NL * P, I.ple_rows + (size_t) t * NL * P, s);
+            if (P > 0)
+                dequant_f32(I.ple_tok.type, I.ple_tok.dev, tokens[t], 1, (int64_t) NL * P, I.ple_rows + (size_t) t * NL * P, s);
         }
         g4_scale(I.x, sqrtf((float) E), (int64_t) T * E, s);
-        if (I.ple_model_f) q35_gemv_f32_cols(I.ple_model_f, I.x, E, I.ple_proj_out, E, NL * P, T, s);
-        else {
-            I.prep(I.x, E, T);
-            I.mm(I.ple_model, I.ple_proj_out);
+        if (P > 0) {
+            if (I.ple_model_f) q35_gemv_f32_cols(I.ple_model_f, I.x, E, I.ple_proj_out, E, NL * P, T, s);
+            else {
+                I.prep(I.x, E, T);
+                I.mm(I.ple_model, I.ple_proj_out);
+            }
+            g4_ple(I.ple_proj_out, I.ple_rows, I.ple_proj_norm, eps, E, NL, T, I.ple, s);
         }
-        g4_ple(I.ple_proj_out, I.ple_rows, I.ple_proj_norm, eps, E, NL, T, I.ple, s);
         I.stage("embed", s);
         for (int l = 0; l < NL; ++l) {
             Layer& L = I.layers[(size_t) l];
@@ -2110,9 +2149,9 @@ bool DenseModel::forward_gemma4(const int32_t* tokens, int T, bool verify, int w
                 kvw = L.g4kv;
             }
             I.stage("attn_qkv", s);
-            g4_attn_prep(I.q_full, I.kcur, I.vcur, T, H, HK, D, L.q_norm, L.k_norm, eps, L.swa ? I.rope_swa : cfg_.rope_base,
+            g4_attn_prep(I.q_full, I.kcur, I.vcur, T, H, KV.HK, D, L.q_norm, L.k_norm, eps, L.swa ? I.rope_swa : cfg_.rope_base,
                          L.swa ? nullptr : I.rope_freqs, (int) p0, I.qcur, kvw, s);
-            g4_attn(I.qcur, KV.g4kv, (int) p0, T, H, HK, D, L.swa ? I.n_swa : 0, 1.0f, I.attn, I.attn_scratch, s);
+            g4_attn(I.qcur, KV.g4kv, (int) p0, T, H, KV.HK, D, L.swa ? I.n_swa : 0, 1.0f, I.attn, I.attn_scratch, s);
             I.stage("attn_core", s);
             I.prep(I.attn, H * D, T);
             I.mm(L.o, I.mix);
@@ -2130,7 +2169,11 @@ bool DenseModel::forward_gemma4(const int32_t* tokens, int T, bool verify, int w
             q35_rms_rows(I.mix, E, L.post_ffw_norm, I.mix, nullptr, T, E, eps, s);
             q35_add(I.x, I.mix, (int64_t) T * E, s);
             I.stage("ffn", s);
-            // the per-layer input: x = (x + post_norm(proj(gelu(inp_gate x) * ple_l))) * out_scale
+            // the per-layer input: x = (x + post_norm(proj(gelu(inp_gate x) * ple_l))) * out_scale (none: x *= out_scale)
+            if (P == 0) {
+                if (L.out_scale != 1.0f) g4_scale(I.x, L.out_scale, (int64_t) T * E, s);
+                continue;
+            }
             if (L.inp_gate_f) q35_gemv_f32_cols(L.inp_gate_f, I.x, E, I.ple_g, E, P, T, s);
             else {
                 I.prep(I.x, E, T);
@@ -2155,6 +2198,7 @@ bool DenseModel::forward_gemma4(const int32_t* tokens, int T, bool verify, int w
         }
         I.stage("head", s);
         I.prof_flush(T);
+        I.ring_hi = std::max<int64_t>(I.ring_hi, p0 + T - 1);
         if (verify) pending_ = T;
         else pos_ += T;
         return true;
