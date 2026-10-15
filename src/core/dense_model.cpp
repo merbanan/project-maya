@@ -411,7 +411,7 @@ struct DenseModel::Impl {
     }
 
     bool upload_mat(const Found* f, const std::string& name, int n_in, int n_out, QMat& out, uint64_t& total,
-                    std::string& err, bool packable = true, bool wide = true) {
+                    std::string& err, bool packable = true, bool wide = true, bool host_only = false) {
         if (!f) { err = "dense model: missing tensor " + name; return false; }
         const strata::TensorInfo& t = *f->tensor;
         if (t.shape.size() != 2 || t.shape[0] != (uint64_t) n_in || t.shape[1] != (uint64_t) n_out) {
@@ -437,7 +437,7 @@ struct DenseModel::Impl {
         }
         void* dev = nullptr;
         cudaError_t s = cudaSuccess;
-        if (dev_used + bytes <= budget) {
+        if (!host_only && dev_used + bytes <= budget) {
             s = cudaMalloc(&dev, bytes);
             if (s == cudaSuccess) s = cudaMemcpy(dev, f->file->tensor_data(t), bytes, cudaMemcpyHostToDevice);
             if (s != cudaSuccess) {                 // the card is fuller than cudaMemGetInfo said: spill this one
@@ -462,8 +462,10 @@ struct DenseModel::Impl {
             }
             std::memcpy(host, f->file->tensor_data(t), bytes);
             host_allocs.push_back(host);
-            host_bytes += bytes;
-            ++host_tensors;
+            if (!host_only) {   // (the warning below is for matrices that did not fit, not ones placed there)
+                host_bytes += bytes;
+                ++host_tensors;
+            }
         }
         const bool in_vram = std::find(allocations.begin(), allocations.end(), dev) != allocations.end();
         out = QMat{dev, (int) t.type, n_in, n_out};
@@ -893,7 +895,12 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         }
 
         // ---- 4. the input and output side
-        if (!I.upload_mat(tok, "token_embd.weight", E, cfg_.n_vocab, I.embd, total, err, false)) return false;
+        // the embedding rows are read a token at a time (one row of E): pinned host memory (read over PCIe) when the
+        // head has its own matrix - 0.7-1.3 GB of VRAM for the KV cache (STRATA_DENSE_EMBD_HOST=0: in VRAM)
+        static const bool embd_host = !std::getenv("STRATA_DENSE_EMBD_HOST") || std::atoi(std::getenv("STRATA_DENSE_EMBD_HOST")) != 0;
+        const bool untied = I.find("output.weight") != nullptr;
+        if (!I.upload_mat(tok, "token_embd.weight", E, cfg_.n_vocab, I.embd, total, err, false, true, embd_host && untied))
+            return false;
         if (!I.upload_floats(I.find("output_norm.weight"), "output_norm.weight", E, &I.output_norm, err)) return false;
         const Found* head = I.find("output.weight");
         if (!head) head = tok;                                   // tied embeddings
@@ -901,8 +908,12 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                           I.head, total, err, head != tok, false))
             return false;
         I.head_draft = I.head;
-        if (const char* e = std::getenv("STRATA_DENSE_DRAFT_VOCAB")) {
-            const int dv = std::atoi(e);
+        // the draft head scores the first N vocabulary rows (STRATA_DENSE_DRAFT_VOCAB; 0: all): 32768 by default on the
+        // dense model (27B MTP3, two cooled rounds: 61.3 / 61.2 -> 63.4 / 63.4 tok/s, 2.56 -> 2.43 tokens a round;
+        // 65536 no gain; DFlash2 unchanged); the MoE keeps the whole vocabulary (not measured there)
+        {
+            const char* e = std::getenv("STRATA_DENSE_DRAFT_VOCAB");
+            const int dv = e ? std::atoi(e) : cfg_.n_expert == 0 ? 32768 : 0;
             if (dv > 0 && dv < cfg_.n_vocab) I.head_draft.n_out = dv / 128 * 128;   // (rows are contiguous blocks)
         }
         weight_bytes_ = total;
