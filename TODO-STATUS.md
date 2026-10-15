@@ -208,6 +208,7 @@ expected gain (guess = not measured), effort S/M/L. Ranked plan per engine; "mea
 | 3 | Port jmnargi's fp16tc kernel (WMMA m16n16k16, self-contained) into the existing group launch (prefill.cpp:3907-3927) for cc 7.0 + Q2_0 + chunk >= 2048, without the compact walk; check ggml's q8_1 Q2_0 layout; port prefill_fp16tc_test | MMQ dp4a | +15-25% on top of #2 | M |
 | 4 | Cherry-pick 2680b4de (mma884 prompt-attention pipeline; applies cleanly) | - | +1-2% at 16-32K | S |
 | 5 | strata-q36 FP16-TC experts for Q4_K/Q5_K (experts ~70% of a 4K prompt; bnk's unpack + register fragments) | pp512 1,685 | up to ~+40% | L |
+| 6 | bnk-style Flash-Next prompt experts v2: Q2_0 sub-blocks unpacked straight into register-resident mma.m8n8k4 fragments, one launch a layer for every (expert, 64-token, 64-row) tile, FP16 activations double-buffered (bnk moe_tc.cu 97b61ed: 32K 1,873 -> 2,782 tok/s on 2 V100s; their WMMA-via-smem variant = jmnargi's shape was slower, 2,412 vs 2,740) | after #3 | maybe +10-15% over #3 | L |
 
 ## Serving / tooling
 
