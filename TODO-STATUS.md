@@ -154,6 +154,29 @@ lives. Branches on the fork: `qwen38` (strata-dense: Qwen3.8-27B, Qwen3.6-35B-A3
 Each open review item was checked in the code of the branch it belongs to: present / partial / absent, cost today,
 expected gain (guess = not measured), effort S/M/L. Ranked plan per engine; "measure" steps come first.
 
+### Progress (2026-10-16; cooled, alternated A/B runs - see "Measuring" below)
+| Item | Result | Commit |
+|---|---|---|
+| Strata: Flash-Next --prefill auto | 6K prompt 665 -> 1,527 tok/s, 16.5K 658 -> 1,582, decode and tokens unchanged | v100 8466e942 (bench default) |
+| Strata: FP16 tensor-core prompt experts (jmnargi moe_fp16tc) | 6K 1,510 -> 1,750 / 1,737, 16.5K 1,591 -> 1,790 / 1,793 tok/s, same decode tokens, parity test passes | v100 952f4e81 |
+| strata-dense: GDN recurrence 4 warps a head (no spill) | plain 33.5 -> 33.8 tok/s, greedy = llama.cpp | qwen38 b4018bf |
+| strata-dense: commit of all GDN layers in two launches | commit 0.80 -> 0.46 ms (MTP3 59.6 -> 60.4), 1.37 -> 0.91 ms (DFlash2 93.0 -> 94.0) | qwen38 b4018bf |
+| strata-dense: CUDA-core decode attention (one-token steps) | 28K plain 29.8 -> 30.8 tok/s; kernel 28K 0.319 -> 0.254 ms, 90K 0.899 -> 0.666 ms a layer | qwen38 b4018bf |
+| strata-dense: Gemma SWA ring + Gemma 4 31B | 31B greedy = llama.cpp 64/64 (4K ctx); E4B 128/128, needles 3/3 at 28K, K/V 0.17 GiB | qwen38 d8e352d |
+| strata-dense: verify GEMV at 4-8 rows | measured (mmt_bench): packed TC 590-630 GB/s at M=4, 558-600 at M=8 - already near QPN8's 637; not pursued | - |
+| strata-dense: DFlash2 window (35B, 28K) | 2048 (default) 143.7 vs 8192 122.1 vs 16384 110.8 tok/s - default kept | - |
+| strata-dense: draft vocab 32K (27B) | first look MTP3 59.2 -> 62.3, DFlash2 unchanged; cooled A/B pending | - |
+| dsv4: MTP window row as K/V only | drafts 3.1 -> 2.0 ms a round, decode +4-6% (two cooled rounds), exact with fixed tiers | dsv4 2a4cc15 |
+| dsv4: prompt indexer split (26K) | q 0.2 s, score 1.24 s, top-k 0.05 s: the score kernel is the target (two-row kernel under test) | dsv4 2a4cc15 (timer) |
+| glm: PREFILL_SUB default 1024 on CUDA | 27K prompt 68.7 -> 67.2 / 67.6 s (shexp 3.03 -> 1.69 s) on glm-dflash; upstream's 4x is upstream-code-specific (open) | glm-dflash 0d75afc |
+| glm: DFlash2 verify width cap at 12K | --spec 2 / 3 / 4 / min-p 0.98 all 20-21 tok/s vs plain ~22: no width recovers 12K; short: +4-6% | - (no change) |
+| glm: turn snapshot at the last user token (trappsquid) | the live server saves 31-100K-token conversation slots; no per-request reuse log to show a gap - closed | - |
+
+**Measuring**: the V100 throttles under sustained load (clock 540-1000 MHz for minutes) and a server build during a run
+inflates every stage (~1.6x): runs start below 60 C (/media/per/work/llm/cool.sh), A/B arms alternate, a clock log is
+kept (clklog.sh), and nothing builds during a GPU run. The old "30K 28.5, 60K 13.6, 94K 9.1 tok/s" plain numbers were
+throttled: the attention kernel alone would allow ~24 tok/s at 90K (plain decode is weight-bound: ~30 ms a token).
+
 ### Already present - drop from the list
 - strata-dense: GDN verify by input replay (= SGLang #42388 idea; F32 per-token states would write ~1.2 GB a round - skip), conv window in registers, fp32 sigmoid / softplus, drafter KV ring (new rows only), suffix draft skips MTP, GPU top-k sampling, K8V4 read in place (byte_perm in registers), lazy rescale (covers the "fixed upper bound"), Gemma window-only split-K, reduced-vocab p/q (vocab is a prefix: no d2t scatter needed, q>0 checked, double precision).
 - GLM / Hy3: next-layer router prediction, staging banks = cache slots, shared expert folded into the routed launch, CPU/GPU split in moe_route + cpu_mask (#685/#665), miss-count-based CPU-vs-PCIe plan with runtime recalibration (#664), usage-profile / counts seeding, prefill expert-slot lending, THP + prefault + cudaHostRegister, O_DIRECT, window runs each distinct expert once for all verify rows, dp4a int32 + float scaling, KDA_SPLIT=8 option, DSA sparse MLA kernels, pooled index keys once.
