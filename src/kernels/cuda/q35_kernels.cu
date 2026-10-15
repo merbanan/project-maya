@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -133,6 +134,97 @@ __global__ void __launch_bounds__(128) gdn_seq_kernel(float* __restrict__ state,
 #pragma unroll
         for (int i = 0; i < S; ++i) state[((size_t) i * h_v + h) * S + j] = st[i];
     }
+}
+
+// block = (value head h, 32 state columns), 4 warps: warp w holds rows [32w, 32w + 32) of its lane's column (32
+// registers, no spill; the one-block-a-head form above needs all 128 and spills), the dot products are summed over
+// the warps through shared memory in a fixed order.  4x the blocks of gdn_seq_kernel (192 on the 27B), coalesced
+// state loads (a warp reads 32 consecutive columns of a row)
+__global__ void __launch_bounds__(128) gdn_seq4_kernel(float* __restrict__ state, const float* __restrict__ x, int ld,
+                                                       const float* __restrict__ g, const float* __restrict__ b, int ldg,
+                                                       float* __restrict__ o, int T, int h_k, int h_v, int commit) {
+    constexpr int S = 128, R = 32;
+    const int h = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5, kh = h % h_k;
+    const int j = blockIdx.y * 32 + lane, i0 = w * R;
+    __shared__ float sq[S], sk[S], rs[4][32], ra[4][32];
+    float st[R];
+#pragma unroll
+    for (int i = 0; i < R; ++i) st[i] = state[((size_t) (i0 + i) * h_v + h) * S + j];
+    const float qscale = 1.0f / sqrtf((float) S);
+    for (int t = 0; t < T; ++t) {
+        const float* xr = x + (size_t) t * ld;
+        __syncthreads();
+        sq[threadIdx.x] = xr[kh * S + threadIdx.x];
+        sk[threadIdx.x] = xr[h_k * S + kh * S + threadIdx.x];
+        __syncthreads();
+        const float v = xr[2 * h_k * S + h * S + j];
+        const float dec = expf(g[(size_t) t * ldg + h]);
+        const float beta = b[(size_t) t * ldg + h];
+        float p = 0.0f;
+#pragma unroll
+        for (int i = 0; i < R; ++i) { st[i] *= dec; p += st[i] * sk[i0 + i]; }
+        rs[w][lane] = p;
+        __syncthreads();
+        const float skd = ((rs[0][lane] + rs[1][lane]) + rs[2][lane]) + rs[3][lane];
+        const float d = (v - skd) * beta;
+        float acc = 0.0f;
+#pragma unroll
+        for (int i = 0; i < R; ++i) { st[i] += sk[i0 + i] * d; acc += st[i] * sq[i0 + i]; }
+        ra[w][lane] = acc;
+        __syncthreads();
+        if (w == 0) o[(size_t) t * h_v * S + h * S + j] = (((ra[0][lane] + ra[1][lane]) + ra[2][lane]) + ra[3][lane]) * qscale;
+    }
+    if (commit) {
+#pragma unroll
+        for (int i = 0; i < R; ++i) state[((size_t) (i0 + i) * h_v + h) * S + j] = st[i];
+    }
+}
+
+// ---- commit of every GDN layer in two launches (a verify window's kept n tokens): the conv states take the last 3
+// of [state | raw rows], the recurrence runs gdn_seq4's arithmetic over the stashed conv rows (no output)
+__global__ void commit_conv_kernel(const Q35CommitLayer* __restrict__ tab, int n, int C) {
+    const Q35CommitLayer& L = tab[blockIdx.y];
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float h[3] = {L.conv_state[c * 3], L.conv_state[c * 3 + 1], L.conv_state[c * 3 + 2]};
+    for (int t = 0; t < n; ++t) { h[0] = h[1]; h[1] = h[2]; h[2] = L.raw[(size_t) t * C + c]; }
+    L.conv_state[c * 3] = h[0]; L.conv_state[c * 3 + 1] = h[1]; L.conv_state[c * 3 + 2] = h[2];
+}
+__global__ void __launch_bounds__(128) commit_gdn_kernel(const Q35CommitLayer* __restrict__ tab, int n, int C, int h_k,
+                                                         int h_v) {
+    constexpr int S = 128, R = 32;
+    const Q35CommitLayer& L = tab[blockIdx.z];
+    float* __restrict__ state = L.state;
+    const float* __restrict__ x = L.conv;
+    const float* __restrict__ g = L.ab;
+    const float* __restrict__ b = L.ab + h_v;
+    const int ldg = 2 * h_v;
+    const int h = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5, kh = h % h_k;
+    const int j = blockIdx.y * 32 + lane, i0 = w * R;
+    __shared__ float sk[S], rs[4][32];
+    float st[R];
+#pragma unroll
+    for (int i = 0; i < R; ++i) st[i] = state[((size_t) (i0 + i) * h_v + h) * S + j];
+    for (int t = 0; t < n; ++t) {
+        const float* xr = x + (size_t) t * C;
+        __syncthreads();
+        sk[threadIdx.x] = xr[h_k * S + kh * S + threadIdx.x];
+        __syncthreads();
+        const float v = xr[2 * h_k * S + h * S + j];
+        const float dec = expf(g[(size_t) t * ldg + h]);
+        const float beta = b[(size_t) t * ldg + h];
+        float p = 0.0f;
+#pragma unroll
+        for (int i = 0; i < R; ++i) { st[i] *= dec; p += st[i] * sk[i0 + i]; }
+        rs[w][lane] = p;
+        __syncthreads();
+        const float skd = ((rs[0][lane] + rs[1][lane]) + rs[2][lane]) + rs[3][lane];
+        const float d = (v - skd) * beta;
+#pragma unroll
+        for (int i = 0; i < R; ++i) st[i] += sk[i0 + i] * d;
+    }
+#pragma unroll
+    for (int i = 0; i < R; ++i) state[((size_t) (i0 + i) * h_v + h) * S + j] = st[i];
 }
 
 // ------------------------------------------------------------------------------------------------ attention prep
@@ -446,6 +538,124 @@ __global__ void __launch_bounds__(AW * 32) attn_tc_kernel(const float* __restric
     }
 }
 
+// ---- decode / short verify (the tile kernel above fills 1 of its 4 warps with 6-48 rows and runs 1 block a SM):
+// block = (kv head, split, token t), 4 warps, warp w takes the split's keys w, w + 4, ..; lane l the dims 8 l .. 8 l + 7
+// of the G rows of token t (CUDA cores: q.k by a warp sum, the online softmax and O in registers), two keys in flight
+// a warp.  The warps fold through shared memory; partials in attn_tc_kernel's layout (attn_merge_kernel folds them).
+template <int MODE, int G>
+__global__ void __launch_bounds__(128) attn_dec_kernel(const float* __restrict__ q, Q35Kv kv, int p0, int n_head,
+                                                       int max_ctx, int split_len, float scale,
+                                                       const float* __restrict__ q_full, int ldq,
+                                                       float* __restrict__ out, float* __restrict__ part_o,
+                                                       float* __restrict__ part_ml) {
+    __shared__ float sm_m[4][G], sm_l[4][G];
+    __shared__ float sm_o[4][G][AD];
+    const int kvh = blockIdx.x, split = blockIdx.y, n_split = gridDim.y, t = blockIdx.z, T = gridDim.z;
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, n_kv = gridDim.x;
+    const int ks = split * split_len, ke = min(p0 + t + 1, ks + split_len);
+    const int qld = n_head * AD;
+    float qv[G][8];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        const float4* qp = (const float4*) (q + (size_t) t * qld + (size_t) (kvh * G + g) * AD + lane * 8);
+        const float4 a = qp[0], b = qp[1];
+        qv[g][0] = a.x * scale; qv[g][1] = a.y * scale; qv[g][2] = a.z * scale; qv[g][3] = a.w * scale;
+        qv[g][4] = b.x * scale; qv[g][5] = b.y * scale; qv[g][6] = b.z * scale; qv[g][7] = b.w * scale;
+    }
+    float m[G], l[G], acc[G][8];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        m[g] = -INFINITY; l[g] = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[g][j] = 0.0f;
+    }
+    auto load = [&](int key, uint4& kr, uint4& vr) {
+        const size_t cell = (size_t) kvh * max_ctx + key;
+        if (MODE == 0) {
+            kr = __ldg((const uint4*) ((const __half*) kv.k + cell * AD + lane * 8));
+            vr = __ldg((const uint4*) ((const __half*) kv.v + cell * AD + lane * 8));
+        } else {
+            const uint2 kc = __ldg((const uint2*) ((const int8_t*) kv.k + cell * AD + lane * 8));
+            kr = make_uint4(kc.x, kc.y, __ldg((const unsigned short*) kv.ks + cell * (AD / 32) + lane / 4), 0);
+            vr = make_uint4(__ldg((const uint32_t*) ((const uint8_t*) kv.v + cell * (AD / 2) + lane * 4)),
+                            __ldg((const unsigned short*) kv.vs + cell * (AD / 32) + lane / 4), 0, 0);
+        }
+    };
+    auto step = [&](uint4 kr, uint4 vr) {
+        if (MODE != 0) {
+            kr = deq_k8(make_uint2(kr.x, kr.y), __ushort_as_half((unsigned short) kr.z));
+            vr = deq_v4(vr.x, __ushort_as_half((unsigned short) vr.y));
+        }
+        float kf[8], vf[8];
+        const __half2* k2 = (const __half2*) &kr;
+        const __half2* v2 = (const __half2*) &vr;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 a = __half22float2(k2[j]), b = __half22float2(v2[j]);
+            kf[2 * j] = a.x; kf[2 * j + 1] = a.y; vf[2 * j] = b.x; vf[2 * j + 1] = b.y;
+        }
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            float sv = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) sv += qv[g][j] * kf[j];
+            sv = warp_sum(sv);
+            const float mn = fmaxf(m[g], sv), corr = __expf(m[g] - mn), p = __expf(sv - mn);
+            l[g] = l[g] * corr + p;
+            m[g] = mn;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) acc[g][j] = acc[g][j] * corr + p * vf[j];
+        }
+    };
+    int key = ks + w;
+    for (; key + 4 < ke; key += 8) {
+        uint4 k0, v0, k1, v1;
+        load(key, k0, v0);
+        load(key + 4, k1, v1);
+        step(k0, v0);
+        step(k1, v1);
+    }
+    if (key < ke) {
+        uint4 k0, v0;
+        load(key, k0, v0);
+        step(k0, v0);
+    }
+    if (lane == 0)
+#pragma unroll
+        for (int g = 0; g < G; ++g) { sm_m[w][g] = m[g]; sm_l[w][g] = l[g]; }
+#pragma unroll
+    for (int g = 0; g < G; ++g)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) sm_o[w][g][lane * 8 + j] = acc[g][j];
+    __syncthreads();
+    const int rows = T * G;
+    for (int i = threadIdx.x; i < G * AD; i += 128) {
+        const int g = i / AD, d = i % AD;
+        float M = -INFINITY;
+#pragma unroll
+        for (int ww = 0; ww < 4; ++ww) if (sm_l[ww][g] > 0.0f) M = fmaxf(M, sm_m[ww][g]);
+        float a = 0.0f, L = 0.0f;
+#pragma unroll
+        for (int ww = 0; ww < 4; ++ww) {
+            if (!(sm_l[ww][g] > 0.0f)) continue;
+            const float f = __expf(sm_m[ww][g] - M);
+            a += sm_o[ww][g][d] * f;
+            L += sm_l[ww][g] * f;
+        }
+        const int head = kvh * G + g, row = t * G + g;
+        if (n_split == 1) {
+            const float gt = q_full[(size_t) t * ldq + (size_t) head * 2 * AD + AD + d];
+            out[(size_t) t * qld + (size_t) head * AD + d] = (L > 0.0f ? a / L : 0.0f) * (MODE == 0 ? sigm(gt) : 1.0f);
+        } else {
+            part_o[(((size_t) split * n_kv + kvh) * rows + row) * AD + d] = a;
+            if (d == 0) {
+                part_ml[(((size_t) split * n_kv + kvh) * rows + row) * 2] = M;
+                part_ml[(((size_t) split * n_kv + kvh) * rows + row) * 2 + 1] = L;
+            }
+        }
+    }
+}
+
 // block = row, AD threads: fold the splits' partials, then the output gate
 __global__ void attn_merge_kernel(const float* __restrict__ part_o, const float* __restrict__ part_ml, int rows,
                                   int n_split, int G, int n_head, const float* __restrict__ q_full, int ldq,
@@ -582,8 +792,20 @@ void q35_gate_beta(float* alpha, float* beta, int ld, const float* dt, const flo
 void q35_gdn_seq(float* state, const float* x, int ld, const float* g, const float* b, int ldg, float* o, int T,
                  int h_k, int h_v, bool commit, void* stream) {
     if (T <= 0) return;
-    gdn_seq_kernel<<<h_v, 128, 0, (cudaStream_t) stream>>>(state, x, ld, g, b, ldg, o, T, h_k, h_v, commit);
+    static const bool old = std::getenv("STRATA_DENSE_GDN_OLD") && std::atoi(std::getenv("STRATA_DENSE_GDN_OLD")) != 0;
+    if (old)
+        gdn_seq_kernel<<<h_v, 128, 0, (cudaStream_t) stream>>>(state, x, ld, g, b, ldg, o, T, h_k, h_v, commit);
+    else
+        gdn_seq4_kernel<<<dim3(h_v, 4), 128, 0, (cudaStream_t) stream>>>(state, x, ld, g, b, ldg, o, T, h_k, h_v, commit);
     check("q35_gdn_seq");
+}
+
+void q35_commit_all(const Q35CommitLayer* tab_dev, int n_layers, int n, int C, int h_k, int h_v, void* stream) {
+    if (n <= 0 || n_layers <= 0) return;
+    commit_conv_kernel<<<dim3(blocks(C, 128), n_layers), 128, 0, (cudaStream_t) stream>>>(tab_dev, n, C);
+    check("q35_commit_conv");
+    commit_gdn_kernel<<<dim3(h_v, 4, n_layers), 128, 0, (cudaStream_t) stream>>>(tab_dev, n, C, h_k, h_v);
+    check("q35_commit_gdn");
 }
 
 void q35_gdn_out(const float* o, const float* z, const float* w, float* y, int rows, float eps, void* stream) {
@@ -607,7 +829,18 @@ void q35_attn_prep(const float* q_full, int ldq, const float* k, const float* v,
 
 namespace {
 constexpr int kSplitLen = 128;   // the shortest split (a decode step at a short context still spreads)
+int g_dec_max = -1;
 }
+
+// the CUDA-core decode kernel serves windows of up to this many tokens (STRATA_DENSE_ATTN_DEC, default below)
+int q35_attn_dec_max_tokens() {
+    if (g_dec_max < 0) {
+        const char* e = std::getenv("STRATA_DENSE_ATTN_DEC");
+        g_dec_max = e ? std::atoi(e) : 1;   // (one token: 28K plain decode 29.8 -> 30.8 tok/s; 2+ rows: the tile kernel)
+    }
+    return g_dec_max;
+}
+void q35_set_attn_dec_max_tokens(int n) { g_dec_max = n; }
 
 int64_t q35_attn_scratch_floats(int T, int n_head, int D, int max_ctx) {
     const int64_t splits = (max_ctx + kSplitLen - 1) / kSplitLen;
@@ -624,6 +857,37 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
     const int max_ctx = kv.max_ctx;
     const int G = n_head / n_kv, rows = T * G, tiles = (rows + AR - 1) / AR;
     const int n_keys = p0 + T;
+    if (G == 6 && splits <= 0 && T <= q35_attn_dec_max_tokens()) {
+        // the CUDA-core decode kernel: ~4 blocks a SM over (kv head, token), at least 64 keys a split
+        const int cap = (int) (q35_attn_scratch_floats(T, n_head, D, max_ctx) / ((int64_t) rows * n_kv * (D + 2)));
+        int n_split = std::max(1, std::min({320 / (n_kv * T), (n_keys + 63) / 64, cap}));
+        const int split_len = (n_keys + n_split - 1) / n_split;
+        n_split = (n_keys + split_len - 1) / split_len;
+        if ((int64_t) n_split * rows * n_kv * (D + 2) > q35_attn_scratch_floats(T, n_head, D, max_ctx))
+            throw std::runtime_error("q35_attn: scratch too small");
+        float* part_o = scratch;
+        float* part_ml = scratch + (size_t) n_split * rows * n_kv * D;
+        const dim3 grid(n_kv, n_split, T);
+        const float sc = 1.0f / sqrtf((float) D);
+        if (kv.mode == 0)
+            attn_dec_kernel<0, 6><<<grid, 128, 0, (cudaStream_t) stream>>>(q, kv, p0, n_head, max_ctx, split_len, sc, q_full,
+                                                                          ldq, out, part_o, part_ml);
+        else
+            attn_dec_kernel<1, 6><<<grid, 128, 0, (cudaStream_t) stream>>>(q, kv, p0, n_head, max_ctx, split_len, sc, q_full,
+                                                                          ldq, out, part_o, part_ml);
+        check("q35_attn_dec");
+        if (n_split > 1) {
+            attn_merge_kernel<<<dim3(rows, n_kv), D, 0, (cudaStream_t) stream>>>(part_o, part_ml, rows, n_split, G, n_head,
+                                                                                 q_full, ldq, out, p0, split_len,
+                                                                                 kv.mode == 0);
+            check("q35_attn_merge");
+        }
+        if (kv.mode != 0) {
+            unrotate_gate_kernel<<<dim3(T, n_head), 256, 0, (cudaStream_t) stream>>>(out, n_head, q_full, ldq);
+            check("q35_attn_unrotate");
+        }
+        return;
+    }
     // splits: enough blocks to fill the GPU when the rows are few
     int n_split = splits;
     if (n_split <= 0) {

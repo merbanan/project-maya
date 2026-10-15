@@ -272,6 +272,10 @@ struct DenseModel::Impl {
     float* logits = nullptr;                        // kMaxCols rows of n_vocab
     float* attn_scratch = nullptr;
     float* conv_dummy = nullptr;
+    int swa_ring = 0;          // Gemma: the sliding-window layers' ring cells (0: they hold the whole context)
+    int64_t ring_hi = -1;      // the highest position written into the rings since the last reset
+    strata::kernels::Q35CommitLayer* commit_tab = nullptr;   // device: the GDN layers' commit inputs (built once)
+    int commit_n = 0;
     int32_t* tok_dev = nullptr;
     // MoE (chunk x k pairs)
     float *moe_logits = nullptr, *moe_w = nullptr, *moe_g = nullptr, *moe_u = nullptr, *moe_y = nullptr, *moe_sh = nullptr;
@@ -1293,10 +1297,26 @@ bool DenseModel::commit(int n, std::string& err) {
     if (pending_ == 0 || n < 1 || n > pending_) { err = "dense model: commit without a matching verify pass"; return false; }
     const int C = cfg_.conv_channels(), KH = cfg_.ssm_k_heads, VH = cfg_.ssm_v_heads;
     try {
-        for (Layer& L : I.layers) {
-            if (L.attn) continue;
-            q35_conv_seq(L.conv_state, L.st_raw, C, L.conv_w, I.conv_dummy, n, C, true, I.stream);
-            q35_gdn_seq(L.state, L.st_conv, C, L.st_ab, L.st_ab + VH, 2 * VH, I.o, n, KH, VH, true, I.stream);
+        // STRATA_DENSE_COMMIT_OLD=1: a conv + recurrence launch a layer (96 on the 27B) instead of two for all
+        static const bool old = std::getenv("STRATA_DENSE_COMMIT_OLD") && std::atoi(std::getenv("STRATA_DENSE_COMMIT_OLD")) != 0;
+        if (!old && !I.commit_tab && I.commit_n >= 0) {
+            std::vector<strata::kernels::Q35CommitLayer> tab;
+            for (Layer& L : I.layers)
+                if (!L.attn) tab.push_back({L.conv_state, L.st_raw, L.state, L.st_conv, L.st_ab});
+            if (tab.empty()) I.commit_n = -1;   // (no GDN layer: nothing to commit)
+            else if (cudaMalloc(&I.commit_tab, tab.size() * sizeof(tab[0])) != cudaSuccess ||
+                cudaMemcpy(I.commit_tab, tab.data(), tab.size() * sizeof(tab[0]), cudaMemcpyHostToDevice) != cudaSuccess)
+                throw std::runtime_error("commit table");
+            if (!tab.empty()) I.commit_n = (int) tab.size();
+        }
+        if (!old) {
+            if (I.commit_n > 0) q35_commit_all(I.commit_tab, I.commit_n, n, C, KH, VH, I.stream);
+        } else {
+            for (Layer& L : I.layers) {
+                if (L.attn) continue;
+                q35_conv_seq(L.conv_state, L.st_raw, C, L.conv_w, I.conv_dummy, n, C, true, I.stream);
+                q35_gdn_seq(L.state, L.st_conv, C, L.st_ab, L.st_ab + VH, 2 * VH, I.o, n, KH, VH, true, I.stream);
+            }
         }
     } catch (const std::exception& e) {
         err = std::string("dense model: ") + e.what();

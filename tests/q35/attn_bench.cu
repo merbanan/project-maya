@@ -46,26 +46,33 @@ int main(int argc, char** argv) {
     for (auto& x : h) x = nd(rng) * 3.0f;   // the queries (sharper softmax)
     cudaMemcpy(qf, h.data(), h.size() * 4, cudaMemcpyHostToDevice);
     cudaStreamSynchronize(s);
-    for (int T : {1, 4, 8}) {
+    for (int T : {1, 2, 4, 8}) {
         const int p0 = N - T;
-        float ms[2] = {0, 0};
-        for (int m = 0; m < 2; ++m) {
-            q35_attn_prep(qf, H * 2 * D, kk, vv, HK * D, nw, nw, 1e-6f, 1e7f, 64, p0, T, H, HK, D, qo, kv[m], s);
-            q35_attn(qo, kv[m], p0, T, H, HK, D, qf, H * 2 * D, out + (size_t) m * 8 * H * D, scr, 0, s);
-            cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
-            cudaEventRecord(a, s);
-            for (int r = 0; r < 20; ++r)
+        std::vector<float> ref;
+        for (int dec : {0, 8}) {
+            q35_set_attn_dec_max_tokens(dec);
+            float ms[2] = {0, 0};
+            for (int m = 0; m < 2; ++m) {
+                q35_attn_prep(qf, H * 2 * D, kk, vv, HK * D, nw, nw, 1e-6f, 1e7f, 64, p0, T, H, HK, D, qo, kv[m], s);
                 q35_attn(qo, kv[m], p0, T, H, HK, D, qf, H * 2 * D, out + (size_t) m * 8 * H * D, scr, 0, s);
-            cudaEventRecord(b, s); cudaEventSynchronize(b);
-            cudaEventElapsedTime(&ms[m], a, b); ms[m] /= 20;
+                cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+                cudaEventRecord(a, s);
+                for (int r = 0; r < 20; ++r)
+                    q35_attn(qo, kv[m], p0, T, H, HK, D, qf, H * 2 * D, out + (size_t) m * 8 * H * D, scr, 0, s);
+                cudaEventRecord(b, s); cudaEventSynchronize(b);
+                cudaEventElapsedTime(&ms[m], a, b); ms[m] /= 20;
+            }
+            std::vector<float> o((size_t) 2 * 8 * H * D);
+            cudaMemcpy(o.data(), out, o.size() * 4, cudaMemcpyDeviceToHost);
+            double e = 0, r = 0, e2 = 0;
+            for (size_t i = 0; i < (size_t) T * H * D; ++i) { e += pow(o[i] - o[8 * H * D + i], 2); r += o[i] * o[i]; }
+            if (dec == 0) ref = o;
+            else for (size_t i = 0; i < (size_t) T * H * D; ++i) e2 += pow(o[i] - ref[i], 2) + pow(o[8 * H * D + i] - ref[8 * H * D + i], 2);
+            const double gb16 = (double) N * HK * D * 2 * 2 / 1e9, gb8 = (double) N * HK * (D + D / 2 + 32) / 1e9;
+            printf("N %d T %d %s: fp16 %.3f ms (%.0f GB/s)  k8v4 %.3f ms (%.0f GB/s)  k8v4 rel err %.4f  dec vs tile %.2e  cuda %s\n",
+                   N, T, dec ? "dec " : "tile", ms[0], gb16 / ms[0] * 1e3, ms[1], gb8 / ms[1] * 1e3, sqrt(e / r),
+                   dec ? sqrt(e2 / (2 * r)) : 0.0, cudaGetErrorString(cudaGetLastError()));
         }
-        std::vector<float> o((size_t) 2 * 8 * H * D);
-        cudaMemcpy(o.data(), out, o.size() * 4, cudaMemcpyDeviceToHost);
-        double e = 0, r = 0;
-        for (size_t i = 0; i < (size_t) T * H * D; ++i) { e += pow(o[i] - o[8 * H * D + i], 2); r += o[i] * o[i]; }
-        const double gb16 = (double) N * HK * D * 2 * 2 / 1e9, gb8 = (double) N * HK * (D + D / 2 + 32) / 1e9;
-        printf("N %d T %d: fp16 %.3f ms (%.0f GB/s)  k8v4 %.3f ms (%.0f GB/s)  k8v4 rel err %.4f  cuda %s\n", N, T,
-               ms[0], gb16 / ms[0] * 1e3, ms[1], gb8 / ms[1] * 1e3, sqrt(e / r), cudaGetErrorString(cudaGetLastError()));
     }
     return 0;
 }

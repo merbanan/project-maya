@@ -696,9 +696,21 @@ int main(int argc, char** argv) {
         // the MTP rows still to read: tokens mtp_tok at positions mtp_p0 .. with the trunk's hidden rows in d_hrows
         std::vector<int32_t> mtp_tok = {anchor};
         int64_t mtp_p0 = model.position() - 1;
+        // STRATA_DENSE_ROUND_PROF=1: each round's phases timed on the host after a sync (draft, verify, accept,
+        // commit) - the sum at DONE (debug: the syncs cost a little)
+        static const bool rprof = std::getenv("STRATA_DENSE_ROUND_PROF") && std::atoi(std::getenv("STRATA_DENSE_ROUND_PROF")) != 0;
+        double rp[4] = {0, 0, 0, 0};
+        auto rp_mark = [&](int i, Clock::time_point& t) {
+            if (!rprof) return;
+            std::string e2;
+            model.sync(e2);
+            rp[i] += ms_since(t);
+            t = Clock::now();
+        };
         while (going) {
             if (in.stop.load()) { cancelled = true; break; }
             const int64_t pos = model.position();
+            Clock::time_point t_rp = Clock::now();
             int k = (int) std::min<long long>(K, std::min<long long>(budget - produced, model.max_context() - pos - 1));
             if (adaptive && !use_df) k = std::min(k, k_cur);   // (MTP: each draft is a step of its own)
             k = std::max(0, k);
@@ -743,9 +755,11 @@ int main(int argc, char** argv) {
                 if (failed) break;
             }
             const int W = (int) win.size();
+            rp_mark(0, t_rp);
             if (!model.forward(win.data(), W, K > 0, K > 0 ? strata::core::DenseModel::kAll : strata::core::DenseModel::kLast, err)) {
                 std::printf("ERR %s\n", err.c_str()); failed = true; break;
             }
+            rp_mark(1, t_rp);
             int picks[16];
             int acc = 0;
             if (spec_s && (int) qd.size() == W - 1 && lookup_rounds_before == lookup_rounds) {
@@ -788,6 +802,7 @@ int main(int argc, char** argv) {
                 produced = before;
             }
             ++rounds; drafted += W - 1; accepted += acc;
+            rp_mark(2, t_rp);
             if (K > 0 && use_df) {
                 if (!model.commit(acc + 1, err) || !model.dflash_inject(acc + 1, pos, err)) {
                     std::printf("ERR %s\n", err.c_str()); failed = true; break;
@@ -801,6 +816,7 @@ int main(int argc, char** argv) {
                 mtp_tok.push_back(picks[acc]);
                 mtp_p0 = pos;
             }
+            rp_mark(3, t_rp);
             fed.insert(fed.end(), win.begin(), win.begin() + acc + 1);
             bool more = true;
             for (int j = 0; j < acc && more; ++j) more = emit(win[j + 1]);
@@ -810,6 +826,9 @@ int main(int argc, char** argv) {
             going = more;
         }
         if (failed) { model.reset(); fed.clear(); std::fflush(stdout); continue; }
+        if (rprof && rounds > 0)
+            std::fprintf(stderr, "strata-dense: round phases (ms a round): draft %.2f, verify %.2f, accept %.2f, commit %.2f\n",
+                         rp[0] / rounds, rp[1] / rounds, rp[2] / rounds, rp[3] / rounds);
         if (cancelled) finish = "cancel";
         const double decode_ms = ms_since(t_dec);
         std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld\n", produced, (long long) n, prompt_ms, decode_ms, finish,

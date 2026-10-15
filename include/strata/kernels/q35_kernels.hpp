@@ -43,6 +43,19 @@ void q35_gate_beta(float* alpha, float* beta, int ld, const float* dt, const flo
 void q35_gdn_seq(float* state, const float* x, int ld, const float* g, const float* b, int ldg, float* o, int T,
                  int h_k, int h_v, bool commit, void* stream);
 
+/// One GDN layer's commit inputs: its conv state (3 x C) and recurrent state, the verify window's stashed raw conv
+/// input and conv output rows (stride C), and its [g | b] rows (stride 2 * h_v).
+struct Q35CommitLayer {
+    float* conv_state;
+    const float* raw;
+    float* state;
+    const float* conv;
+    const float* ab;
+};
+/// commit of n kept tokens for every layer of tab_dev (a device array): conv states, then the recurrence (the result
+/// of q35_conv_seq + q35_gdn_seq with commit on, without their outputs) - two launches for all layers
+void q35_commit_all(const Q35CommitLayer* tab_dev, int n_layers, int n, int C, int h_k, int h_v, void* stream);
+
 /// rms(o) * w * silu(z) per 128-wide head (`rows` heads in all, dense)
 void q35_gdn_out(const float* o, const float* z, const float* w, float* y, int rows, float eps, void* stream);
 
@@ -77,6 +90,12 @@ int64_t q35_attn_scratch_floats(int T, int n_head, int D, int max_ctx);
 /// splits: 0 = choose.
 void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_kv, int D, const float* q_full,
               int ldq, float* out, float* scratch, int splits, void* stream);
+
+/// Windows of up to this many tokens (and G = 6) run a CUDA-core split-K decode kernel instead of the tile kernel
+/// (STRATA_DENSE_ATTN_DEC, default 1: decode steps; the kernel reads the cache once a token, so wider windows lose);
+/// the setter overrides the environment (benchmarks).
+int q35_attn_dec_max_tokens();
+void q35_set_attn_dec_max_tokens(int n);
 
 /// y[t][r] = sum_i W[r][i] x[t][i] for T tokens: an F32 matrix (n_out rows of n_in), x rows stride ldx, y dense.
 void q35_gemv_f32_cols(const float* W, const float* x, int ldx, float* y, int n_in, int n_out, int T, void* stream);
