@@ -94,6 +94,19 @@ struct Carve {
 };
 
 constexpr int kSub = 256;   // the sub-batch the mixers, the dense FFN and the shared expert start from
+// STRATA_GLM_PREFILL_SUB: 16-8192 sets every sub-batch, "auto" the sizes below (mixer_sub, the shared expert kSub).
+// Unset: 1024 on CUDA - the auto sizes left the shared expert at 256 (its weights dequantized to FP16 every 256 tokens)
+// and made a 27K GLM prompt ~4x slower on a V100 (314 s of GPU time against 78.6 s); HIP keeps auto
+int prefill_sub_env() {
+    const char* v = getenv("STRATA_GLM_PREFILL_SUB");
+    if (v && std::strcmp(v, "auto") == 0) return 0;
+    if (v) return std::clamp(std::atoi(v), 16, 8192);
+#if defined(STRATA_USE_HIP)
+    return 0;
+#else
+    return 1024;
+#endif
+}
 // prestaging (PrefillState::pbuf): the buffer's slots on one GPU, the chunk from which it is carved, and the fewest
 // predicted rows an expert is prestaged for (below that it may not be routed at all)
 constexpr int kPreSlots = 160, kPreMinT = 1024, kPreMinRows = 4;
@@ -598,8 +611,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
     S->has_dense = has_dense;
     S->has_moe = has_moe;
     S->max_pools = (int) std::max<int64_t>(1, max_ctx_ / g.idx_kpool);
-    if (const char* v = getenv("STRATA_GLM_PREFILL_SUB"))
-        S->sub_env = std::clamp(std::atoi(v), 16, 8192);
+    S->sub_env = prefill_sub_env();
     S->prof = getenv("STRATA_GLM_PREFILL_PROF") != nullptr;
     S->gstride = gstride;
 
@@ -949,8 +961,7 @@ std::pair<size_t, size_t> Glm5Model::prefill_bytes_for(size_t T, size_t kv_stage
 size_t glm_prefill_lend_bytes(const Glm5Geometry& g, size_t T, bool has_kda, bool has_dsa, bool has_dense,
                               bool has_moe, bool mtp, int64_t max_ctx, size_t gstride, size_t kv_stage) {
     const int max_pools = (int) std::max<int64_t>(1, max_ctx / g.idx_kpool);
-    int sub_env = 0;
-    if (const char* v = getenv("STRATA_GLM_PREFILL_SUB")) sub_env = std::clamp(std::atoi(v), 16, 8192);
+    const int sub_env = prefill_sub_env();
     const auto pu = chunk_bytes(g, T, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env, mtp, kv_stage);
     const auto ws = weight_scratch(g, has_dsa);
     Carve c;
