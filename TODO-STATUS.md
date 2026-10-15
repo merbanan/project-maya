@@ -172,6 +172,13 @@ expected gain (guess = not measured), effort S/M/L. Ranked plan per engine; "mea
 | glm: DFlash2 verify width cap at 12K | --spec 2 / 3 / 4 / min-p 0.98 all 20-21 tok/s vs plain ~22: no width recovers 12K; short: +4-6% | - (no change) |
 | glm: turn snapshot at the last user token (trappsquid) | the live server saves 31-100K-token conversation slots; no per-request reuse log to show a gap - closed | - |
 
+**Host embedding / reduced draft vocabulary on the other engines** (checked 2026-10-16): GLM-5.3-Flash, Hy3 and DSv4
+(Maya's glm fast path) already read token rows on the CPU from the pack (pack_emb_src_) - nothing in VRAM to free; Strata
+Flash-Next keeps token_embd in mapped host memory (NativeEmbed) and its MTP head already scores a token subset
+(data/draft_vocab_*.bin). Left to try, small: a vocabulary-prefix draft head for DSv4's MTP (full 129K head, drafts are
+~2 ms of a 53 ms round: <2%) and GLM DFlash2's candidate head (154K, 2.1 ms a round: ~1-2%; on the 27B DFlash2 gained
+nothing from 32K). Hy3 has no single-GPU speculative decode.
+
 **Measuring**: the V100 throttles under sustained load (clock 540-1000 MHz for minutes) and a server build during a run
 inflates every stage (~1.6x): runs start below 60 C (/media/per/work/llm/cool.sh), A/B arms alternate, a clock log is
 kept (clklog.sh), and nothing builds during a GPU run. The old "30K 28.5, 60K 13.6, 94K 9.1 tok/s" plain numbers were
