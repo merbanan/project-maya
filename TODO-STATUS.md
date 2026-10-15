@@ -149,6 +149,66 @@ lives. Branches on the fork: `qwen38` (strata-dense: Qwen3.8-27B, Qwen3.6-35B-A3
 | - #2356: Volta prompt-expert WMMA kernel for IQ2_S / IQ4_NL | n/a | none of our models' experts are IQ2_S / IQ4_NL (GLM / DSv4: IQ2_XXS + Q2_K, Qwen: Q4_K / Q5_K) |
 | - not applicable: the SYCL / HIP / Metal / Arc / gfx PRs, multi-GPU layer splits, setup / serve / MCP changes | - | |
 
+## Investigation 2026-10-15: open items checked against the code (read only, nothing run)
+
+Each open review item was checked in the code of the branch it belongs to: present / partial / absent, cost today,
+expected gain (guess = not measured), effort S/M/L. Ranked plan per engine; "measure" steps come first.
+
+### Already present - drop from the list
+- strata-dense: GDN verify by input replay (= SGLang #42388 idea; F32 per-token states would write ~1.2 GB a round - skip), conv window in registers, fp32 sigmoid / softplus, drafter KV ring (new rows only), suffix draft skips MTP, GPU top-k sampling, K8V4 read in place (byte_perm in registers), lazy rescale (covers the "fixed upper bound"), Gemma window-only split-K, reduced-vocab p/q (vocab is a prefix: no d2t scatter needed, q>0 checked, double precision).
+- GLM / Hy3: next-layer router prediction, staging banks = cache slots, shared expert folded into the routed launch, CPU/GPU split in moe_route + cpu_mask (#685/#665), miss-count-based CPU-vs-PCIe plan with runtime recalibration (#664), usage-profile / counts seeding, prefill expert-slot lending, THP + prefault + cudaHostRegister, O_DIRECT, window runs each distinct expert once for all verify rows, dp4a int32 + float scaling, KDA_SPLIT=8 option, DSA sparse MLA kernels, pooled index keys once.
+- DSv4: F16 compressed rows gathered in place, radix top-512, pooled index keys once, expert usage tiers, prefetch (opt-in).
+- n/a: DSv4 SWA replay (snapshots hold the rings), #42929 (V4.1 only), E4M3 bit move (keys are F16), host KV, candidate blocks (<1%), fixed 64-CTA fetch (we are at the PCIe3 ceiling, 11.5 GB/s), per-layer pools, layer-major prefill (auto chunks already 32K), F32 states, verify width 16 (drafters are block 8), int4 draft head (Q6_K head: only 1.45x fewer bytes), fp16 PV accumulate, split-KV prefill / prompt GEMM tiles in strata-dense (cuBLAS, ~768 CTAs already), RACER, FLy (lossy).
+
+### strata-dense (Qwen3.8-27B / Qwen3.6-35B / Gemma / Muse) - ranked
+| # | Item | Today | Gain (guess unless noted) | Effort |
+|---|---|---|---|---|
+| 1 | Long-context decode / verify attention: ptxas -v + profile attn_tc_kernel (T=1 uses the 64-row prompt tile, 1 of 4 warps does MMA, 160 CTAs at 1 / SM; ~60-100 GB/s at 90K vs 880 peak), then a T<=8 split-K kernel after G4 dec_kernel with K8V4, ~512 CTAs, V loads with K | 30K 28.5, 60K 13.6, 94K 9.1 tok/s plain | 2-5x plain decode at 30-94K; DFlash2 94K 34 -> 55+ | M |
+| 2 | Verify GEMV at 4-8 rows: re-bench STRATA_DENSE_BENCH widths 1..8 (37.6 / 40.6 ms numbers predate e98df5a), bring mmtp from ~410-450 GB/s toward QPN8's 637 (prepack, NACC=2) | 4-row verify ~37 ms vs 29.8 ms plain token | +20-25% every 27B spec mode | M-L |
+| 3 | Draft vocab: measure STRATA_DENSE_DRAFT_VOCAB 32K / 64K on 27B MTP + DFlash2 (head 248K x 5120 Q6_K ~1.2-2.3 ms a pass); SVD dynamic list (#59740) later if AL drops | unused | a few % | S |
+| 4 | MTP gap vs JimmyMax (ours 56.9 K3 / 2.46 tok a round vs their 68-93): per-position acceptance on 256-token runs, nextn block quant (Q8_0?), device-resident draft chain (argmax -> memcpy -> sync per draft today) | - | to ~80-90 with 1-3 | S-M |
+| 5 | GDN commit: 96 launches of 48-CTA kernels -> one launch (VH x layers = 2304 CTAs) on its own stream beside the drafter (bnk 2.97 -> 2.46 ms) | - | 3-6% a round, bit-exact | S-M |
+| 6 | GDN recurrence occupancy: gdn_seq_kernel<<<h_v,128>>> = 48 / 32 CTAs -> 4 one-warp CTAs a head (bit-identical), then fuse conv / l2 / gates (144 launches a pass) | - | 3-6% | S, M |
+| 7 | Gemma 4 31B SWA ring = window + max(chunk, verify 8) (SWA KV sized at max_context: ~26 GB at 32K) | uncommitted 31B loader edits | required for the 31B | M |
+| 8 | DSpark walk: W2 top-k pruning + fused walk (28 launches, full-vocab W2 + ds_head) | 35B draft pass 4.8 ms of ~25 | 35B DSpark +4-6% | M |
+| 9 | DFlash2 window sweep STRATA_DENSE_DFLASH_CTX 2K / 8K / 16K at 28K (35B 5.12 -> 4.34 tok a round) | default 2048 | measure only | S |
+| 10 | Embedding in pinned host (not tied heads) + a/b projections as one GEMV | - | VRAM 0.7-1.3 GB; ~1% | S |
+
+### GLM-5.3-Flash / Hy3 - ranked
+| # | Item | Today | Gain | Effort |
+|---|---|---|---|---|
+| 1 | Hy3 KV stream: summarize / select / resolve every N (>=64) tokens instead of every token and layer (KVFlash) | 93K 84.4 ms a token, gqa_stream 24.1 ms | -> ~65 ms (lossy mode already) | S-M |
+| 2 | STRATA_GLM_PREFILL_SUB unset 4x slower: profile with STRATA_GLM_PREFILL_PROF (suspect mixer_sub stuck at 256 by the 128K DSA carve), CUDA default 1024, upstream PR | 314 vs 78.6 s | ~4x on default configs | S |
+| 3 | GLM DFlash2 verify width capped / adaptive above ~8K (fixed --spec today) | -4% at 12K | ~even at 12K | S |
+| 4 | Agent turns: sweep STRATA_GLM_PREFILL_MIN 4/8/16/32 (token path < 32; longer prompts lend the pool tail and evict experts), then a light no-lend #676 path | - | up to ~0.5 s TTFT a turn | S, M |
+| 5 | Fetch: sweep STRATA_GLM_FETCH_OVERLAP=1 with FETCH_BLOCKS 4/8/16 (does SM stealing explain the overlap loss?), then copy-engine DMA fetch (host thread issues copies) -> unlocks #678 shared expert during the copy and #677 low-priority prefetch | fetch 13-15% of a token, 80-SM kernel on the main stream | +5-8% decode | S, L |
+| 6 | GLM prompt stage split (the 27K prompt has ~53 s outside dsa_attn / kda / shexp), then indexer on HMMA (F32 keys + FP32 scorer today; DSv4 6d39cfc got 11.2 -> 2.1 s) and routed experts on FP16 TC (Strata-V100 31ad437c / bnk) | 70.5 s GPU at 27K | 2-3% (indexer) + experts tbd | M |
+| 7 | Profile-pinned + LRU eviction: simulate offline on STRATA_GLM_ROUTE_LOG replays (aged LFU default, live config uses lru) | - | +1-3% | S |
+| 8 | Low-priority-slot prefetch (#677) on top of DMA, only if the "predicted one layer early" stat shows >60% on non-resident experts | prefetch uses the 3 demand spares, 40 SMs, waits on the whole event | 0-4% | M |
+| 9 | Verify-width cliff sweep T 4/5/6/8 (old window 5 rows 197 ms, 7 rows 326 ms) + one KDA_SPLIT=8 run | - | closes two items | S |
+| 10 | Turn snapshot at the last <|user|> (trappsquid): check reuse counts in opencode serve logs first | snapshot before the last prompt token | tbd | S |
+
+### DeepSeek-V4 Flash - ranked
+| # | Item | Today | Gain | Effort |
+|---|---|---|---|---|
+| 1 | MTP KV-only insert on accept: today a full dummy draft (q, attn, out, MoE, 129K head, ~1.6-1.8 ms) runs to put row p+1 in the MTP window (d4_decode_spec); only hc pre + attn_norm + kv GEMV + kv_update are needed (vLLM #55654) | - | +2-3%, exact | S |
+| 2 | Measure how many experts the two verify rows share; if >=20% build a deduplicated 2-row MoE / CPU lane (each row runs its own fast_moe today) - the gate for wider speculation / DSpark | MTP round 54 ms, MoE 34.5 (CPU wait 14.3 a row) | +3-8% | S, M |
+| 3 | Prompt indexer: tile 4-8 query rows per K tile (rows_idx_score_tc_kernel = one block a query row) | d4_index 2.1 s at 26K | ~-50% d4_index, +3-8% long prompts | S-M |
+| 4 | MTP confidence gate: skip the draft when top-1 prob / margin is low (rejected round 54 ms for 1 token vs 31 plain); log margin vs acceptance first | fixed 2-row verify | +1-3% | S |
+| 5 | Measure prefetch on DSv4 (never measured) + exact prefetch for hash-routed layers 0-2 (tid2eid) | - | +- | S |
+| 6 | Seed the MTP window with the last 128 prompt rows (starts empty after each prompt) | - | +1-2% short replies | S-M |
+| 7 | Long-context decode attention (28K 25.0 / 93K 21.7 tok/s; +6..12 ms a token over 2K) | - | biggest lever above 28K | M |
+| 8 | DSpark: our GGUFs have only mtp.0 (nextn, 32 tensors); DSpark is a separate 3-stage drafter (Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF, ROCm FP4 -> reconvert). Each extra verify row costs ~23 ms here (CPU-lane bound) -> likely no gain until #2 lands | - | uncertain | L |
+
+### Strata v100 tree (Flash-Next / strata-q36) - ranked
+| # | Item | Today | Gain | Effort |
+|---|---|---|---|---|
+| 1 | Profile: STRATA_PREFILL_TIMING=1 on fn_bench 6K at --prefill 512 vs 2048 / 4096 / auto; find what OOMs under auto (suspect 8192 chunks + 384-slot ring ~506 MiB + MoE buffers ~600 MB + verify-graph capture) | 729 tok/s | - | S |
+| 2 | Move Flash-Next onto streamed chunks (--prefill 512 keeps every chunk < stream_all_min 1024: STAGE=8 staged path + CPU share, ~10 rows an expert); jmnargi's MMQ baseline with auto: 8K 1,049 / 16K 1,482 / 32K 1,812 | 729 at 6K | +30-60% prompt | S |
+| 3 | Port jmnargi's fp16tc kernel (WMMA m16n16k16, self-contained) into the existing group launch (prefill.cpp:3907-3927) for cc 7.0 + Q2_0 + chunk >= 2048, without the compact walk; check ggml's q8_1 Q2_0 layout; port prefill_fp16tc_test | MMQ dp4a | +15-25% on top of #2 | M |
+| 4 | Cherry-pick 2680b4de (mma884 prompt-attention pipeline; applies cleanly) | - | +1-2% at 16-32K | S |
+| 5 | strata-q36 FP16-TC experts for Q4_K/Q5_K (experts ~70% of a 4K prompt; bnk's unpack + register fragments) | pp512 1,685 | up to ~+40% | L |
+
 ## Serving / tooling
 
 | Item | Status | Evidence |
