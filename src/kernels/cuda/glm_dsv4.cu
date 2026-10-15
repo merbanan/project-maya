@@ -1275,7 +1275,16 @@ void dsv4_rows_indexer(float* q, const float* w, int n_head, const Dsv4Layer& L,
         return;
     }
     const int max_vis = (p0 + T) / 4;
+    // STRATA_DSV4_IDX_TIME=1: the q / score / top-k kernels' GPU time, summed over the calls (printed every 43 calls)
+    static const bool itime = getenv("STRATA_DSV4_IDX_TIME") != nullptr;
+    static cudaEvent_t ie[4];
+    static double ims[3] = {0, 0, 0};
+    static long icalls = 0;
+    if (itime && icalls == 0)
+        for (auto& e : ie) cudaEventCreate(&e);
+    if (itime) cudaEventRecord(ie[0], s);
     rows_idx_q_kernel<<<T * n_head, kDsv4Ihd, 0, s>>>(q, n_head, p0, rope);
+    if (itime) cudaEventRecord(ie[1], s);
     static const bool scalar = getenv("STRATA_DSV4_IDX_SCALAR") != nullptr;   // (the F32 kernel, for comparison)
     if (max_vis > top_k && scalar) {
         rows_idx_score_kernel<<<dim3(T, (max_vis + kIdxRowsB - 1) / kIdxRowsB), 256, 0, s>>>(
@@ -1290,8 +1299,17 @@ void dsv4_rows_indexer(float* q, const float* w, int n_head, const Dsv4Layer& L,
         rows_idx_score_tc_kernel<<<dim3(T, (max_vis + kIdxRowsB - 1) / kIdxRowsB), 256, smem, s>>>(
             q, w, L.icomp, p0, 1.0f / std::sqrt((float) (kDsv4Ihd * n_head)), score, ld);
     }
+    if (itime) cudaEventRecord(ie[2], s);
     rows_topk_kernel<<<T, 1024, 0, s>>>(score, ld, p0, top_k, sel);
     check("rows_indexer");
+    if (itime) {
+        cudaEventRecord(ie[3], s);
+        cudaEventSynchronize(ie[3]);
+        for (int i = 0; i < 3; ++i) { float m = 0; cudaEventElapsedTime(&m, ie[i], ie[i + 1]); ims[i] += m; }
+        if (++icalls % 43 == 0)
+            std::fprintf(stderr, "dsv4 indexer prof (%ld calls): q %.0f ms, score %.0f ms, top-k %.0f ms\n", icalls,
+                         ims[0], ims[1], ims[2]);
+    }
 }
 void dsv4_rows_attn(const float* q, const float* sinks, const Dsv4Layer& L, const uint16_t* raw16, int n_swa, int p0,
                     int T, const int* sel, int k, const Dsv4Rope& rope, float eps, int n_head, uint16_t* out16,

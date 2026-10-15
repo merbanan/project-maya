@@ -440,7 +440,8 @@ public:
     bool d4mtp_resident_ = false;
     static int d4_mtp_exp_type();                          // STRATA_DSV4_MTP_EXPERTS: -1 as stored
     bool d4_mtp_load(const std::string& path, std::string& err);
-    bool d4_mtp_draft(int32_t token, int64_t pos, int& draft, std::string& err);
+    // kv_only: only the block's K/V row of (token, pos) into its window (an accepted round's first row: no draft)
+    bool d4_mtp_draft(int32_t token, int64_t pos, int& draft, std::string& err, bool kv_only = false);
     // ... and the speculative decode on it (STRATA_DSV4_MTP_SPEC=1, greedy): a round runs the pending token and the
     // block's draft through every layer as two rows (the dense weights read once, mv2), keeps both when the trunk
     // agrees with the draft, else rolls the draft row's compressor windows back

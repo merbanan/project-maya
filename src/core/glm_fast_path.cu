@@ -5606,7 +5606,7 @@ bool Glm5Model::d4_mtp_load(const std::string& path, std::string& err) {
 }
 
 // one draft: (token at position pos, the trunk's streams at pos - 1 in state_) -> the block's argmax at pos + 1
-bool Glm5Model::d4_mtp_draft(int32_t token, int64_t pos, int& draft, std::string& err) {
+bool Glm5Model::d4_mtp_draft(int32_t token, int64_t pos, int& draft, std::string& err, bool kv_only) {
     D4Mtp* M = d4mtp_;
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
@@ -5658,10 +5658,24 @@ bool Glm5Model::d4_mtp_draft(int32_t token, int64_t pos, int& draft, std::string
     h.part = F->part;
     h.counter = F->counter;
     gf::hc(h, s);
+    // STRATA_DSV4_MTP_KVONLY=0: an accepted round's window row through the whole block (the old dummy draft)
+    static const bool kv_only_on = !getenv("STRATA_DSV4_MTP_KVONLY") || atoi(getenv("STRATA_DSV4_MTP_KVONLY")) != 0;
+    kv_only = kv_only && kv_only_on;
     nj = 0;
-    j[nj++] = {M->q_a, F->xq, nullptr, F->d4_qr, nullptr, 1.0f, GGML_TYPE_Q8_0, E, g.q_lora};
+    if (!kv_only) j[nj++] = {M->q_a, F->xq, nullptr, F->d4_qr, nullptr, 1.0f, GGML_TYPE_Q8_0, E, g.q_lora};
     j[nj++] = {M->kv, F->xq, nullptr, F->d4_kv, nullptr, 1.0f, GGML_TYPE_Q8_0, E, HD};
     if (!gf::mv(j, nj, s)) { err = "dsv4 mtp: q_a / kv"; return false; }
+    if (kv_only) {   // the row's K/V into the window: no q, attention, FFN or head
+        gf::Dsv4Layer L0;
+        L0.swa = M->swa;
+        L0.ratio = 0;
+        const gf::Dsv4KvArgs ka0{F->d4_kv, M->kv_a_norm, nullptr, nullptr, nullptr, nullptr,
+                                 nullptr, nullptr, nullptr, nullptr, g.norm_eps, g.n_swa};
+        gf::dsv4_kv_update(ka0, L0, F->d4_rope[1], vp, s);
+        draft = -1;
+        mtp_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_in).count();
+        return true;
+    }
     gf::dsv4_qr_norm(F->d4_qr, M->q_a_norm, g.norm_eps, g.q_lora, F->d4_qrn, F->d4_qrn_q8, s);
     j[0] = {M->q_b, F->d4_qrn_q8, nullptr, F->d4_q, nullptr, 1.0f, GGML_TYPE_Q8_0, g.q_lora, g.n_head * HD};
     if (!gf::mv(j, 1, s)) { err = "dsv4 mtp: q_b"; return false; }
@@ -6136,7 +6150,7 @@ bool Glm5Model::d4_decode_spec(strata::kernels::SamplerParams& sp, int64_t max_n
             F->tokens += 2;
             int dummy = -1;
             // the block's window takes row (d at p + 1, A's streams) before it drafts from (t2, B's)
-            if (!d4_mtp_draft(dft, p + 1, dummy, err)) return false;
+            if (!d4_mtp_draft(dft, p + 1, dummy, err, true)) return false;
             cudaMemcpyAsync(state_, B->Rb, hcb, cudaMemcpyDeviceToDevice, s);
             last_tok_ = t2;
             if (!emit(t2)) break;
