@@ -4276,10 +4276,14 @@ bool Glm5Model::fast_boundary(std::string& err) {
             // least recently used instead - route traces replayed through these rules (Maya-M, 3090 + 3060 split):
             // the aged counts keep experts that were frequent a while ago, the smaller half's pool most of all (VRAM
             // hits 55.7 -> 65.2 %, off-card experts a token 57.7 -> 45.4 on the 3060; 71.8 -> 64.6 on the 3090)
-            static const bool vram_lru = [] {
+            // One GPU (no split): LRU by default - a GLM-5.3-Flash trace of 67K routes replayed at the V100's 3,780
+            // slots (tools/glm_policy_sim.py): LRU 78.5 % hits, aged counts 69.5 %, a pinned profile share + LRU
+            // 72-77 %.  A split keeps the counts (STRATA_GLM_VRAM_EVICT=lru / lfu chooses either)
+            static const int vram_env = [] {
                 const char* ve = getenv("STRATA_GLM_VRAM_EVICT");
-                return ve != nullptr && std::strcmp(ve, "lru") == 0;
+                return ve == nullptr ? -1 : std::strcmp(ve, "lru") == 0 ? 1 : 0;
             }();
+            const bool vram_lru = vram_env >= 0 ? vram_env == 1 : (split_next_ == nullptr && n_parts_ <= 1);
             int v = -1;
             uint32_t bc = UINT32_MAX;
             uint64_t bt = UINT64_MAX;
