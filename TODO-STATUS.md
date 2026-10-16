@@ -241,8 +241,9 @@ DFlash2 67.1 tok/s).
 **Left open (with the measured reason)**: DSpark for DSv4 - verify of 4 / 8 drafts costs 4.79 / 6.81 decode steps
 (d4verify, measured 2026-10-16): no acceptance rate can pay for it here; GLM / Hy3 copy-engine fetch and the prefetch on it -
 the copy engine and the gather kernel both run at the PCIe ceiling (13.0 / 13.2 GB/s) and both overlap compute (dmabench);
- GPU power / clock limits - need root on the server (`sudo nvidia-smi -pm 1; sudo nvidia-smi -lgc
-1230,1230` or `-pl 200`), not available to this account (sudo asks for a password).
+ GPU power / clock limits - kept on the list by the user (2026-10-16): needs root on the server (`sudo nvidia-smi
+-pm 1; sudo nvidia-smi -lgc 1230,1230` or `-pl 200`, or a sudoers rule for nvidia-smi); once set, re-run the key A/Bs at
+the locked clock.
 
 **Host embedding / reduced draft vocabulary on the other engines** (checked 2026-10-16): GLM-5.3-Flash, Hy3 and DSv4
 (Maya's glm fast path) already read token rows on the CPU from the pack (pack_emb_src_) - nothing in VRAM to free; Strata
