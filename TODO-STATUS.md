@@ -291,6 +291,7 @@ throttled: the attention kernel alone would allow ~24 tok/s at 90K (plain decode
 | 9 | (done: linear ~25-30 ms a row, no cliff; KDA_SPLIT=8 slower) Verify-width cliff sweep T 4/5/6/8 (old window 5 rows 197 ms, 7 rows 326 ms) + one KDA_SPLIT=8 run | - | closes two items | S |
 | 10 | (closed: the server keeps 31-100K-token slots, no reuse gap to show) Turn snapshot at the last <|user|> (trappsquid): check reuse counts in opencode serve logs first | snapshot before the last prompt token | tbd | S |
 | 11 | (done: 93K 124.3 -> 74.3 ms, 2K -1.5 %, default at >= 64K) Hy3 KV stream without the RAM-tier cost: position-major pinned records lent from the RAM tier's tail as the context grows (today 11.9 GB pinned at load for 131K: short prompts 47 -> 69 ms a token, 93K 124 -> 80) - then the stream can be the long-context default | measured cause: RAM tier 53.1 -> 40.7 GB, disk 0 -> 14 reads a token | short prompts back to 47 ms with the 93K gain kept | L |
+| 12 | CPU-lane defer (Strata #2689 / #2690): layer l's RAM-tier expert rows join the residual after layer l+1's mixer (attention / KDA), the heavy rows (routing weight >= 0.1) waited for first and the light ones late - the CPU computes layer l under the GPU's next mixer. Measure decode + KL (vs the ~0.02 run-to-run floor; fixed STRATA_GLM_RAM_GB) on GLM and Hy3, opt-in until the KL is known | CPU lane ~22-29 ms a token (GLM 2K: 222 rows in 28.7 ms) | their 3080: +15.8 % decode, KL 0.096 with the split | M |
 
 ### DeepSeek-V4 Flash - ranked
 | # | Item | Today | Gain | Effort |
@@ -303,6 +304,7 @@ throttled: the attention kernel alone would allow ~24 tok/s at 90K (plain decode
 | 6 | (closed: the batched prompt keeps no per-position MTP inputs) Seed the MTP window with the last 128 prompt rows (starts empty after each prompt) | - | +1-2% short replies | S-M |
 | 7 | (measured: 2K -> 28K +6.9 ms, of it attention + indexer 2.4, expert pool 4.4 - <= ~6 %) Long-context decode attention (28K 25.0 / 93K 21.7 tok/s; +6..12 ms a token over 2K) | - | biggest lever above 28K | M |
 | 8 | (measured: verify 4 / 8 drafts = 4.79 / 6.81 decode steps - cannot gain, not built) DSpark: our GGUFs have only mtp.0 (nextn, 32 tensors); DSpark is a separate 3-stage drafter (Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF, ROCm FP4 -> reconvert). Each extra verify row costs ~23 ms here (CPU-lane bound) -> likely no gain until #2 lands | - | uncertain | L |
+| 9 | CPU-lane defer (Strata #2689 / #2690), as GLM / Hy3 #12: the CPU lane's rows of layer l added after layer l+1's attention, heavy rows first; decode + KL | moe_cpu_wait 7.1 ms of 33.8 a token (2K) | +5-15 % decode | M |
 
 ### Strata v100 tree (Flash-Next / strata-q36) - ranked
 | # | Item | Today | Gain | Effort |
