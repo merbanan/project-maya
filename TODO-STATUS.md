@@ -200,12 +200,14 @@ expected gain (guess = not measured), effort S/M/L. Ranked plan per engine; "mea
 | strata-dense: MTP drafts 4 on the dense Qwen | 27B K3 65.7 / 65.7, K4 68.0 / 68.2, K5 66.2 / 66.2 tok/s, greedy 128/128 | qwen38 d55ce1a |
 | glm: turn snapshot at the last user token (trappsquid) | the live server saves 31-100K-token conversation slots; no per-request reuse log to show a gap - closed | - |
 | strata-dense: 27B at 64K, decode measured cool (prompt read, GPU cooled to 60 C, then 192 tokens; tests/q35/q38cool.py) | plain 27.5, MTP4 65.2 (3.13 tokens a round), DFlash2 67.1 tok/s (3.24) - the earlier 14.3 / 24.2 / 37.9 were thermal throttling after the 64K prompt (SW slowdown 0x20 in 32 of 546 samples here). Plain matches the 64K stage profile's ~27 tok/s; the repeated filler helps the drafts (38 of ~60 rounds by lookup) | - |
+| glm: prompt experts on FP16 tensor cores for IQ2_XXS / IQ3_XXS / IQ2_S (moe_tc_iq, jmnargi's 64 x 128 tile, ggml's grids, STRATA_GLM_PREFILL_TC=1) | correct (needle answered, greedy tokens within GLM's run-to-run spread) but slower than MMQ: 27K prompt 37.0 / 36.9 -> 45.8 / 46.2 s (two cooled rounds) - dropped, as the 35B K-quant version; MMQ's int8 dp4a path is the better one on sm_70 for these formats | - |
+| strata-dense: Gemma 4 31B assistant acceptance vs llama.cpp (same prompt, 3 drafts, greedy) | llama.cpp keeps 48 of 156 drafts (31 %, 1.92 tokens a round) vs ours 56 of 216 (26 %, 1.78): the drafter's acceptance is low in both - not an engine fault. But llama.cpp runs 45.2 tok/s with it vs our 33.0 (plain 32.5): our assistant round costs too much (next: profile the round) | - |
 
-**Left open (with the reason)**: a bnk-style register-fragment prompt-expert kernel (bnk has no license - its code
-cannot be copied; my FP16 shared-memory K-quant version lost to MMQ by 14 %, so the expected gain is small for the effort);
-GLM's IQ2_XXS prompt experts on tensor cores (same finding: MMQ is well tuned for the K / IQ formats); DSpark for DSv4
+**Left open (with the reason)**: a bnk-style register-fragment prompt-expert kernel - now on the list as Strata #7: study
+bnk's logic and reimplement it in our own code (its code has no license and is not copied);
+GLM's IQ prompt experts on tensor cores (built and measured: 24 % slower than MMQ, dropped); DSpark for DSv4
 (each extra verify row costs ~23 ms here, and the joint two-row CPU lane measured slower); Hy3 KV-stream page choice
-(0/3 needles at 93K); the Gemma 4 31B assistant's acceptance (1.78 tokens a round).
+(0/3 needles at 93K); the Gemma 4 31B assistant's acceptance (1.78 tokens a round; llama.cpp 1.92 - the drafter, but our round is slower).
 
 **Host embedding / reduced draft vocabulary on the other engines** (checked 2026-10-16): GLM-5.3-Flash, Hy3 and DSv4
 (Maya's glm fast path) already read token rows on the CPU from the pack (pack_emb_src_) - nothing in VRAM to free; Strata
@@ -274,6 +276,7 @@ throttled: the attention kernel alone would allow ~24 tok/s at 90K (plain decode
 | 4 | Cherry-pick 2680b4de (mma884 prompt-attention pipeline; applies cleanly) | - | +1-2% at 16-32K | S |
 | 5 | strata-q36 FP16-TC experts for Q4_K/Q5_K (experts ~70% of a 4K prompt; bnk's unpack + register fragments) | pp512 1,685 | up to ~+40% | L |
 | 6 | bnk-style Flash-Next prompt experts v2: Q2_0 sub-blocks unpacked straight into register-resident mma.m8n8k4 fragments, one launch a layer for every (expert, 64-token, 64-row) tile, FP16 activations double-buffered (bnk moe_tc.cu 97b61ed: 32K 1,873 -> 2,782 tok/s on 2 V100s; their WMMA-via-smem variant = jmnargi's shape was slower, 2,412 vs 2,740) | after #3 | maybe +10-15% over #3 | L |
+| 7 | **Register-fragment prompt-expert kernel, own implementation** (requested 2026-10-16): bnk has no license, so do not copy its code - study its logic (tiling: one launch a layer over every (expert, 64-token, 64-row) tile; weight sub-blocks dequantized straight into mma.m8n8k4 A/B fragments in registers, no shared-memory staging of weights; FP16 activations double-buffered in smem; IQ grid tables in smem; work list / tile scheduling; epilogue) and write down the algorithm, then reimplement it from that description in our own code for: Strata Flash-Next Q2_0, strata-q36 / 35B K-quants (Q4_K / Q5_K / Q6_K), GLM / Hy3 IQ2_XXS / IQ3_XXS / IQ2_S. Measure against MMQ (our shared-memory FP16 versions lost: 35B -14 %, GLM -24 %) | MMQ dp4a | bnk: 32K 1,873 -> 2,782 tok/s (+48 %) on Q2_0 | L |
 
 ## Serving / tooling
 
