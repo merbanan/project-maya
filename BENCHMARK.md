@@ -109,6 +109,19 @@ run with 8 rows), `STRATA_DENSE_DFLASH=dflash-kquant.gguf`.
 
 ## DeepSeek-V4 Flash - antirez IQ2_XXS (80.8 GB), GLM fast path (`dsv4`)
 
+Current (2026-10-16, dsv4 4158cc2, defaults, cooled; prompt = the engine's prompt ms/token, decode over 100 tokens;
+needles 3/3 at every length):
+
+| Context | Prompt (tok/s) | Decode (tok/s) | MTP decode, short (tok/s) |
+|---|---:|---:|---:|
+| 2K | 385 | 29.2 | 33.6-36.0 (3 prompts x 256) |
+| 28K | 770 | 24.5 | |
+| 93K | 667 | 21.0 | |
+
+Agent turns (later turns of a 13.5K session): 1,070 / 633 / 411 -> 367 / 269 / 427 ms (batched path from 8 tokens).
+Decode 2K -> 28K: +6.9 ms a token, of it expert movement 4.4 ms (the long prompt's KV takes pool slots), attention +
+indexer 2.4 ms.
+
 Fresh run 2026-10-14 (dsv4 6d39cfc: tensor-core prompt indexer and attention, parallel compressors), needles 3/3
 at every length; prompt = the engine's prompt ms/token, decode = its decode stat over 100 tokens.
 
@@ -178,6 +191,20 @@ GLM prompt attention on the V100 (glm-dflash a4f2f49, the default on Volta; `STR
 Window cost by drafts checked (EXPLORE stats, before the fixes): 1 / 2 / 3 / 5 / 7 drafts 86 / 111 / 134 / 197 / 326 ms
 against a 37 ms plain token. Policy sweep after the fixes (--spec 3/4, min-p 0/0.5/0.95, STRATA_GLM_PROMOTE 8-32):
 27.2-27.9 tok/s average, all within noise.
+
+## GLM-5.3-Flash - Maya-S24, one V100, branch `glm-dflash` (current, 2026-10-16, 0312b16)
+
+Defaults (KV int8, LRU eviction, PREFILL_SUB 1024, tensor-core indexer), cooled; tools: glmbench.py (one fresh request
+a length, 128 greedy tokens), tcab.py (27K + needle):
+
+| Prompt | Prompt (tok/s) | Decode (tok/s) | Notes |
+|---|---:|---:|---|
+| 2K | 579 (3.5 s) | 22.0 | first request after load: tiers still warming |
+| 27K | 720 (37.5 s) | 26.3 | 27K + needle run: 36.4-36.6 s, needle answered |
+| short, warm (3 prompts x 256) | | 25-28 plain / 26-32 DFlash2 | from the DFlash2 table above |
+
+Agent turns: 1,041 / 648 / 521 -> 488 / 405 / 577 ms (-33 %). 27K stage split: routed experts 49 %, DSA attention 17 %,
+KDA 17 %, indexer 1.3 % (after the tensor-core scores: 826 -> 495 ms).
 
 ## GLM-5.3-Flash - Maya-S24 (94.7 GB), live Maya (v1.0.30 + PR #78)
 
