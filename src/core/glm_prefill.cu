@@ -2727,7 +2727,10 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())   // (a tail lent to the vision encoder: the
         if (m->pf_ == nullptr || m->fast_ == nullptr || m->vis_lent_) return false;   // token path, until it is back)
     // a handful of tokens costs less through the token path (the batched path streams every expert they touch)
-    int64_t min_n = 32;
+    // One GPU: from 8 tokens - an agent session's later turns (13.5K of history + a short user turn, one V100, two cooled
+    // rounds of three turns): Hy3 prompt 906 / 1,521 / 924 and 916 / 1,529 / 907 ms at 32 -> 877 / 751 / 925 and 885 /
+    // 751 / 910 at 8 (DSv4 and GLM-5.3-Flash -45 / -33 % likewise); a split keeps 32
+    int64_t min_n = split_next_ == nullptr && n_parts_ <= 1 ? 8 : 32;
     if (const char* mn = getenv("STRATA_GLM_PREFILL_MIN")) min_n = std::max<int64_t>(1, std::atoll(mn));
     if ((int64_t) tokens.size() < min_n) return false;
     // the chunk for this prompt: no bigger than it needs (rounded up to 64), so it borrows only that much; a prompt
