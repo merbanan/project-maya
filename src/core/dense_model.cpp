@@ -326,12 +326,14 @@ struct DenseModel::Impl {
             prof.calls[prof.ev_name[i]] += 1;
         }
         prof.used = 0;
-        if (++prof.passes % 64 == 0) {
+        // (STRATA_DENSE_PROF_N: passes a report, 64 - e.g. a 28K prompt in 2048-token chunks is 14)
+        static const int every = std::getenv("STRATA_DENSE_PROF_N") ? std::max(1, std::atoi(std::getenv("STRATA_DENSE_PROF_N"))) : 64;
+        if (++prof.passes % every == 0) {
             double tot = 0;
             for (double m : prof.ms) tot += m;
-            std::fprintf(stderr, "dense prof (last 64 passes, T=%d): %.2f ms a pass\n", T, tot / 64);
+            std::fprintf(stderr, "dense prof (last %d passes, T=%d): %.2f ms a pass\n", every, T, tot / every);
             for (size_t i = 0; i < prof.names.size(); ++i)
-                std::fprintf(stderr, "  %-14s %8.3f ms a pass %5.1f%%\n", prof.names[i].c_str(), prof.ms[i] / 64,
+                std::fprintf(stderr, "  %-14s %8.3f ms a pass %5.1f%%\n", prof.names[i].c_str(), prof.ms[i] / every,
                              tot > 0 ? 100.0 * prof.ms[i] / tot : 0.0);
             std::fill(prof.ms.begin(), prof.ms.end(), 0.0);
         }
@@ -1995,8 +1997,12 @@ bool DenseModel::load_gemma4(int64_t max_context, std::string& err) {
             // a sliding-window layer keeps a ring of the window + a prompt chunk + a verify window (swa_cells)
             const int64_t per = L.swa ? swa_cells(max_context) : max_context;
             const uint64_t cells = (uint64_t) HK * per;
-            if (!I.alloc(&L.g4kv.k, cells * D * 2, err, "K cache") || !I.alloc(&L.g4kv.v, cells * D * 2, err, "V cache"))
+            // (+ 16 cells, all zero: the head-512 prompt kernel reads whole 16-key tiles of K / V in place - the cells
+            // past a tile's last key must be finite, and the last head's tile may reach past its region)
+            if (!I.alloc(&L.g4kv.k, (cells + 16) * D * 2, err, "K cache") || !I.alloc(&L.g4kv.v, (cells + 16) * D * 2, err, "V cache"))
                 return false;
+            cudaMemset(L.g4kv.k, 0, (cells + 16) * D * 2);
+            cudaMemset(L.g4kv.v, 0, (cells + 16) * D * 2);
             L.g4kv.max_ctx = (int) per;
             L.g4kv.ring = per < max_context ? (int) per : 0;
             if (L.g4kv.ring) I.swa_ring = L.g4kv.ring;
@@ -2182,7 +2188,7 @@ bool DenseModel::forward_gemma4(const int32_t* tokens, int T, bool verify, int w
             g4_attn_prep(I.q_full, I.kcur, I.vcur, T, H, KV.HK, D, L.q_norm, L.k_norm, eps, L.swa ? I.rope_swa : cfg_.rope_base,
                          L.swa ? nullptr : I.rope_freqs, (int) p0, I.qcur, kvw, s);
             g4_attn(I.qcur, KV.g4kv, (int) p0, T, H, KV.HK, D, L.swa ? I.n_swa : 0, 1.0f, I.attn, I.attn_scratch, s);
-            I.stage("attn_core", s);
+            I.stage(L.swa ? "attn_core_swa" : "attn_core_full", s);
             I.prep(I.attn, H * D, T);
             I.mm(L.o, I.mix);
             q35_rms_rows(I.mix, E, L.post_norm, I.mix, nullptr, T, E, eps, s);

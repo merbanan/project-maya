@@ -458,10 +458,14 @@ void launch_dec(const float* q, const G4Kv& kv, int p0, int n_head, int n_kv_rea
 // rows (w & 1) * 16 .. over dims (w >> 1) * 256 .., the halves summed by warps 0 / 1, which keep the rows' online
 // softmax and publish P and the rescale; warp w then accumulates rows (w & 1) * 16 .., output dims (w >> 1) * 256 ..
 constexpr int P5_AK = 16, P5_LDQ = 512 + 8, P5_LDS = P5_AK + 4, P5_LDP = P5_AK + 8;
-constexpr size_t p5_smem() {
-    return (size_t) 32 * P5_LDQ * 2 + (size_t) 2 * P5_AK * P5_LDQ * 2 + (size_t) 4 * 16 * P5_LDS * 4 +
+// DIRECT (the default for a layer without a ring; STRATA_G4_P5_DIRECT=0: staged): the K / V fragments read in place from the cache (L1) instead of
+// staged in shared memory - 40 instead of 73 KB a block, two blocks an SM; the cache is zeroed with 16 spare cells, so
+// a tile's keys past the last one are finite (masked to P = 0)
+constexpr size_t p5_smem(bool direct) {
+    return (size_t) 32 * P5_LDQ * 2 + (direct ? 0 : (size_t) 2 * P5_AK * P5_LDQ * 2) + (size_t) 4 * 16 * P5_LDS * 4 +
            (size_t) 32 * P5_LDP * 2 + (size_t) 64 * 4;
 }
+template <bool DIRECT>
 __global__ void __launch_bounds__(128) attn512_kernel(const float* __restrict__ q, G4Kv kv, int p0, int T, int n_head,
                                                       int G, int window, int kbase, int split_len, float scale,
                                                       float* __restrict__ out, float* __restrict__ part_o,
@@ -472,7 +476,7 @@ __global__ void __launch_bounds__(128) attn512_kernel(const float* __restrict__ 
     __half* sQ = (__half*) smem;
     __half* sK = sQ + AR * P5_LDQ;
     __half* sV = sK + P5_AK * P5_LDQ;
-    float* sS = (float*) (sV + P5_AK * P5_LDQ);
+    float* sS = (float*) (DIRECT ? sK : sV + P5_AK * P5_LDQ);
     __half* sP = (__half*) (sS + 4 * 16 * P5_LDS);
     float* sCorr = (float*) (sP + 32 * P5_LDP);     // 32 rows' rescale, then (the end) their sums
     float* sL = sCorr + 32;
@@ -504,6 +508,10 @@ __global__ void __launch_bounds__(128) attn512_kernel(const float* __restrict__ 
     for (int n = 0; n < 16; ++n) wmma::fill_fragment(fo[n], 0.0f);
     for (int k0 = kstart; k0 < ke; k0 += P5_AK) {
         __syncthreads();
+        // (DIRECT: the tile's K / V rows in the cache, ld = AD)
+        const __half* gK = (const __half*) kv.k + ((size_t) kvh * kv.max_ctx + k0) * AD;
+        const __half* gV = (const __half*) kv.v + ((size_t) kvh * kv.max_ctx + k0) * AD;
+        if (!DIRECT)
         for (int i = tid; i < P5_AK * (AD / 8); i += 128) {
             const int r = i / (AD / 8), d = (i % (AD / 8)) * 8, key = k0 + r;
             uint4 kq = make_uint4(0, 0, 0, 0), vq = kq;
@@ -524,7 +532,8 @@ __global__ void __launch_bounds__(128) attn512_kernel(const float* __restrict__ 
                 wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fq;
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
                 wmma::load_matrix_sync(fq, sQ + rt * 16 * P5_LDQ + half * 256 + kk * 16, P5_LDQ);
-                wmma::load_matrix_sync(fb, sK + half * 256 + kk * 16, P5_LDQ);
+                if (DIRECT) wmma::load_matrix_sync(fb, gK + half * 256 + kk * 16, AD);
+                else wmma::load_matrix_sync(fb, sK + half * 256 + kk * 16, P5_LDQ);
                 wmma::mma_sync(acc, fq, fb, acc);
             }
             wmma::store_matrix_sync(sS + w * 16 * P5_LDS, acc, P5_LDS, wmma::mem_row_major);
@@ -578,7 +587,8 @@ __global__ void __launch_bounds__(128) attn512_kernel(const float* __restrict__ 
 #pragma unroll
             for (int n = 0; n < 16; ++n) {
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> fv;
-                wmma::load_matrix_sync(fv, sV + half * 256 + n * 16, P5_LDQ);
+                if (DIRECT) wmma::load_matrix_sync(fv, gV + half * 256 + n * 16, AD);
+                else wmma::load_matrix_sync(fv, sV + half * 256 + n * 16, P5_LDQ);
                 wmma::mma_sync(fo[n], fp, fv, fo[n]);
             }
         }
@@ -616,9 +626,14 @@ __global__ void __launch_bounds__(128) attn512_kernel(const float* __restrict__ 
 
 void launch_attn512(const float* q, const G4Kv& kv, int p0, int T, int n_head, int n_kv, int window, float scale,
                     float* out, float* scratch, cudaStream_t s) {
-    constexpr size_t sm = p5_smem();
-    static const bool attr = cudaFuncSetAttribute(attn512_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm) ==
-                             cudaSuccess;
+    // (31B 28K prompt 62.0 / 62.5 -> 53.5 / 53.5 s, E4B 9.36 -> 7.74 s; needles 3/3, greedy the same, cooled decode the same)
+    static const bool direct_env = std::getenv("STRATA_G4_P5_DIRECT") == nullptr || std::atoi(std::getenv("STRATA_G4_P5_DIRECT")) != 0;
+    const bool direct = direct_env && kv.ring == 0;
+    const size_t sm = p5_smem(direct);
+    static const bool attr = cudaFuncSetAttribute(attn512_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                  (int) p5_smem(false)) == cudaSuccess &&
+                             cudaFuncSetAttribute(attn512_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                  (int) p5_smem(true)) == cudaSuccess;
     if (!attr) throw std::runtime_error("g4_attn512: shared memory attribute");
     const int G = n_head / n_kv, rows = T * G, tiles = (rows + 31) / 32;
     const int kbase = window > 0 ? std::max(0, p0 - window + 1) : 0;
@@ -629,8 +644,12 @@ void launch_attn512(const float* q, const G4Kv& kv, int p0, int T, int n_head, i
     n_split = (n_keys + split_len - 1) / split_len;
     float* part_o = scratch;
     float* part_ml = scratch + (size_t) n_split * rows * n_kv * 512;
-    attn512_kernel<<<dim3(tiles, n_kv, n_split), 128, sm, s>>>(q, kv, p0, T, n_head, G, window, kbase, split_len, scale,
-                                                               out, part_o, part_ml);
+    if (direct)
+        attn512_kernel<true><<<dim3(tiles, n_kv, n_split), 128, sm, s>>>(q, kv, p0, T, n_head, G, window, kbase, split_len,
+                                                                         scale, out, part_o, part_ml);
+    else
+        attn512_kernel<false><<<dim3(tiles, n_kv, n_split), 128, sm, s>>>(q, kv, p0, T, n_head, G, window, kbase, split_len,
+                                                                          scale, out, part_o, part_ml);
     check("g4_attn512");
     if (n_split > 1) {
         merge_kernel<<<dim3(rows, n_kv), 512, 0, s>>>(part_o, part_ml, rows, n_split, G, n_head, out);
