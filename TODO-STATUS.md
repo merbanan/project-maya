@@ -196,7 +196,15 @@ expected gain (guess = not measured), effort S/M/L. Ranked plan per engine; "mea
 | strata-dense: 35B prompt experts on FP16 tensor cores (moe_tc_kq: Q4_K / Q5_K / Q6_K dequantized to FP16 in shared memory, jmnargi's tile) | correct (greedy 128/128, needles 3/3) but slower than ggml's MMQ: 28K prompt 2,256 / 2,252 -> 1,946 / 1,946 tok/s, 1.6K 1,459 -> 1,169 - dropped. Strata item 5 (the same for strata-q36's K-quant experts) falls with it; only a bnk-style register-fragment kernel could win (L, open) | - |
 | hy3: KV stream - re-select pages every N tokens | profiled at 93K (tq6v3, STRATA_GLM_KV_STREAM=16384): resolve 11.6 + select 4.1 of 76 ms a token - but the stream found 0/3 needles at 93K (its page choice loses the context), so a staler selection is not built; the served config does not stream. Open: the stream's selection quality | - |
 | strata (Flash-Next): jmnargi's prompt-attention latency pipeline cherry-picked | 6K 1,849 / 1,856 -> 1,889 / 1,889, 16.5K 1,870 / 1,874 -> 1,908 / 1,904 tok/s, the same tokens | v100 0c396a02, 982c2a1c |
+| glm / dsv4 / hy3: short prompts (agent turns) through the batched path from 8 tokens (was 32) on one GPU | later turns of a 13.5K session, two cooled rounds: GLM 1,041 / 648 / 521 -> 488 / 405 / 577 ms (-33 %), DSv4 1,070 / 633 / 411 -> 367 / 269 / 427 (-45 %), Hy3 1,521 -> 751 ms on the sub-32-token turn (-24 % average); each default re-measured | glm-dflash ec48632, dsv4 4158cc2, hy3 5e6d222 |
+| strata-dense: MTP drafts 4 on the dense Qwen | 27B K3 65.7 / 65.7, K4 68.0 / 68.2, K5 66.2 / 66.2 tok/s, greedy 128/128 | qwen38 d55ce1a |
 | glm: turn snapshot at the last user token (trappsquid) | the live server saves 31-100K-token conversation slots; no per-request reuse log to show a gap - closed | - |
+
+**Left open (with the reason)**: a bnk-style register-fragment prompt-expert kernel (bnk has no license - its code
+cannot be copied; my FP16 shared-memory K-quant version lost to MMQ by 14 %, so the expected gain is small for the effort);
+GLM's IQ2_XXS prompt experts on tensor cores (same finding: MMQ is well tuned for the K / IQ formats); DSpark for DSv4
+(each extra verify row costs ~23 ms here, and the joint two-row CPU lane measured slower); Hy3 KV-stream page choice
+(0/3 needles at 93K); the Gemma 4 31B assistant's acceptance (1.78 tokens a round).
 
 **Host embedding / reduced draft vocabulary on the other engines** (checked 2026-10-16): GLM-5.3-Flash, Hy3 and DSv4
 (Maya's glm fast path) already read token rows on the CPU from the pack (pack_emb_src_) - nothing in VRAM to free; Strata
