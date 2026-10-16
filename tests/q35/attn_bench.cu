@@ -49,8 +49,10 @@ int main(int argc, char** argv) {
     for (int T : {1, 2, 4, 8}) {
         const int p0 = N - T;
         std::vector<float> ref;
-        for (int dec : {0, 8}) {
-            q35_set_attn_dec_max_tokens(dec);
+        for (int dec : {0, 8, 101, 102}) {   // 0 the tile kernel, 8 the decode kernel, 10x tile variant x
+            if (dec > 100 && T == 1) continue;
+            q35_set_attn_dec_max_tokens(dec > 100 ? 0 : dec);
+            q35_set_attn_var(dec > 100 ? dec - 100 : 0);
             float ms[2] = {0, 0};
             for (int m = 0; m < 2; ++m) {
                 q35_attn_prep(qf, H * 2 * D, kk, vv, HK * D, nw, nw, 1e-6f, 1e7f, 64, p0, T, H, HK, D, qo, kv[m], s);
@@ -70,7 +72,7 @@ int main(int argc, char** argv) {
             else for (size_t i = 0; i < (size_t) T * H * D; ++i) e2 += pow(o[i] - ref[i], 2) + pow(o[8 * H * D + i] - ref[8 * H * D + i], 2);
             const double gb16 = (double) N * HK * D * 2 * 2 / 1e9, gb8 = (double) N * HK * (D + D / 2 + 32) / 1e9;
             printf("N %d T %d %s: fp16 %.3f ms (%.0f GB/s)  k8v4 %.3f ms (%.0f GB/s)  k8v4 rel err %.4f  dec vs tile %.2e  cuda %s\n",
-                   N, T, dec ? "dec " : "tile", ms[0], gb16 / ms[0] * 1e3, ms[1], gb8 / ms[1] * 1e3, sqrt(e / r),
+                   N, T, dec == 8 ? "dec  " : dec > 100 ? (dec == 101 ? "var1 " : "var2 ") : "tile ", ms[0], gb16 / ms[0] * 1e3, ms[1], gb8 / ms[1] * 1e3, sqrt(e / r),
                    dec ? sqrt(e2 / (2 * r)) : 0.0, cudaGetErrorString(cudaGetLastError()));
         }
     }

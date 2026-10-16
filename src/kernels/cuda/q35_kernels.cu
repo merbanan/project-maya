@@ -357,13 +357,21 @@ __device__ __forceinline__ uint4 deq_v4(uint32_t u, __half s1) {
 
 // grid (row tiles, n_kv, splits), AW warps of 16 rows; see the header.  gated: the output gate applied here (FP16
 // cache); K8V4 leaves it to unrotate_gate_kernel (the output is still rotated)
-template <int MODE>
-__global__ void __launch_bounds__(AW * 32) attn_tc_kernel(const float* __restrict__ q, Q35Kv kv, int p0, int T, int n_head,
+template <int AR_, int AK_, int AW_>
+constexpr size_t attn_smem() {
+    return (size_t) AR_ * LDQ * 2 + 2 * (size_t) AK_ * LDQ * 2 + (size_t) AW_ * 16 * (AK_ + 4) * 4 +
+           (size_t) AW_ * 16 * (AK_ + 8) * 2;
+}
+// (the tile shape is a parameter: the 64-row default for prompts, 32-row tiles of 2 warps for verify windows)
+template <int MODE, int AR_ = 64, int AK_ = 32, int AW_ = 4>
+__global__ void __launch_bounds__(AW_ * 32) attn_tc_kernel(const float* __restrict__ q, Q35Kv kv, int p0, int T, int n_head,
                                                           int G, int max_ctx, int split_len, float scale,
                                                           const float* __restrict__ q_full, int ldq,
                                                           float* __restrict__ out, float* __restrict__ part_o,
                                                           float* __restrict__ part_ml) {
     using namespace nvcuda;
+    constexpr int AR = AR_, AK = AK_, AW = AW_, LDS = AK + 4, LDP = AK + 8;
+    static_assert(AR == AW * 16, "a warp's 16 rows");
     extern __shared__ __align__(32) unsigned char smem[];
     __half* sQ = (__half*) smem;
     __half* sK = sQ + AR * LDQ;
@@ -830,6 +838,7 @@ void q35_attn_prep(const float* q_full, int ldq, const float* k, const float* v,
 namespace {
 constexpr int kSplitLen = 128;   // the shortest split (a decode step at a short context still spreads)
 int g_dec_max = -1;
+int g_attn_var = -1;
 }
 
 // the CUDA-core decode kernel serves windows of up to this many tokens (STRATA_DENSE_ATTN_DEC, default below)
@@ -841,6 +850,7 @@ int q35_attn_dec_max_tokens() {
     return g_dec_max;
 }
 void q35_set_attn_dec_max_tokens(int n) { g_dec_max = n; }
+void q35_set_attn_var(int v) { g_attn_var = v; }
 
 int64_t q35_attn_scratch_floats(int T, int n_head, int D, int max_ctx) {
     const int64_t splits = (max_ctx + kSplitLen - 1) / kSplitLen;
@@ -855,7 +865,17 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
         cudaFuncSetAttribute(attn_tc_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kAttnSmem) == cudaSuccess;
     if (!attr_ok) throw std::runtime_error("q35_attn: shared memory attribute");
     const int max_ctx = kv.max_ctx;
-    const int G = n_head / n_kv, rows = T * G, tiles = (rows + AR - 1) / AR;
+    const int G = n_head / n_kv, rows = T * G;
+    // verify windows (2-8 tokens): STRATA_DENSE_ATTN_VAR 1 = 32-row tiles of 2 warps (32 keys a step), 2 = the same with
+    // 16 keys a step (2 blocks a SM); 0 = the 64-row tile
+    static int var = -1;
+    // (attn_bench 64K FP16 a layer, variant 2: 2 rows 0.674 -> 0.450 ms, 4 rows 0.698 -> 0.542, 8 rows 0.753 -> 0.876;
+    // the engine's MTP3 28K / 64K rounds measured even (thermal noise at 64K) - so opt-in; -2: variant 2 at 2-4 tokens)
+    if (var < 0) var = std::getenv("STRATA_DENSE_ATTN_VAR") ? std::atoi(std::getenv("STRATA_DENSE_ATTN_VAR")) : 0;
+    const int vsel = g_attn_var >= 0 ? g_attn_var : var;
+    const int v = vsel == -2 ? (T >= 2 && T <= 4 ? 2 : 0) : (T >= 2 && T <= 8) ? vsel : 0;
+    const int AR_v = v ? 32 : AR, AK_v = v == 2 ? 16 : AK, AW_v = v ? 2 : AW;
+    const int tiles = (rows + AR_v - 1) / AR_v;
     const int n_keys = p0 + T;
     if (G == 6 && splits <= 0 && T <= q35_attn_dec_max_tokens()) {
         // the CUDA-core decode kernel: ~4 blocks a SM over (kv head, token), at least 64 keys a split
@@ -891,22 +911,35 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
     // splits: enough blocks to fill the GPU when the rows are few
     int n_split = splits;
     if (n_split <= 0) {
-        const int want = 160 / std::max(1, tiles * n_kv);
+        const int want = (v == 2 ? 320 : 160) / std::max(1, tiles * n_kv);   // (variant 2: two blocks a SM)
         n_split = std::max(1, std::min(want, (n_keys + kSplitLen - 1) / kSplitLen));
     }
-    const int split_len = n_split == 1 ? n_keys : ((n_keys + n_split - 1) / n_split + AK - 1) / AK * AK;
+    const int split_len = n_split == 1 ? n_keys : ((n_keys + n_split - 1) / n_split + AK - 1) / AK * AK;   // (AK: 32)
     n_split = (n_keys + split_len - 1) / split_len;
     if ((int64_t) n_split * rows * n_kv * (D + 2) > q35_attn_scratch_floats(T, n_head, D, max_ctx))
         throw std::runtime_error("q35_attn: scratch too small");
     float* part_o = scratch;
     float* part_ml = scratch + (size_t) n_split * rows * n_kv * D;
     const dim3 grid(tiles, n_kv, n_split);
-    if (kv.mode == 0)
+    const float sc = 1.0f / sqrtf((float) D);
+    auto go = [&](auto kern, size_t smem, int threads) {
+        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        kern<<<grid, threads, smem, (cudaStream_t) stream>>>(q, kv, p0, T, n_head, G, max_ctx, split_len, sc, q_full, ldq,
+                                                             out, part_o, part_ml);
+    };
+    if (v == 1) {
+        if (kv.mode == 0) go(attn_tc_kernel<0, 32, 32, 2>, attn_smem<32, 32, 2>(), 64);
+        else go(attn_tc_kernel<1, 32, 32, 2>, attn_smem<32, 32, 2>(), 64);
+    } else if (v == 2) {
+        if (kv.mode == 0) go(attn_tc_kernel<0, 32, 16, 2>, attn_smem<32, 16, 2>(), 64);
+        else go(attn_tc_kernel<1, 32, 16, 2>, attn_smem<32, 16, 2>(), 64);
+    } else if (kv.mode == 0) {
         attn_tc_kernel<0><<<grid, AW * 32, kAttnSmem, (cudaStream_t) stream>>>(
-            q, kv, p0, T, n_head, G, max_ctx, split_len, 1.0f / sqrtf((float) D), q_full, ldq, out, part_o, part_ml);
-    else
+            q, kv, p0, T, n_head, G, max_ctx, split_len, sc, q_full, ldq, out, part_o, part_ml);
+    } else {
         attn_tc_kernel<1><<<grid, AW * 32, kAttnSmem, (cudaStream_t) stream>>>(
-            q, kv, p0, T, n_head, G, max_ctx, split_len, 1.0f / sqrtf((float) D), q_full, ldq, out, part_o, part_ml);
+            q, kv, p0, T, n_head, G, max_ctx, split_len, sc, q_full, ldq, out, part_o, part_ml);
+    }
     check("q35_attn");
     if (n_split > 1) {
         attn_merge_kernel<<<dim3(rows, n_kv), D, 0, (cudaStream_t) stream>>>(part_o, part_ml, rows, n_split, G, n_head,

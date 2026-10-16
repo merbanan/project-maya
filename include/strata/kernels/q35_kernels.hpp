@@ -96,6 +96,9 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
 /// the setter overrides the environment (benchmarks).
 int q35_attn_dec_max_tokens();
 void q35_set_attn_dec_max_tokens(int n);
+/// the tile kernel's shape for 2-8 token windows (STRATA_DENSE_ATTN_VAR: 0 the 64-row tile, 1 32 rows / 2 warps, 2 the
+/// same with 16 keys a step); the setter overrides the environment (benchmarks)
+void q35_set_attn_var(int v);
 
 /// y[t][r] = sum_i W[r][i] x[t][i] for T tokens: an F32 matrix (n_out rows of n_in), x rows stride ldx, y dense.
 void q35_gemv_f32_cols(const float* W, const float* x, int ldx, float* y, int n_in, int n_out, int T, void* stream);
