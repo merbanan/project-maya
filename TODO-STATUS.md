@@ -207,10 +207,16 @@ expected gain (guess = not measured), effort S/M/L. Ranked plan per engine; "mea
 | strata-dense: Gemma 4 31B at 28K vs llama.cpp (llama-bench, fa, ub 2048) | decode ours 27.6 vs 17.5 tok/s; prompt llama.cpp 910 tok/s at depth 0, 432 at 26.6K. Our 28K prompt stage split (2048-token chunks): attn full layers 38 %, FFN 37.5 %, qkv 10.5 %, SWA attn 7 %, out 6 %; decode at 28K 38 ms: FFN 48 %, qkv 16 %, full attn 14 %, out 10 %, SWA attn 8 % (STRATA_DENSE_PROF_N=14 reports a prompt's passes) | - |
 | strata-dense: Gemma head-512 prompt attention reads K / V in place (no shared-memory staging: 40 instead of 73 KB a block, two blocks an SM; the cache zeroed with 16 spare cells) | 31B 28K prompt 62.0 / 62.5 -> 53.5 / 53.5 s (457 -> 530 tok/s, full-layer attention 1.69 -> 1.04 s a chunk), E4B 28K 3,030 -> 3,664 tok/s, 94K 2,011; needles 3/3, greedy the same; cooled 28K decode 27.3 / 27.2 vs 27.2 / 27.3 (the slower decode right after the prompt was heat). Default (STRATA_G4_P5_DIRECT=0: staged) | qwen38 (this commit) |
 
-**Left open (with the reason)**: a bnk-style register-fragment prompt-expert kernel - now on the list as Strata #7: study
-bnk's logic and reimplement it in our own code (its code has no license and is not copied);
-GLM's IQ prompt experts on tensor cores (built and measured: 24 % slower than MMQ, dropped); DSpark for DSv4
-(each extra verify row costs ~23 ms here, and the joint two-row CPU lane measured slower); the Gemma 4 31B assistant's acceptance (1.78 tokens a round; llama.cpp 1.92 - the drafter, but our round is slower).
+**Closed today (2026-10-16)**: Strata #7 register-fragment prompt experts (own code from bnk's design; Q2_0 +3.4 / +1.4 %,
+IQ for GLM / Hy3 measured 15 % slower than MMQ - dropped, K-quants not built for the same reason); Hy3 KV-stream page
+choice (the 0/3 was the test; re-select once a page +15-24 %); the Gemma 4 31B assistant (one draft a round, +24 %);
+Gemma 31B long context (prompt +16 %, decode 27.6 vs llama.cpp 17.5 at 28K); Qwen 64K cooled (plain 27.5, MTP 65.2,
+DFlash2 67.1 tok/s).
+
+**Left open (with the reason)**: DSpark for DSv4 (each extra verify row costs ~23 ms here, and the joint two-row CPU lane
+measured slower); Gemma 31B prompt: FFN is 43 % of a chunk at ~51 TFLOPS (near V100's sustained rate), full-layer attention
+1.04 s a chunk (~18 TFLOPS: a 64-row tile could still gain, M effort); the 31B assistant's acceptance itself (31 % - the
+drafter's, llama.cpp the same).
 
 **Host embedding / reduced draft vocabulary on the other engines** (checked 2026-10-16): GLM-5.3-Flash, Hy3 and DSv4
 (Maya's glm fast path) already read token rows on the CPU from the pack (pack_emb_src_) - nothing in VRAM to free; Strata
