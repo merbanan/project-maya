@@ -189,12 +189,22 @@ against a 37 ms plain token. Policy sweep after the fixes (--spec 3/4, min-p 0/0
 
 ## Hy3 (Hunyuan 3) - `hy3`
 
-| Context | Decode (tok/s) | Notes |
-|---|---:|---|
-| 93K | 7.84 | non-streamed KV |
-| 93K, KV streaming (16K / 32K cache) | 10.15 / 10.41 | disk reads 21-24 a token from RAM pressure |
-| 28K tq6v3 (2026-10-14) | 15.47 | attention 16.9 ms a token (17.9 before the code-pair tables + register K fragments); 15.12 before |
-| 66K tq6v3 (2026-10-14) | 11.39 | attention 33.5 ms a token (36.1 before) |
+bartowski IQ2_XXS pack, tq6v3 K/V, one V100, `--max-context 131072`, cooled runs, needles 3/3 at every length
+(2026-10-16, hy3 bc9bbe1):
+
+| Prompt | Decode, default | Decode, KV stream off | Old stream (whole context pinned at load) |
+|---|---:|---:|---:|
+| 2K | 19.8 tok/s (50.5 ms) | 20.0-20.3 tok/s (49.2-49.9 ms) | 14.6 tok/s (68.7 ms) |
+| 30K | 16.1 tok/s (62.2 ms) | 14.2 tok/s (70.3 ms) | 15.0 tok/s (66.6 ms) |
+| 93K | **13.5 tok/s (74.3 ms)** | 8.0 tok/s (124.3 ms) | 12.6 tok/s (79.6 ms) |
+
+The default streams the K/V cache at contexts of 64K and up: 16384 positions a layer cached in VRAM, pages re-selected
+once a page, the host records pinned 8192 positions at a time from the expert RAM tier's tail as the conversation grows
+(the old stream pinned 11.9 GB at load: RAM tier 40.7 instead of 53.1 GB, ~14 disk reads a token on short prompts).
+Below 64K nothing streams (2K at a 32K context: 20.7 tok/s). `STRATA_GLM_KV_STREAM=0` turns it off. An agent turn of
+under 32 tokens after a 13.5K history: 751 ms (1,521 before the batched path started at 8 tokens).
+
+Earlier (2026-10-14): 28K 15.47 tok/s (attention 16.9 ms a token), 66K 11.39 tok/s.
 
 Expert prefetch (`STRATA_GLM_PREFETCH_N` 1 / 2) and fetch overlap (#118) are slower on this PCIe-bound box: 16.4 / 15.6
 and 20.1 tok/s against 22.9 at a short context.
