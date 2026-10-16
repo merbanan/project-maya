@@ -1363,10 +1363,11 @@ bool DenseModel::mtp_forward(const int32_t* toks, const float* hidden, int64_t p
                 q35_rms_rows(I.a_h, AE, L.attn_norm, I.a_n, nullptr, 1, AE, eps, s);
                 I.prep(I.a_n, AE, 1);
                 I.mm(L.q, I.a_q);
-                g4_attn_prep(I.a_q, nullptr, nullptr, 1, AH, HK, L.D, L.q_norm, nullptr, eps,
+                const int KHK = KV.HK > 0 ? KV.HK : HK;   // (31B: 16 KV heads on the sliding layers, 4 on the full ones)
+                g4_attn_prep(I.a_q, nullptr, nullptr, 1, AH, KHK, L.D, L.q_norm, nullptr, eps,
                              L.swa ? I.rope_swa : cfg_.rope_base, L.swa ? nullptr : I.rope_freqs, (int) pa, I.a_qr, G4Kv{}, s);
                 // the query at pa over keys < pa: the attention's "position" pa - 1 (the window one shorter to match)
-                g4_attn(I.a_qr, KV.g4kv, (int) pa - 1, 1, AH, HK, L.D, L.swa ? I.n_swa - 1 : 0, 1.0f, I.a_att,
+                g4_attn(I.a_qr, KV.g4kv, (int) pa - 1, 1, AH, KHK, L.D, L.swa ? I.n_swa - 1 : 0, 1.0f, I.a_att,
                         I.attn_scratch, s);
                 I.prep(I.a_att, AH * L.D, 1);
                 I.mm(L.o, I.a_o);
@@ -2064,9 +2065,26 @@ bool DenseModel::load_gemma4(int64_t max_context, std::string& err) {
         I.asst_ff = anum("feed_forward_length");
         const int AL = anum("block_count"), AD_f = anum("attention.key_length"), AD_s = anum("attention.key_length_swa");
         const auto* apat = A.get(q + "attention.sliding_window_pattern");
-        if (anum("embedding_length_out") != E || anum("attention.head_count_kv") != HK || AD_f != D_full || AD_s != D_swa ||
+        // the assistant's KV head counts: one number (E4B) or one a layer (31B: [16, 16, 16, 4]) - each must be the
+        // target's for that kind of layer (it reads their K/V)
+        bool hk_ok = true;
+        {
+            int hk_swa = HK, hk_full = HK;
+            for (int l = 0; l < NL; ++l) (pat->items[(size_t) l].u ? hk_swa : hk_full) = hk_of[(size_t) l];
+            const auto* hkv = A.get(q + "attention.head_count_kv");
+            const auto* ap = A.get(q + "attention.sliding_window_pattern");
+            if (!hkv || !ap) hk_ok = false;
+            else if (hkv->items.empty()) hk_ok = (int) hkv->num() == hk_swa && (int) hkv->num() == hk_full;
+            else
+                for (size_t l = 0; l < hkv->items.size() && l < ap->items.size(); ++l)
+                    hk_ok = hk_ok && (int) hkv->items[l].u == (ap->items[l].u ? hk_swa : hk_full);
+        }
+        if (anum("embedding_length_out") != E || !hk_ok || AD_f != D_full || AD_s != D_swa ||
             !apat || (int) apat->items.size() < AL || I.asst_E % 256 || I.asst_ff % 256) {
-            err = "gemma4: the assistant's geometry does not match the model";
+            err = "gemma4: the assistant's geometry does not match the model (out " + std::to_string(anum("embedding_length_out")) +
+                  " vs " + std::to_string(E) + ", kv heads " + (hk_ok ? "ok" : "differ") + ", head " + std::to_string(AD_f) + "/" +
+                  std::to_string(AD_s) + " vs " + std::to_string(D_full) + "/" + std::to_string(D_swa) + ", layers " +
+                  std::to_string(AL) + ", embd " + std::to_string(I.asst_E) + ", ff " + std::to_string(I.asst_ff) + ")";
             return false;
         }
         auto af = [&](const std::string& n) -> const Found* {

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 
@@ -320,7 +321,8 @@ constexpr int kSplitLen = 128;
 template <int D, int G>
 __global__ void __launch_bounds__(128) dec_kernel(const float* __restrict__ q, G4Kv kv, int pos, int n_head, int window,
                                                   int kbase, int split_len, float scale, float* __restrict__ out,
-                                                  float* __restrict__ part_o, float* __restrict__ part_ml, bool round_h) {
+                                                  float* __restrict__ part_o, float* __restrict__ part_ml, bool round_h,
+                                                  int rep) {
     constexpr int PL = D / 32;   // dims a lane: 4, 8 or 16 (D 128: lane l the 4 dims 4 l ..; else chunks of 8)
     __shared__ float sm_m[4][G], sm_l[4][G];
     __shared__ float sm_o[4][G][D];
@@ -347,8 +349,9 @@ __global__ void __launch_bounds__(128) dec_kernel(const float* __restrict__ q, G
         for (int j = 0; j < PL; ++j) acc[g][j] = 0.0f;
     }
     for (int key = ks + w; key < ke; key += 4) {
-        const __half* kr = (const __half*) kv.k + ((size_t) kvh * kv.max_ctx + g4_cell(kv, key)) * D;
-        const __half* vr = (const __half*) kv.v + ((size_t) kvh * kv.max_ctx + g4_cell(kv, key)) * D;
+        // (rep > 1: blockIdx.x is a virtual kv head of G of the real one's rep x G query heads)
+        const __half* kr = (const __half*) kv.k + ((size_t) (kvh / rep) * kv.max_ctx + g4_cell(kv, key)) * D;
+        const __half* vr = (const __half*) kv.v + ((size_t) (kvh / rep) * kv.max_ctx + g4_cell(kv, key)) * D;
         float kf[PL], vf[PL];
         if (D == 128) {
             const uint2 ku = __ldg((const uint2*) (kr + lane * 4)), vu = __ldg((const uint2*) (vr + lane * 4));
@@ -426,12 +429,14 @@ __global__ void __launch_bounds__(128) dec_kernel(const float* __restrict__ q, G
 }
 
 template <int D, int G>
-void launch_dec(const float* q, const G4Kv& kv, int p0, int n_head, int n_kv, int window, float scale, float* out,
-                float* scratch, cudaStream_t s) {
+void launch_dec(const float* q, const G4Kv& kv, int p0, int n_head, int n_kv_real, int window, float scale, float* out,
+                float* scratch, cudaStream_t s, int rep = 1) {
+    const int n_kv = n_kv_real * rep;   // (rep > 1: each kv head's query heads in rep blocks of G)
     const int kbase = window > 0 ? std::max(0, p0 - window + 1) : 0;
     const int n_keys = p0 + 1 - kbase;
     // splits: ~4 blocks a SM over the kv heads, at least 64 keys a split (16 a warp)
-    int n_split = std::max(1, std::min(320 / n_kv, (n_keys + 63) / 64));
+    // (at most g4_attn_scratch_floats' splits: one a kSplitLen keys + 1)
+    int n_split = std::max(1, std::min({320 / n_kv, (n_keys + 63) / 64, (n_keys + kSplitLen - 1) / kSplitLen + 1}));
     const int split_len = (n_keys + n_split - 1) / n_split;
     n_split = (n_keys + split_len - 1) / split_len;
     float* part_o = scratch;
@@ -440,7 +445,7 @@ void launch_dec(const float* q, const G4Kv& kv, int p0, int n_head, int n_kv, in
     // greedy tokens at 28K follow that rounding (measured); STRATA_G4_DEC_F32=1 keeps them in FP32
     static const bool round_h = std::getenv("STRATA_G4_DEC_F32") == nullptr;
     dec_kernel<D, G><<<dim3(n_kv, n_split), 128, 0, s>>>(q, kv, p0, n_head, window, kbase, split_len, scale, out, part_o,
-                                                        part_ml, round_h);
+                                                        part_ml, round_h, rep);
     check("g4_attn_dec");
     if (n_split > 1) {
         merge_kernel<<<dim3(G, n_kv), D, 0, s>>>(part_o, part_ml, G, n_split, G, n_head, out);
@@ -680,6 +685,14 @@ void g4_attn(const float* q, const G4Kv& kv, int p0, int T, int n_head, int n_kv
     if (n_head % n_kv != 0 || n_head / n_kv > 16) throw std::invalid_argument("g4_attn: geometry");
     cudaStream_t s = (cudaStream_t) stream;
     static const bool dec = std::getenv("STRATA_G4_DEC") == nullptr || std::atoi(std::getenv("STRATA_G4_DEC")) != 0;
+    // eight query heads a kv head at head 512 (Gemma 4 31B's full layers): two blocks of four a kv head (one block of
+    // eight would hold 256 registers of q and output a thread); STRATA_G4_DEC8=0: the tile form as before
+    static const bool dec8 = std::getenv("STRATA_G4_DEC8") == nullptr || std::atoi(std::getenv("STRATA_G4_DEC8")) != 0;
+    if (T == 1 && dec && dec8 && D == 512 && n_head / n_kv == 8) {
+        static bool said = false;
+        if (!said) { std::fprintf(stderr, "gemma4: head-512 decode, 8 query heads a K/V head: two decode blocks a K/V head\n"); said = true; }
+        return launch_dec<512, 4>(q, kv, p0, n_head, n_kv, window, scale, out, scratch, s, 2);
+    }
     if (T == 1 && dec && D == 128 && n_head / n_kv == 16)
         return launch_dec<128, 16>(q, kv, p0, n_head, n_kv, window, scale, out, scratch, s);
     if (T == 1 && dec && (n_head / n_kv == 4 || n_head / n_kv == 2)) {   // one token: the split-K SIMT form

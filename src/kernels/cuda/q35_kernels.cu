@@ -870,8 +870,9 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
     // 16 keys a step (2 blocks a SM); 0 = the 64-row tile
     static int var = -1;
     // (attn_bench 64K FP16 a layer, variant 2: 2 rows 0.674 -> 0.450 ms, 4 rows 0.698 -> 0.542, 8 rows 0.753 -> 0.876;
-    // the engine's MTP3 28K / 64K rounds measured even (thermal noise at 64K) - so opt-in; -2: variant 2 at 2-4 tokens)
-    if (var < 0) var = std::getenv("STRATA_DENSE_ATTN_VAR") ? std::atoi(std::getenv("STRATA_DENSE_ATTN_VAR")) : 0;
+    // the engine, 27B MTP3 at 28K, two cooled rounds: verify 40.1 / 40.3 -> 39.3 / 39.3 ms, 58.4 / 58.2 -> 59.5 / 59.5
+    // tok/s - the default for 2-4 tokens (-2); 0: the 64-row tile)
+    if (var < 0) var = std::getenv("STRATA_DENSE_ATTN_VAR") ? std::atoi(std::getenv("STRATA_DENSE_ATTN_VAR")) : -2;
     const int vsel = g_attn_var >= 0 ? g_attn_var : var;
     const int v = vsel == -2 ? (T >= 2 && T <= 4 ? 2 : 0) : (T >= 2 && T <= 8) ? vsel : 0;
     const int AR_v = v ? 32 : AR, AK_v = v == 2 ? 16 : AK, AW_v = v ? 2 : AW;
