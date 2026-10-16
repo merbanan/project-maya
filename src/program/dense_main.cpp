@@ -708,6 +708,9 @@ int main(int argc, char** argv) {
         // commit) - the sum at DONE (debug: the syncs cost a little)
         static const bool rprof = std::getenv("STRATA_DENSE_ROUND_PROF") && std::atoi(std::getenv("STRATA_DENSE_ROUND_PROF")) != 0;
         double rp[4] = {0, 0, 0, 0};
+        // STRATA_DENSE_ACC_HIST=1: rounds by drafts kept (0 .. k) and window size, at DONE - per-position acceptance
+        static const bool acc_hist = std::getenv("STRATA_DENSE_ACC_HIST") && std::atoi(std::getenv("STRATA_DENSE_ACC_HIST")) != 0;
+        long long ah[17][17] = {};   // [drafts offered][drafts kept]
         auto rp_mark = [&](int i, Clock::time_point& t) {
             if (!rprof) return;
             std::string e2;
@@ -808,6 +811,7 @@ int main(int argc, char** argv) {
             } else {
                 if (!sample_rows(model.logits(), W, picks)) { failed = true; break; }
                 while (acc + 1 < W && win[acc + 1] == picks[acc]) ++acc;
+                if (acc_hist && lookup_rounds_before == lookup_rounds && W - 1 <= 16) ++ah[W - 1][acc];
             }
             if (adaptive && !use_df && W > 1) {   // NInfer-style: one more after a full round, back to what was kept + 1
                 if (acc == W - 1) k_cur = std::min(K, k_cur + 1);
@@ -848,6 +852,23 @@ int main(int argc, char** argv) {
             going = more;
         }
         if (failed) { model.reset(); fed.clear(); std::fflush(stdout); continue; }
+        if (acc_hist) {   // P(draft j kept | drafts 0 .. j-1 kept), per offered window size
+            for (int o = 1; o <= 16; ++o) {
+                long long n = 0;
+                for (int a = 0; a <= o; ++a) n += ah[o][a];
+                if (n == 0) continue;
+                std::string line = "strata-dense: acceptance, " + std::to_string(o) + " drafts, " + std::to_string(n) + " rounds:";
+                for (int j = 0; j < o; ++j) {
+                    long long reach = 0, kept = 0;
+                    for (int a = j; a <= o; ++a) reach += ah[o][a];
+                    for (int a = j + 1; a <= o; ++a) kept += ah[o][a];
+                    char b[48];
+                    std::snprintf(b, sizeof b, " p%d %.2f", j + 1, reach ? (double) kept / reach : 0.0);
+                    line += b;
+                }
+                std::fprintf(stderr, "%s\n", line.c_str());
+            }
+        }
         if (rprof && rounds > 0)
             std::fprintf(stderr, "strata-dense: round phases (ms a round): draft %.2f, verify %.2f, accept %.2f, commit %.2f\n",
                          rp[0] / rounds, rp[1] / rounds, rp[2] / rounds, rp[3] / rounds);
