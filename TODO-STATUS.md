@@ -223,10 +223,14 @@ choice (the 0/3 was the test; re-select once a page +15-24 %); the Gemma 4 31B a
 Gemma 31B long context (prompt +16 %, decode 27.6 vs llama.cpp 17.5 at 28K); Qwen 64K cooled (plain 27.5, MTP 65.2,
 DFlash2 67.1 tok/s).
 
-**Left open (with the reason)**: DSpark for DSv4 (each extra verify row costs ~23 ms here, and the joint two-row CPU lane
-measured slower); Gemma 31B prompt: FFN is 43 % of a chunk at ~51 TFLOPS (near V100's sustained rate), full-layer attention
-1.04 s a chunk (~18 TFLOPS: a 64-row tile could still gain, M effort); the 31B assistant's acceptance itself (31 % - the
-drafter's, llama.cpp the same).
+**Left open (with the measured reason)**: DSpark for DSv4 - each verify row past the first costs ~23 ms here (CPU-lane
+bound; the joint two-row lane measured slower, 54 -> 70 ms), so a 5-7 row DSpark verify is ~150-190 ms a round for ~3-4
+tokens (~20 tok/s vs plain 31); the GLM indexer on HMMA - dsa_index is 0.83 s (2.2 %) of a 27K prompt, the ceiling ~1.5 %;
+GLM / Hy3 copy-engine DMA fetch and the low-priority prefetch on top of it - the fetch-overlap experiment it builds on
+measured slower (19.3 -> 17.1-17.7 tok/s) and so did the DSv4 prefetch (31 -> 21.7); the Gemma 31B 64-row attention
+tile - not faster (1.08 vs 1.02 s a chunk); the Hy3 KV stream as the serving default - 56 % faster at 93K but ~12 GB
+of pinned host RAM at 131K, the operator's choice (STRATA_GLM_KV_STREAM); GPU power / clock limits - need root on the
+server (`sudo nvidia-smi -pm 1; sudo nvidia-smi -lgc 1230,1230` or `-pl 200`), not available to this account.
 
 **Host embedding / reduced draft vocabulary on the other engines** (checked 2026-10-16): GLM-5.3-Flash, Hy3 and DSv4
 (Maya's glm fast path) already read token rows on the CPU from the pack (pack_emb_src_) - nothing in VRAM to free; Strata
@@ -267,7 +271,7 @@ throttled: the attention kernel alone would allow ~24 tok/s at 90K (plain decode
 | 2 | STRATA_GLM_PREFILL_SUB unset 4x slower: profile with STRATA_GLM_PREFILL_PROF (suspect mixer_sub stuck at 256 by the 128K DSA carve), CUDA default 1024, upstream PR | 314 vs 78.6 s | ~4x on default configs | S |
 | 3 | GLM DFlash2 verify width capped / adaptive above ~8K (fixed --spec today) | -4% at 12K | ~even at 12K | S |
 | 4 | Agent turns: sweep STRATA_GLM_PREFILL_MIN 4/8/16/32 (token path < 32; longer prompts lend the pool tail and evict experts), then a light no-lend #676 path | - | up to ~0.5 s TTFT a turn | S, M |
-| 5 | Fetch: sweep STRATA_GLM_FETCH_OVERLAP=1 with FETCH_BLOCKS 4/8/16 (does SM stealing explain the overlap loss?), then copy-engine DMA fetch (host thread issues copies) -> unlocks #678 shared expert during the copy and #677 low-priority prefetch | fetch 13-15% of a token, 80-SM kernel on the main stream | +5-8% decode | S, L |
+| 5 | (sweep done: slower at 4 / 8 / 16 blocks; DMA not built) Fetch: sweep STRATA_GLM_FETCH_OVERLAP=1 with FETCH_BLOCKS 4/8/16 (does SM stealing explain the overlap loss?), then copy-engine DMA fetch (host thread issues copies) -> unlocks #678 shared expert during the copy and #677 low-priority prefetch | fetch 13-15% of a token, 80-SM kernel on the main stream | +5-8% decode | S, L |
 | 6 | (split done: dsa_index 2.2 %, experts on TC measured slower - opt-in) GLM prompt stage split (the 27K prompt has ~53 s outside dsa_attn / kda / shexp), then indexer on HMMA (F32 keys + FP32 scorer today; DSv4 6d39cfc got 11.2 -> 2.1 s) and routed experts on FP16 TC (Strata-V100 31ad437c / bnk) | 70.5 s GPU at 27K | 2-3% (indexer) + experts tbd | M |
 | 7 | Profile-pinned + LRU eviction: simulate offline on STRATA_GLM_ROUTE_LOG replays (aged LFU default, live config uses lru) | - | +1-3% | S |
 | 8 | Low-priority-slot prefetch (#677) on top of DMA, only if the "predicted one layer early" stat shows >60% on non-resident experts | prefetch uses the 3 demand spares, 40 SMs, waits on the whole event | 0-4% | M |
@@ -284,7 +288,7 @@ throttled: the attention kernel alone would allow ~24 tok/s at 90K (plain decode
 | 5 | Measure prefetch on DSv4 (never measured) + exact prefetch for hash-routed layers 0-2 (tid2eid) | - | +- | S |
 | 6 | Seed the MTP window with the last 128 prompt rows (starts empty after each prompt) | - | +1-2% short replies | S-M |
 | 7 | Long-context decode attention (28K 25.0 / 93K 21.7 tok/s; +6..12 ms a token over 2K) | - | biggest lever above 28K | M |
-| 8 | DSpark: our GGUFs have only mtp.0 (nextn, 32 tensors); DSpark is a separate 3-stage drafter (Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF, ROCm FP4 -> reconvert). Each extra verify row costs ~23 ms here (CPU-lane bound) -> likely no gain until #2 lands | - | uncertain | L |
+| 8 | (not built - see Left open: ~20 tok/s projected vs 31) DSpark: our GGUFs have only mtp.0 (nextn, 32 tensors); DSpark is a separate 3-stage drafter (Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF, ROCm FP4 -> reconvert). Each extra verify row costs ~23 ms here (CPU-lane bound) -> likely no gain until #2 lands | - | uncertain | L |
 
 ### Strata v100 tree (Flash-Next / strata-q36) - ranked
 | # | Item | Today | Gain | Effort |
