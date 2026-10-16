@@ -2677,6 +2677,14 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         const int64_t want = from != nullptr ? std::max<int64_t>(0, std::atoll(from)) : 4096;
         if (const char* sv = getenv("STRATA_GLM_KV_STREAM"); sv != nullptr && fast_mode_ && !seqs)
             kv_stream_res = std::max<int64_t>(0, std::atoll(sv));
+        else if (sv == nullptr && fast_mode_ && !seqs && max_ctx >= 65536) {
+            // (unset, a context of 64K or more: streamed, 16384 positions a layer cached, the records lent from the RAM
+            // tier as the context grows - ctx 131072: 93K decode 124.3 -> 70.7 ms a token, 2K 49.6 -> 50.3; needles
+            // 3/3; STRATA_GLM_KV_STREAM=0: off)
+            kv_stream_res = 16384;
+            std::fprintf(stderr, "glm pack: CUDA%d K/V stream on by default at a %lld-position context "
+                                 "(STRATA_GLM_KV_STREAM=0: off)\n", dev_, (long long) max_ctx);
+        }
         if (kv_stream_res >= max_ctx) kv_stream_res = 0;   // (the whole context fits the cache: no streaming)
         // (streamed: nothing here - the records are in host memory)
         kv_p0_ = kv_stream_res > 0 ? 0

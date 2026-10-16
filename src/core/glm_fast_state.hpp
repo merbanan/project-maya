@@ -351,6 +351,9 @@ struct Glm5Model::FastState {
         uint8_t* base = nullptr;
         int n = 0;
         bool registered = false;   // numa_pinned's (mmap + cudaHostRegister), not cudaHostAlloc's
+        // (STRATA_GLM_KV_STREAM_LEND: registered in pieces of `chunk` bytes, [0, mapped) still mapped - the KV stream's
+        // records take the tail's chunks as the context grows, ram_retire)
+        size_t chunk = 0, mapped = 0;
         std::vector<int> key;   // slot -> il * n_expert + e, -1 none
         std::vector<uint64_t> tick;   // the route clock when a route last used it (or it arrived): eviction's recency
         std::vector<char> st;   // kRFree / kRHold / kRRelease (promoted: free at the boundary) /

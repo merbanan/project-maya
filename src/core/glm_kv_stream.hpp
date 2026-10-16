@@ -34,6 +34,13 @@ struct KvStream {
     int* lnsel = nullptr;       // [n_layers + 1]
     std::vector<int64_t> sel_pos;
     void forget() { std::fill(sel_pos.begin(), sel_pos.end(), (int64_t) -1); }
+    // (the default; STRATA_GLM_KV_STREAM_LEND=0: one pinned allocation) the records' address range reserved, not pinned - each layer's positions committed
+    // (mprotect + cudaHostRegister, the device reads the host pointers) kGrow at a time as the context grows, and that
+    // memory taken from the RAM tier's tail (ram_retire): a short conversation keeps the whole tier
+    bool lend = false;
+    int64_t committed = 0;          // positions [0, committed) of every layer are pinned
+    size_t lay_host = 0;            // a layer's reserved bytes
+    static constexpr int64_t kGrow = 8192;
 };
 
 }  // namespace strata::core

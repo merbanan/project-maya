@@ -56,6 +56,16 @@
 
 namespace strata::core {
 
+// positions [a, b) of a layer's KV-stream records between the host records and the staging copy (either direction) -
+// with the records lent (KvStream::lend) in pieces of kGrow positions, each a registration of its own: one copy a piece
+static void kv_host_copy(uint8_t* dst, const uint8_t* src, int64_t a, int64_t b, size_t slb, cudaStream_t s) {
+    for (int64_t x = a; x < b;) {
+        const int64_t y = std::min<int64_t>(b, (x / KvStream::kGrow + 1) * KvStream::kGrow);
+        cudaMemcpyAsync(dst + (size_t) x * slb, src + (size_t) x * slb, (size_t) (y - x) * slb, cudaMemcpyDefault, s);
+        x = y;
+    }
+}
+
 namespace gb = strata::kernels::glmb;
 namespace mmq = strata::prefill::mmq;
 
@@ -1620,7 +1630,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 // there, then into host memory with their pages' summaries, and those pages' cached copies dropped)
                 const size_t slb = kvs_ != nullptr ? kvs_->slice : 0;
                 if (kvs_ != nullptr && t0 == 0 && p0 > 0)
-                    cudaMemcpyAsync(kvs_->stage, kvs_->lay[(size_t) il].host, (size_t) p0 * slb, cudaMemcpyDefault, s);
+                    kv_host_copy(kvs_->stage, kvs_->lay[(size_t) il].host, 0, p0, slb, s);
                 const gf::GqaKv kv = kvs_ != nullptr ? kv_stage_view(il) : kv_view(il);
                 gf::gqa_prep(B.q, B.k, B.v, tn, QD, KD, Ly.q_norm, Ly.k_norm, g.norm_eps, pt, g.rope_base, g.n_head, kv, s);
                 if (!gf::gqa_attn_rows(B.q, QD, kv, pt, tn, g.n_head, B.out16, QD, s)) {
@@ -1629,8 +1639,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 }
                 if (kvs_ != nullptr) {
                     const gf::GqaStream& st = kvs_->lay[(size_t) il];
-                    cudaMemcpyAsync(st.host + (size_t) pt * slb, kvs_->stage + (size_t) pt * slb, (size_t) tn * slb,
-                                    cudaMemcpyDefault, s);
+                    kv_host_copy(st.host, kvs_->stage, pt, pt + tn, slb, s);
                     gf::gqa_stream_summarize(kv, st, pt, pt + tn, s);
                     gf::gqa_stream_invalidate(st, pt / gf::kGqaPage, (pt + tn + gf::kGqaPage - 1) / gf::kGqaPage, s);
                     kvs_->forget();

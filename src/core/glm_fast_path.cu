@@ -371,6 +371,47 @@ static void numa_pinned_free(void* p, size_t bytes) {
 #endif
 }
 
+// (STRATA_GLM_KV_STREAM_LEND) a RAM-tier arena registered in pieces of chunk bytes, so that its tail can be given back
+// piece by piece (cudaHostUnregister of one piece + munmap); the device reads it through the host pointers
+static void* chunked_pinned(size_t bytes, size_t chunk) {
+#ifdef __linux__
+    int dev = 0, ok = 0;
+    cudaGetDevice(&dev);
+    if (cudaDeviceGetAttribute(&ok, cudaDevAttrCanUseHostPointerForRegisteredMem, dev) != cudaSuccess || !ok) {
+        cudaGetLastError();
+        return nullptr;
+    }
+    void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) return nullptr;
+    madvise(p, bytes, MADV_HUGEPAGE);
+    for (size_t o = 0; o < bytes; o += 4096) ((volatile char*) p)[o] = 0;
+    for (size_t o = 0; o < bytes; o += chunk) {
+        if (cudaHostRegister((char*) p + o, std::min(chunk, bytes - o), cudaHostRegisterPortable | cudaHostRegisterMapped) !=
+            cudaSuccess) {
+            cudaGetLastError();
+            for (size_t q = 0; q < o; q += chunk) cudaHostUnregister((char*) p + q);
+            munmap(p, bytes);
+            return nullptr;
+        }
+    }
+    return p;
+#else
+    (void) bytes;
+    (void) chunk;
+    return nullptr;
+#endif
+}
+static void chunked_pinned_free(void* p, size_t mapped, size_t chunk) {
+#ifdef __linux__
+    for (size_t o = 0; o < mapped; o += chunk) cudaHostUnregister((char*) p + o);
+    munmap(p, mapped);
+#else
+    (void) p;
+    (void) mapped;
+    (void) chunk;
+#endif
+}
+
 namespace glmfast {
 
 // [off, off + len) of a shard into dst: O_DIRECT through an aligned per-thread bounce buffer when the shard has a
@@ -1388,7 +1429,17 @@ bool Glm5Model::fast_setup(std::string& err) {
             void* p = nullptr;
             // a refusal near a pinning cap: 1/32 less a try for the first four (a tier just over a cap loses ~3%, not
             // the 12% of a 7/8 step), then 1/8 less
+            const bool kv_lend = kvs_ != nullptr && kvs_->lend;
             for (int tries = 0; n >= least; ++tries) {
+                // (KV stream lending: in ~256 MB pieces the records can take back from the tail - a whole number of
+                // slots each: a copy into a slot must not cross two registrations)
+                const size_t ck = std::max<size_t>(1, ((size_t) 256 << 20) / R.stride) * R.stride;
+                if (kv_lend && (p = chunked_pinned((size_t) n * R.stride, ck)) != nullptr) {
+                    R.registered = true;
+                    R.chunk = ck;
+                    R.mapped = (size_t) n * R.stride;
+                    break;
+                }
                 if ((p = numa_pinned((size_t) n * R.stride)) != nullptr) {   // (over every socket: numa_pinned)
                     R.registered = true;
                     break;
@@ -2434,7 +2485,8 @@ void Glm5Model::fast_destroy() {
                      (unsigned long long) F->kda_graphs.invalidations);
     F->kda_graphs.clear();   // before the graph's buffers and streams are freed
     for (auto& R : F->rc)
-        if (R.base && R.registered) numa_pinned_free(R.base, (size_t) R.n * R.stride);
+        if (R.base && R.chunk) chunked_pinned_free(R.base, R.mapped, R.chunk);
+        else if (R.base && R.registered) numa_pinned_free(R.base, (size_t) R.n * R.stride);
         else if (R.base) cudaFreeHost(R.base);
     for (auto& d : F->draining) cudaEventDestroy(d.ev);
     for (auto& m : F->bg) cudaEventDestroy(m.ev);
@@ -3860,16 +3912,38 @@ bool Glm5Model::kv_stream_init(int64_t resident, std::string& err) {
     const size_t NL = K->layers.size(), page_b = (size_t) P * K->slice;
     const size_t lay_host = (size_t) max_pages * page_b;
     K->host_bytes = NL * lay_host;
-    if (cudaHostAlloc((void**) &K->host, K->host_bytes, cudaHostAllocMapped) != cudaSuccess) {
-        cudaGetLastError();
-        K->host = nullptr;
-        err = "glm kv stream: " + std::to_string(K->host_bytes >> 20) + " MB of pinned host memory did not allocate";
-        return false;
-    }
+    K->lay_host = lay_host;
     uint8_t* hdev = nullptr;
-    if (cudaHostGetDevicePointer((void**) &hdev, K->host, 0) != cudaSuccess) {
-        err = "glm kv stream: no device pointer for the host records";
-        return false;
+#ifdef __linux__
+    {
+        int ok = 0;
+        // (the default: STRATA_GLM_KV_STREAM_LEND=0 pins the whole context's records at load, from the RAM tier's share)
+        K->lend = !(getenv("STRATA_GLM_KV_STREAM_LEND") != nullptr && std::atoi(getenv("STRATA_GLM_KV_STREAM_LEND")) == 0) &&
+                  cudaDeviceGetAttribute(&ok, cudaDevAttrCanUseHostPointerForRegisteredMem, dev_) == cudaSuccess && ok;
+        cudaGetLastError();
+    }
+    if (K->lend) {   // reserved only: kv_stream_commit pins positions as the context grows
+        void* p = mmap(nullptr, K->host_bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (p == MAP_FAILED) {
+            err = "glm kv stream: the records' address range did not reserve";
+            return false;
+        }
+        K->host = (uint8_t*) p;
+        hdev = K->host;   // (registered memory: the device reads the host pointers)
+        if (!kv_stream_commit(std::min<int64_t>(max_ctx_, KvStream::kGrow), err)) return false;
+    } else
+#endif
+    {
+        if (cudaHostAlloc((void**) &K->host, K->host_bytes, cudaHostAllocMapped) != cudaSuccess) {
+            cudaGetLastError();
+            K->host = nullptr;
+            err = "glm kv stream: " + std::to_string(K->host_bytes >> 20) + " MB of pinned host memory did not allocate";
+            return false;
+        }
+        if (cudaHostGetDevicePointer((void**) &hdev, K->host, 0) != cudaSuccess) {
+            err = "glm kv stream: no device pointer for the host records";
+            return false;
+        }
     }
     // the device side: per layer the slots, the tables, the summaries; then the selection buffers, the staging copy
     const auto al = [](size_t b) { return (b + 255) / 256 * 256; };
@@ -3932,6 +4006,16 @@ bool Glm5Model::kv_stream_init(int64_t resident, std::string& err) {
 void Glm5Model::kv_stream_free() {
     if (kvs_ == nullptr) return;
     if (kvs_->dev) cudaFree(kvs_->dev);
+#ifdef __linux__
+    if (kvs_->host && kvs_->lend) {
+        const size_t NL = kvs_->layers.size(), sl = kvs_->slice;
+        for (size_t i = 0; i < NL; ++i)
+            for (int64_t a = 0; a < kvs_->committed; a += KvStream::kGrow)
+                cudaHostUnregister(kvs_->host + i * kvs_->lay_host + (size_t) a * sl);
+        munmap(kvs_->host, kvs_->host_bytes);
+        kvs_->host = nullptr;
+    }
+#endif
     if (kvs_->host) cudaFreeHost(kvs_->host);
     delete kvs_;
     kvs_ = nullptr;
@@ -3981,7 +4065,140 @@ size_t Glm5Model::kv_room(int64_t pos_end) const {
     return lo > fast_->xpool ? (size_t) (lo - fast_->xpool) : 0;
 }
 
+// (KV stream lending) every layer's records pinned up to position to (rounded to kGrow), each step's bytes first taken
+// from the RAM tier's tail (ram_retire) when the tier is chunked
+bool Glm5Model::kv_stream_commit(int64_t to, std::string& err) {
+#ifdef __linux__
+    KvStream* K = kvs_;
+    const int64_t max_pos = (int64_t) (K->lay_host / K->slice);
+    to = std::min<int64_t>(max_pos, (to + KvStream::kGrow - 1) / KvStream::kGrow * KvStream::kGrow);
+    if (to <= K->committed) return true;
+    const size_t NL = K->layers.size(), sl = K->slice;
+    if (fast_ != nullptr) {   // (at load the tier is not there yet: sized from what is free after the first step)
+        const size_t need = NL * (size_t) (to - K->committed) * sl;
+        const size_t got = ram_retire(need + ((size_t) 256 << 20), err);
+        if (!err.empty()) return false;
+        std::fprintf(stderr, "glm kv stream: CUDA%d records pinned to position %lld (%.2f GB more; %.2f GB from the RAM "
+                             "tier)\n", dev_, (long long) to, (double) need / 1073741824.0, (double) got / 1073741824.0);
+    }
+    for (int64_t a = K->committed; a < to; a += KvStream::kGrow) {
+        const int64_t b = std::min<int64_t>(to, a + KvStream::kGrow);
+        for (size_t i = 0; i < NL; ++i) {
+            uint8_t* q = K->host + i * K->lay_host + (size_t) a * sl;
+            const size_t len = (size_t) (b - a) * sl;
+            if (mprotect(q, len, PROT_READ | PROT_WRITE) != 0) {
+                err = "glm kv stream: the records' range did not commit";
+                return false;
+            }
+            for (size_t o = 0; o < len; o += 4096) ((volatile uint8_t*) q)[o] = 0;
+            if (cudaHostRegister(q, len, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+                cudaGetLastError();
+                err = "glm kv stream: the records' " + std::to_string(len >> 20) + " MB did not pin";
+                return false;
+            }
+        }
+        K->committed = b;
+    }
+    return true;
+#else
+    (void) to;
+    (void) err;
+    return true;
+#endif
+}
+
+// (KV stream lending) the RAM tier's tail chunks given back, at least want bytes when the tier has them: at a quiet
+// point (as lend_range: the moves held and landed, a boundary, the lookahead readers idle, the device idle) the tail's
+// experts leave the tier (as a step-4 eviction: rtab cleared), the class's slot count shrinks below the chunk, and the
+// chunk is unregistered and unmapped.  The bytes given back.
+size_t Glm5Model::ram_retire(size_t want, std::string& err) {
+#ifdef __linux__
+    FastState* F = fast_;
+    if (F == nullptr) return 0;
+    bool any = false;
+    for (auto& R : F->rc) any = any || (R.chunk > 0 && R.mapped > 2 * R.chunk);
+    if (!any) return 0;
+    F->bg_hold = true;
+    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm ram retire copies", err) || !fast_boundary(err)) return 0;
+    size_t freed = 0;
+    if (F->bg.empty() && F->draining.empty()) {
+        for (;;) {   // the lookahead readers idle (their slots landed or not taken)
+            {
+                std::lock_guard<std::mutex> l(F->ah_mu);
+                if (F->ah_q.empty() && F->ah_inflight.load() == 0) break;
+            }
+            std::this_thread::yield();
+        }
+        if (!glmfast::cuda_ok(cudaDeviceSynchronize(), "glm ram retire sync", err)) return 0;
+        std::lock_guard<std::mutex> lk(F->mu);
+        int nu = 0;
+        bool ok = true;
+        const auto flush = [&]() {
+            if (nu == 0 || !ok) return;
+            ok = glmfast::cuda_ok(cudaMemcpyAsync(F->upd_key_d, F->upd_key_h, (size_t) nu * sizeof(int),
+                                                  cudaMemcpyHostToDevice, F->cs), "glm retire keys", err) &&
+                 glmfast::cuda_ok(cudaMemcpyAsync(F->upd_val_d, F->upd_val_h, (size_t) nu * sizeof(unsigned long long),
+                                                  cudaMemcpyHostToDevice, F->cs), "glm retire values", err);
+            if (ok) {
+                gf::tab_update(F->tab, F->upd_key_d, F->upd_val_d, nu, F->cs);
+                ok = glmfast::cuda_ok(cudaGetLastError(), "glm retire table update", err);
+            }
+            const cudaError_t e = cudaStreamSynchronize(F->cs);
+            if (ok) ok = glmfast::cuda_ok(e, "glm retire table sync", err);
+            nu = 0;
+        };
+        const auto upd = [&](size_t k, unsigned long long v) {
+            if (!ok) return;
+            if (nu == FastState::kMaxUpd) flush();
+            if (!ok) return;
+            F->upd_key_h[nu] = (int) k;
+            F->upd_val_h[nu] = v;
+            ++nu;
+        };
+        while (freed < want && ok) {
+            FastState::RamClass* best = nullptr;   // the class with the most mapped chunks (two always stay)
+            for (auto& R : F->rc)
+                if (R.chunk > 0 && R.mapped > 2 * R.chunk && (best == nullptr || R.mapped > best->mapped)) best = &R;
+            if (best == nullptr) break;
+            FastState::RamClass& R = *best;
+            const size_t last = (R.mapped - 1) / R.chunk * R.chunk;   // the tail chunk's start
+            const int new_n = (int) (last / R.stride);
+            bool clean = true;   // (a slot mid-move would need its DMA: retired at a later step instead)
+            for (int s = new_n; s < R.n; ++s)
+                clean = clean && (R.st[(size_t) s] == FastState::kRFree || R.st[(size_t) s] == FastState::kRHold);
+            if (!clean) break;
+            for (int s = new_n; s < R.n; ++s) {
+                const int key = R.key[(size_t) s];
+                if (key >= 0 && F->ram_of[(size_t) key] == s) {
+                    upd(F->rtab_key(key), 0ull);
+                    F->ram_of[(size_t) key] = -1;
+                    F->left[(size_t) key] = 2;
+                }
+            }
+            flush();
+            if (!ok) break;
+            R.n = new_n;
+            R.key.resize((size_t) new_n);
+            R.st.resize((size_t) new_n);
+            R.tick.resize((size_t) new_n);
+            cudaHostUnregister(R.base + last);
+            munmap(R.base + last, R.mapped - last);
+            freed += R.mapped - last;
+            F->ram_bytes -= std::min(F->ram_bytes, R.mapped - last);
+            R.mapped = last;
+        }
+    }
+    F->bg_hold = false;
+    return freed;
+#else
+    (void) want;
+    (void) err;
+    return 0;
+#endif
+}
+
 bool Glm5Model::kv_ensure(int64_t pos_end, std::string& err) {
+    if (kvs_ != nullptr && kvs_->lend) return kv_stream_commit(pos_end, err);
     if (kv_b_ == nullptr || pos_end <= kv_lent_) return true;
     const int64_t to = std::min<int64_t>(max_ctx_, (pos_end + 1023) / 1024 * 1024);
     uint64_t moved = 0, dropped = 0;
@@ -4982,8 +5199,14 @@ std::vector<std::pair<int64_t, int64_t>> Glm5Model::slot_gqa_runs(int64_t n) con
     std::vector<std::pair<int64_t, int64_t>> r;
     if (!g_.gqa()) return r;
     if (kvs_ != nullptr) {   // streamed: every layer's host records (an offset from state_ as well)
+        // (lent records: a run per kGrow positions - each piece a registration of its own)
+        const int64_t step = kvs_->lend ? KvStream::kGrow : std::max<int64_t>(1, n);
         for (int il : kvs_->layers)
-            r.push_back({(int64_t) ((const float*) kvs_->lay[(size_t) il].host - state_), n * (int64_t) kvs_->slice / 4});
+            for (int64_t a = 0; a < n; a += step) {
+                const int64_t b = std::min<int64_t>(n, a + step);
+                r.push_back({(int64_t) ((const float*) (kvs_->lay[(size_t) il].host + (size_t) a * kvs_->slice) - state_),
+                             (b - a) * (int64_t) kvs_->slice / 4});
+            }
         return r;
     }
     const int64_t p0 = kv_b_ != nullptr ? kv_p0_ : max_ctx_, first = gqa_kv_[(size_t) l0_];

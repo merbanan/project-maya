@@ -410,6 +410,8 @@ public:
     strata::kernels::glmf::GqaKv kv_stage_view(int il) const;   // ... its staging copy (the prompt path)
     void kv_stream_reload(int64_t n);                           // nothing cached, the summaries of [0, n) again
     bool kv_ensure(int64_t pos_end, std::string& err);      // hy_v3: region b lent to the cache up to pos_end
+    bool kv_stream_commit(int64_t to, std::string& err);   // (KV stream lending: pin the records' positions up to to)
+    size_t ram_retire(size_t want, std::string& err);      // (KV stream lending: the RAM tier's tail chunks given back)
     const uint8_t* kv_lo(int64_t pos_end) const;            // ... the lowest byte of positions [p0, pos_end) there
     size_t kv_room(int64_t pos_end) const;                  // ... the tail's bytes below them (the prompt path's)
     void kv_trim(int64_t keep);                             // ... and handed back to the pool beyond keep
