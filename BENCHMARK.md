@@ -228,7 +228,8 @@ bartowski IQ2_XXS pack, tq6v3 K/V, one V100, `--max-context 131072`, cooled runs
 The default streams the K/V cache at contexts of 64K and up: 16384 positions a layer cached in VRAM, pages re-selected
 once a page, the host records pinned 8192 positions at a time from the expert RAM tier's tail as the conversation grows
 (the old stream pinned 11.9 GB at load: RAM tier 40.7 instead of 53.1 GB, ~14 disk reads a token on short prompts).
-Below 64K nothing streams (2K at a 32K context: 20.7 tok/s). `STRATA_GLM_KV_STREAM=0` turns it off. An agent turn of
+Prompt (the engine's prompt ms/token, the same with and without the stream): 2K ~300 tok/s (3.3 ms), 30K ~345 (2.9 ms),
+93K ~128 (7.8 ms) - a 93K prompt reads in ~12 minutes. Below 64K nothing streams (2K at a 32K context: 20.7 tok/s). `STRATA_GLM_KV_STREAM=0` turns it off. An agent turn of
 under 32 tokens after a 13.5K history: 751 ms (1,521 before the batched path started at 8 tokens).
 
 Earlier (2026-10-14): 28K 15.47 tok/s (attention 16.9 ms a token), 66K 11.39 tok/s.
