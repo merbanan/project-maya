@@ -170,6 +170,12 @@ expected gain (guess = not measured), effort S/M/L. Ranked plan per engine; "mea
 | dsv4: prompt indexer split (26K) | q 0.2 s, score 1.24 s, top-k 0.05 s: the score kernel is the target (two-row kernel under test) | dsv4 2a4cc15 (timer) |
 | glm: PREFILL_SUB default 1024 on CUDA | 27K prompt 68.7 -> 67.2 / 67.6 s (shexp 3.03 -> 1.69 s) on glm-dflash; upstream's 4x is upstream-code-specific (open) | glm-dflash 0d75afc |
 | glm: DFlash2 verify width cap at 12K | --spec 2 / 3 / 4 / min-p 0.98 all 20-21 tok/s vs plain ~22: no width recovers 12K; short: +4-6% | - (no change) |
+| glm: KDA_SPLIT=8 vs 4 | 27K prompt kda_rec 3.33 / 3.33 s (4) vs 5.11 / 5.14 s (8): 4 stays | - |
+| glm: DFlash2 window cost by rows (explore stats) | short: 2 rows 66, 3: 95, 4: 113, 5: 142, 8: 203 ms; 12K: 74 .. 231 ms - linear, ~25-30 ms a row (no 5-row cliff): each row's own experts through the CPU lane | next: one CPU-lane pass for the rows' shared experts (dsv4: consecutive tokens share 2.26 of 6 experts, 38%) |
+| dsv4: MTP confidence gate 0.5 | 34.9 / 34.8 -> 35.4 / 35.2 tok/s; rounds under 0.5 accepted 25-45% | dsv4 57036eb |
+| dsv4: prompt indexer two rows a block | score 1,235 -> 1,030 ms at 26K, needles 3/3 | dsv4 57036eb |
+| strata-dense: Gemma 4 31B at 28K | needles 3/3, prompt 455 tok/s, decode 18.8 tok/s | - |
+| strata-dense: 27B at 28K / 64K (cooled) | 28K: plain 30.8, MTP3 55.6, DFlash2 78.8-79.3 tok/s (the earlier 36 was throttling); 64K: plain 14.3, MTP3 24.2, DFlash2 37.9 - a 64K stage profile is running | - |
 | glm: turn snapshot at the last user token (trappsquid) | the live server saves 31-100K-token conversation slots; no per-request reuse log to show a gap - closed | - |
 
 **Host embedding / reduced draft vocabulary on the other engines** (checked 2026-10-16): GLM-5.3-Flash, Hy3 and DSv4
