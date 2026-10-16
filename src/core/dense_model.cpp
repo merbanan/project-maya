@@ -11,6 +11,7 @@
 #include "strata/kernels/q35_kernels.hpp"
 #include "strata/kernels/q35_moe.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/moe_tc_kq.hpp"
 #include "strata/prefill/gemm.hpp"
 
 #include <cuda_runtime.h>
@@ -1109,18 +1110,28 @@ void moe_ffn(DenseModel::Impl& I, const DenseConfig& c, Layer& L, float* x, int 
     // gate and up: the pairs' token rows quantized once (gate and up share a type in these files)
     mmq::quantize(I.xn, I.moe_tok, I.moe_xq, L.type_gate, E, E, P, s);
     mmq::Product pr;
+    // the K-quant experts on the FP16 tensor cores on sm_70 (moe_tc_kq, register fragments; STRATA_DENSE_MOE_TC=0: MMQ) -
+    // 35B prompt, two cooled rounds: 1.6K 702 / 691 -> 664 / 654 ms, 6K 2,329 / 2,325 -> 2,241 / 2,242, 28K 13.17 / 13.16 ->
+    // 12.84 / 12.85 s; needles 3/3, greedy 128/128 vs llama.cpp
+    static const bool tc_env = !(std::getenv("STRATA_DENSE_MOE_TC") && std::atoi(std::getenv("STRATA_DENSE_MOE_TC")) == 0);
+    const auto run_pr = [&](const mmq::Product& q) {
+        if (tc_env && strata::prefill::tckq::available() && strata::prefill::tckq::supported(q.type, q.w_cols, q.w_rows))
+            strata::prefill::tckq::product(q.type, q.w, q.expert_bytes, q.w_cols, q.w_rows, q.n, q.bounds, q.max_rows, q.xq,
+                                           q.total_rows, q.dst, q.ld_dst, s);
+        else I.mmq->run(q, s);
+    };
     pr.w = L.exp_gate; pr.type = L.type_gate; pr.w_rows = FF; pr.w_cols = E;
     pr.expert_bytes = mmq::matrix_bytes(L.type_gate, FF, E); pr.n = NE; pr.xq = I.moe_xq; pr.bounds = I.moe_bounds;
     pr.ids = I.moe_iota; pr.total_rows = P; pr.max_rows = max_rows; pr.dst = I.moe_g; pr.ld_dst = FF;
-    I.mmq->run(pr, s);
+    run_pr(pr);
     if (L.type_up != L.type_gate) mmq::quantize(I.xn, I.moe_tok, I.moe_xq, L.type_up, E, E, P, s);
     pr.w = L.exp_up; pr.type = L.type_up; pr.expert_bytes = mmq::matrix_bytes(L.type_up, FF, E); pr.dst = I.moe_u;
-    I.mmq->run(pr, s);
+    run_pr(pr);
     dense_swiglu(I.moe_g, I.moe_u, I.moe_g, (int64_t) P * FF, s);
     mmq::quantize(I.moe_g, nullptr, I.moe_xq, L.type_down, FF, FF, P, s);
     pr.w = L.exp_down; pr.type = L.type_down; pr.w_rows = E; pr.w_cols = FF;
     pr.expert_bytes = mmq::matrix_bytes(L.type_down, E, FF); pr.dst = I.moe_y; pr.ld_dst = E;
-    I.mmq->run(pr, s);
+    run_pr(pr);
     I.stage("moe_experts", s);
     }
     // the shared expert and its gate
