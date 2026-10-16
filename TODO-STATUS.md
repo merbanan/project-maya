@@ -183,6 +183,11 @@ expected gain (guess = not measured), effort S/M/L. Ranked plan per engine; "mea
 | strata-dense: 32-row / 16-key verify attention tiles | kernel 64K 4 rows 0.698 -> 0.542 ms, engine even (28K) / thermal-bound (64K): opt-in STRATA_DENSE_ATTN_VAR=2 | qwen38 897800e |
 | hy3: fetch overlap (STRATA_GLM_FETCH_OVERLAP) with 4 / 8 / 16 fetch blocks | 2K decode 19.32 (off) vs 17.42 / 17.66 / 17.07 tok/s, needles 3/3: slower even with few blocks - SM stealing is not the cause; the copy-engine DMA fetch is not worth building | - |
 | dsv4: next-layer prefetch (STRATA_GLM_PREFETCH_N 2 / 4) | plain decode 30.7 / 31.2 / 32.7 -> 21.7 / 21.7 / 21.7 tok/s - off (as on Hy3) | - |
+| dsv4: long-context decode (28K vs 2K, stage profile) | 41.3 vs 34.9 ms a token: attention 3.6 -> 5.0, expert fetch 3.4 -> 4.9, disk waits 0.2 -> 2.2, indexer +0.95 ms - the KV cache takes VRAM from the expert pool; no attention rewrite to do | - |
+| dsv4: seed the MTP window with the last prompt rows | not cheaply possible: the batched prompt path keeps no per-position streams for the MTP block's input | - |
+| glm: profile-pinned + LRU eviction (route-log replay, tools/glm_policy_sim.py) | 67K routes at 3,780 slots: LRU 78.5 %, aged LFU 69.5 %, pinned 25/50/75 % + LRU 77.0 / 75.3 / 72.1 %: pinning does not help; LRU the default on one GPU (a split keeps the counts) | glm-dflash (pending A/B) |
+| strata-dense: alpha / beta as one GEMV | greedy 128/128, plain 34.9 / 34.9 vs 34.9 / 34.9 tok/s - no gain, not kept | - |
+| strata-dense: Gemma 4 31B decode | short 32.5 tok/s (llama.cpp 33.6); 28K 18.8 with attention 25.6 of 55 ms a token: the full layers (head 512, 8 query heads a KV head) ran the 64-row tile at T=1 - now two decode blocks of 4 heads (A/B running); assistant: per-layer KV head counts (A/B running) | - |
 | glm: turn snapshot at the last user token (trappsquid) | the live server saves 31-100K-token conversation slots; no per-request reuse log to show a gap - closed | - |
 
 **Host embedding / reduced draft vocabulary on the other engines** (checked 2026-10-16): GLM-5.3-Flash, Hy3 and DSv4
