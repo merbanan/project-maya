@@ -194,6 +194,8 @@ expected gain (guess = not measured), effort S/M/L. Ranked plan per engine; "mea
 | strata-dense: Gemma 4 31B full-layer decode (two blocks of 4 heads a K/V head) | 28K decode 18.7 / 18.8 -> 24.0 / 22.1 tok/s, needles 3/3 | qwen38 5720ad9 |
 | strata-dense: Gemma 4 31B assistant (unsloth mtp-gemma-4-31B-it.gguf, per-layer K/V heads) | short 33.0 vs 32.5 tok/s (1.78 tokens a round), 28K 27.2 tok/s, needles 3/3, greedy as plain | qwen38 5720ad9 |
 | strata-dense: 35B prompt experts on FP16 tensor cores (moe_tc_kq: Q4_K / Q5_K / Q6_K dequantized to FP16 in shared memory, jmnargi's tile) | correct (greedy 128/128, needles 3/3) but slower than ggml's MMQ: 28K prompt 2,256 / 2,252 -> 1,946 / 1,946 tok/s, 1.6K 1,459 -> 1,169 - dropped. Strata item 5 (the same for strata-q36's K-quant experts) falls with it; only a bnk-style register-fragment kernel could win (L, open) | - |
+| hy3: KV stream - re-select pages every N tokens | profiled at 93K (tq6v3, STRATA_GLM_KV_STREAM=16384): resolve 11.6 + select 4.1 of 76 ms a token - but the stream found 0/3 needles at 93K (its page choice loses the context), so a staler selection is not built; the served config does not stream. Open: the stream's selection quality | - |
+| strata (Flash-Next): jmnargi's prompt-attention latency pipeline cherry-picked | 6K 1,849 / 1,856 -> 1,889 / 1,889, 16.5K 1,870 / 1,874 -> 1,908 / 1,904 tok/s, the same tokens | v100 0c396a02, 982c2a1c |
 | glm: turn snapshot at the last user token (trappsquid) | the live server saves 31-100K-token conversation slots; no per-request reuse log to show a gap - closed | - |
 
 **Host embedding / reduced draft vocabulary on the other engines** (checked 2026-10-16): GLM-5.3-Flash, Hy3 and DSv4
