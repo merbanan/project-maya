@@ -25,5 +25,8 @@ void dequant_f16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, 
 
 /// The same into FP32 (tests and small tensors).
 void dequant_f32(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, float* out, void* stream);
+/// one row as dequant_f32, its index read on the device from *d_row (no host round trip; not the i-quant formats)
+bool dequant_f32_dev_supported(int ggml_type) noexcept;
+void dequant_f32_dev(int ggml_type, const void* blocks, const int32_t* d_row, int64_t cols, float* out, void* stream);
 
 }  // namespace strata::kernels

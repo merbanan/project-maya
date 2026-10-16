@@ -689,6 +689,10 @@ int main(int argc, char** argv) {
                 out.push_back(sparse_dist(ids.data() + (size_t) r * sp.top_k, lg.data() + (size_t) r * sp.top_k, sp.top_k, sp));
             return true;
         };
+        // STRATA_DENSE_DEV_CHAIN=1: the greedy MTP drafts chained on the device (one sync a round, not one a draft) - measured
+        // even (27B MTP4 68.0 / 68.0 vs 68.0 / 68.4, E4B assistant 156.5 vs 156.6 tok/s, the same tokens): off by default
+        static const bool dev_chain_env = std::getenv("STRATA_DENSE_DEV_CHAIN") && std::atoi(std::getenv("STRATA_DENSE_DEV_CHAIN")) != 0;
+        const bool dev_chain = dev_chain_env && !spec_s && model.mtp_dev_ok();
         static const bool adaptive = std::getenv("STRATA_DENSE_ADAPTIVE") ? std::atoi(std::getenv("STRATA_DENSE_ADAPTIVE")) != 0
                                                                           : cfg.n_expert > 0;
         int k_cur = K;
@@ -746,6 +750,20 @@ int main(int argc, char** argv) {
                     if (spec_s) {   // a draw from the draft head's own (filtered) distribution, kept for the accept test
                         if (!topk_rows(model.mtp_logits(), model.draft_vocab(), 1, qd)) { failed = true; break; }
                         d = draw(qd.back(), srng);
+                    } else if (dev_chain) {
+                        // (device-resident chain: draft j's argmax stays in d_next[j] and feeds the next step; the
+                        // drafts reach the host once, after the last)
+                        strata::kernels::q35_argmax_rows(model.mtp_logits(), model.draft_vocab(), model.draft_vocab(), 1, d_next + j, cs);
+                        if (j + 1 < k && !model.mtp_forward_dev(d_next + j, model.mtp_hidden(), pos + j, err)) {
+                            std::printf("ERR %s\n", err.c_str()); failed = true; break;
+                        }
+                        if (j + 1 == k) {
+                            int dh[16];
+                            cudaMemcpyAsync(dh, d_next, (size_t) k * sizeof(int), cudaMemcpyDeviceToHost, cs);
+                            if (!model.sync(err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
+                            win.insert(win.end(), dh, dh + k);
+                        }
+                        continue;
                     } else {
                         strata::kernels::q35_argmax_rows(model.mtp_logits(), model.draft_vocab(), model.draft_vocab(), 1, d_next, cs);
                         cudaMemcpyAsync(&d, d_next, sizeof(int), cudaMemcpyDeviceToHost, cs);

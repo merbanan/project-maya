@@ -118,6 +118,9 @@ public:
     /// hidden row t of `hidden` (device, rows of n_embd).  Its own K/V cache gets cells p0 .. p0 + T - 1; the logits
     /// of the last row (or every row: all) go to mtp_logits(), its normed hidden rows to mtp_hidden().
     bool mtp_forward(const int32_t* toks, const float* hidden, int64_t p0, int T, bool all_logits, std::string& err);
+    /// one MTP row whose token is on the device (*d_tok - a draft's argmax): no host round trip between drafts
+    bool mtp_forward_dev(const int32_t* d_tok, const float* hidden, int64_t p0, std::string& err);
+    bool mtp_dev_ok() const;
     float* mtp_logits() const;         ///< rows of draft_vocab()
     /// The vocabulary drafts come from: the first N ids of the head (STRATA_DENSE_DRAFT_VOCAB, NInfer's reduced
     /// proposal head), else all of it.  MTP's logits rows and DFlash2's candidates use it.

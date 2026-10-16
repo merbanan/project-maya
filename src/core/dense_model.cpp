@@ -288,6 +288,7 @@ struct DenseModel::Impl {
     std::unique_ptr<strata::prefill::mmq::Context> mmq;
     // MTP
     float *mtp_x = nullptr, *mtp_cat = nullptr, *mtp_h = nullptr, *mtp_logits = nullptr;
+    const int32_t* mtp_dev_tok = nullptr;   // (mtp_forward_dev: the row's token on the device)
 
     // ---- STRATA_DENSE_PROF=1: GPU time a stage (events around each), printed every 64 forward passes
     struct Prof {
@@ -1353,7 +1354,8 @@ bool DenseModel::mtp_forward(const int32_t* toks, const float* hidden, int64_t p
         const int E = cfg_.n_embd, AE = I.asst_E, AH = I.asst_H, NL = cfg_.n_layer, HK = cfg_.n_head_kv;
         const float eps = cfg_.rms_eps;
         try {
-            dequant_f32(I.embd.type, I.embd.dev, toks[T - 1], 1, E, I.mtp_cat, s);
+            if (I.mtp_dev_tok) dequant_f32_dev(I.embd.type, I.embd.dev, I.mtp_dev_tok, E, I.mtp_cat, s);
+            else dequant_f32(I.embd.type, I.embd.dev, toks[T - 1], 1, E, I.mtp_cat, s);
             g4_scale(I.mtp_cat, sqrtf((float) E), E, s);
             cudaMemcpyAsync(I.mtp_cat + E, hidden + (size_t) (T - 1) * E, (size_t) E * 4, cudaMemcpyDeviceToDevice, s);
             I.prep(I.mtp_cat, 2 * E, 1);
@@ -1404,8 +1406,10 @@ bool DenseModel::mtp_forward(const int32_t* toks, const float* hidden, int64_t p
     try {
         I.mark(s);
         // [enorm(emb(tok)) | hnorm(h)] -> eh_proj
-        for (int t = 0; t < T; ++t)
-            dequant_f32(I.embd.type, I.embd.dev, toks[t], 1, E, I.y + (size_t) t * E, s);
+        for (int t = 0; t < T; ++t) {
+            if (I.mtp_dev_tok) dequant_f32_dev(I.embd.type, I.embd.dev, I.mtp_dev_tok, E, I.y + (size_t) t * E, s);
+            else dequant_f32(I.embd.type, I.embd.dev, toks[t], 1, E, I.y + (size_t) t * E, s);
+        }
         float* cat = I.mtp_cat;
         q35_rms_rows(I.y, E, M.enorm, I.xn, nullptr, T, E, eps, s);
         cudaMemcpy2DAsync(cat, (size_t) 2 * E * 4, I.xn, (size_t) E * 4, (size_t) E * 4, T, cudaMemcpyDeviceToDevice, s);
@@ -1430,6 +1434,16 @@ bool DenseModel::mtp_forward(const int32_t* toks, const float* hidden, int64_t p
         err = std::string("dense model: ") + e.what();
         return false;
     }
+}
+
+bool DenseModel::mtp_dev_ok() const { return dequant_f32_dev_supported(impl_->embd.type); }
+
+bool DenseModel::mtp_forward_dev(const int32_t* d_tok, const float* hidden, int64_t p0, std::string& err) {
+    const int32_t dummy = 0;
+    impl_->mtp_dev_tok = d_tok;
+    const bool ok = mtp_forward(&dummy, hidden, p0, 1, false, err);
+    impl_->mtp_dev_tok = nullptr;
+    return ok;
 }
 
 bool DenseModel::has_dflash() const { return impl_->df.on; }
