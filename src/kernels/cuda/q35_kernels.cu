@@ -90,6 +90,51 @@ __global__ void qk_l2_kernel(float* __restrict__ x, int ld, float eps) {
     r[threadIdx.x] = __fmaf_rn(__fmul_rn(scale, v), 1.0f / sqrtf(128.0f), 0.0f);
 }
 
+// conv_seq + qk_l2 + gate_beta in one launch (q35_gdn_prep): block b < C / 128 the conv of channels 128 b .. (one q / k
+// head row when b < n_qk: its L2 norm per token in the block, the same arithmetic as qk_l2_kernel), the rest gate_beta's
+// elements, 128 a block
+__global__ void __launch_bounds__(128) gdn_prep_kernel(float* __restrict__ st, const float* __restrict__ raw, int ld,
+                                                       const float* __restrict__ w, float* __restrict__ out, int T, int C,
+                                                       int commit, int n_qk, float eps, float* __restrict__ a,
+                                                       float* __restrict__ bt, const float* __restrict__ dt,
+                                                       const float* __restrict__ ssm_a, int h_v, int ldg) {
+    __shared__ float sh[32];
+    const int nb = C / 128;
+    if ((int) blockIdx.x >= nb) {
+        const int k = ((int) blockIdx.x - nb) * 128 + threadIdx.x;
+        if (k >= T * h_v) return;
+        const int h = k % h_v, i = (k / h_v) * ldg + h;
+        const float v = __fadd_rn(a[i], dt[h]);
+        const float sp = v > 20.0f ? v : logf(1.0f + expf(v));
+        a[i] = sp * ssm_a[h];
+        bt[i] = 1.0f / (1.0f + expf(-bt[i]));
+        return;
+    }
+    const int c = blockIdx.x * 128 + threadIdx.x;
+    const bool qk = (int) blockIdx.x < n_qk;
+    float h0 = st[c * 3], h1 = st[c * 3 + 1], h2 = st[c * 3 + 2];
+    const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+    for (int t = 0; t < T; ++t) {
+        const float x = raw[(size_t) t * ld + c];
+        float sum = 0.0f;
+        sum += h0 * w0;
+        sum += h1 * w1;
+        sum += h2 * w2;
+        sum += x * w3;
+        sum = __fadd_rn(sum, 0.0f);
+        float o = sum / (1.0f + expf(-sum));
+        if (qk) {
+            const float s2 = block_sum(o * o, sh);
+            const float scale = rsqrtf(s2 / 128.0f + eps / 128.0f);
+            o = __fmaf_rn(__fmul_rn(scale, o), 1.0f / sqrtf(128.0f), 0.0f);
+            __syncthreads();   // (sh reused by the next token's sum)
+        }
+        out[(size_t) t * ld + c] = o;
+        h0 = h1; h1 = h2; h2 = x;
+    }
+    if (commit) { st[c * 3] = h0; st[c * 3 + 1] = h1; st[c * 3 + 2] = h2; }
+}
+
 __global__ void gate_beta_kernel(float* __restrict__ a, float* __restrict__ b, const float* __restrict__ dt,
                                  const float* __restrict__ ssm_a, int n, int h_v, int ld) {
     const int k = blockIdx.x * blockDim.x + threadIdx.x;
@@ -789,6 +834,17 @@ void q35_conv_seq(float* conv_state, const float* raw, int ld, const float* w, f
 void q35_qk_l2(float* x, int ld, int T, int n_rows, float eps, void* stream) {
     qk_l2_kernel<<<dim3(n_rows, T), 128, 0, (cudaStream_t) stream>>>(x, ld, eps);
     check("q35_qk_l2");
+}
+
+bool q35_gdn_prep(float* conv_state, const float* raw, int ld, const float* w, float* out, int T, int C, bool commit,
+                  int n_qk_rows, float eps, float* alpha, float* beta, int ldg, const float* dt, const float* ssm_a, int h_v,
+                  void* stream) {
+    if (C % 128 != 0 || n_qk_rows * 128 > C) return false;
+    const int nb = C / 128 + (T * h_v + 127) / 128;
+    gdn_prep_kernel<<<nb, 128, 0, (cudaStream_t) stream>>>(conv_state, raw, ld, w, out, T, C, commit, n_qk_rows, eps, alpha,
+                                                           beta, dt, ssm_a, h_v, ldg);
+    check("q35_gdn_prep");
+    return true;
 }
 
 void q35_gate_beta(float* alpha, float* beta, int ld, const float* dt, const float* ssm_a, int T, int h_v, void* stream) {

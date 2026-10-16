@@ -1240,9 +1240,15 @@ bool DenseModel::forward(const int32_t* tokens, int T, bool verify, int want, st
                     q35_gemv_f32_cols(L.ab_w, I.xn, E, ab, E, 2 * VH, T, s);
                 }
                 I.stage("gdn_ab", s);
-                q35_conv_seq(L.conv_state, raw, C, L.conv_w, cv, T, C, !verify, s);
-                q35_qk_l2(cv, C, T, 2 * KH, eps, s);
-                q35_gate_beta(ab, ab + VH, 2 * VH, L.dt, L.ssm_a, T, VH, s);
+                // (decode / verify windows: one launch for conv + q / k L2 + gate / beta - its L2 is serial over the
+                // window's tokens, so a prompt chunk keeps the three; STRATA_DENSE_GDN_FUSE=0: three always)
+                static const bool fuse = !(std::getenv("STRATA_DENSE_GDN_FUSE") && std::atoi(std::getenv("STRATA_DENSE_GDN_FUSE")) == 0);
+                if (!fuse || T > kMaxCols || !q35_gdn_prep(L.conv_state, raw, C, L.conv_w, cv, T, C, !verify, 2 * KH, eps, ab, ab + VH, 2 * VH,
+                                           L.dt, L.ssm_a, VH, s)) {
+                    q35_conv_seq(L.conv_state, raw, C, L.conv_w, cv, T, C, !verify, s);
+                    q35_qk_l2(cv, C, T, 2 * KH, eps, s);
+                    q35_gate_beta(ab, ab + VH, 2 * VH, L.dt, L.ssm_a, T, VH, s);
+                }
                 I.stage("gdn_conv", s);
                 q35_gdn_seq(L.state, cv, C, ab, ab + VH, 2 * VH, I.o, T, KH, VH, !verify, s);
                 I.stage("gdn_rec", s);

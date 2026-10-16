@@ -37,6 +37,11 @@ void q35_qk_l2(float* x, int ld, int T, int n_rows, float eps, void* stream);
 
 /// g = softplus(alpha + dt) * ssm_a, b = sigmoid(beta), in place, rows of h_v for T tokens (row stride ld).
 void q35_gate_beta(float* alpha, float* beta, int ld, const float* dt, const float* ssm_a, int T, int h_v, void* stream);
+/// q35_conv_seq + q35_qk_l2 (the first n_qk_rows 128-wide rows) + q35_gate_beta in one launch, the same arithmetic;
+/// false (nothing launched) when C is not a multiple of 128
+bool q35_gdn_prep(float* conv_state, const float* raw, int ld, const float* w, float* out, int T, int C, bool commit,
+                  int n_qk_rows, float eps, float* alpha, float* beta, int ldg, const float* dt, const float* ssm_a, int h_v,
+                  void* stream);
 
 /// The delta rule over T tokens (see the header).  x rows: [q (h_k*128) | k (h_k*128) | v (h_v*128)], stride ld;
 /// g, b rows of h_v (row stride ldg); o rows of h_v*128 (dense).  q scaled by 1/sqrt(128) inside.
