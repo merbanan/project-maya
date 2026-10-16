@@ -2573,6 +2573,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                     cudaMemcpyDefault, s);
                     gf::gqa_stream_summarize(kv, st, pt, pt + tn, s);
                     gf::gqa_stream_invalidate(st, pt / gf::kGqaPage, (pt + tn + gf::kGqaPage - 1) / gf::kGqaPage, s);
+                    kvs_->forget();
                 }
                 S->mark("gqa_attn", s);
                 if (!skip_output) hgemm_q(Ly.out, E, QD, B.out16, QD, mixer, E, tn, 0.0f);
@@ -4113,8 +4114,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 hgemm_q(Ly.v, KD, E, S->x16, E, vv, KD, Tv, 0.0f);
                 const gf::GqaKv gkv = kv_view(mtp_il_);   // (streamed: the host records, and a cached page's copy)
                 gf::gqa_prep(nullptr, kk, vv, Tv, 0, KD, nullptr, Ly.k_norm, g.norm_eps, (int) p0, g.rope_base, 0, gkv, s);
-                if (kvs_ != nullptr)
+                if (kvs_ != nullptr) {
                     gf::gqa_stream_summarize(gkv, kvs_->lay[(size_t) mtp_il_], (int) p0, (int) p0 + Tv, s);
+                    kvs_->forget();
+                }
                 S->mark("mtp_cache", s);
             } else {   // GLM: the latent and the indexer's key / gate
             hgemm_q(Ly.kv_a, g.kv_lora, E, S->x16, E, kv, g.kv_lora, Tv, 0.0f);
