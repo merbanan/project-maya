@@ -908,6 +908,9 @@ __global__ void __launch_bounds__(256) mla_attn_tc2_kernel(const float* __restri
                                                            const int* __restrict__ cells_all,
                                                            const int* __restrict__ n_sel_arr, int n_sel_max, int n_head,
                                                            float scale, float* __restrict__ ctx, bool q8) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+    // Pascal (sm_6x): no tensor cores - mla_attn takes the F32 kernel there (major < 7), never this one
+#else
     using namespace nvcuda;
     constexpr int KV = 512;
     extern __shared__ __align__(128) unsigned char t2_sm[];
@@ -1026,6 +1029,7 @@ __global__ void __launch_bounds__(256) mla_attn_tc2_kernel(const float* __restri
             ctx[((size_t) t * n_head + h0 + hl) * KV + half * (KV / 2) + d] = L > 0.0f ? so[hl * (KV / 2) + d] / L : 0.0f;
         }
     }
+#endif
 }
 
 // The same tensor-core attention with the context O in the wmma accumulator registers (four 16-wide column tiles a
