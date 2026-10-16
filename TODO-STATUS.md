@@ -225,6 +225,13 @@ expected gain (guess = not measured), effort S/M/L. Ranked plan per engine; "mea
 | hy3: 93K decode without the KV stream | 124.3 ms a token (8.0 tok/s), needles 3/3 - the stream (re-select once a page) is 56 % faster at 93K (79.6 ms) and even at 30K (66.6 vs 70.3); it pins ~12 GB of host RAM at 131K: recommended for long contexts, not made the serving default here | - |
 | dsv4: experts shared by consecutive tokens (#2's gate) | 2.26 of 6 (38 %) - above the 20 % gate; the deduplicated joint two-row CPU lane was built and measured slower (verify 54 -> 70 ms, tokens differ) and reverted | - |
 
+**Final regression, every tree at its pushed HEAD with default settings (2026-10-16, cooled runs)**: DSv4 28K needles 3/3,
+decode 24.4 tok/s, MTP short 35.0 / 33.6 / 36.0; GLM-5.3-Flash 27K prompt 36.4 s, needle answered; Qwen3.8-27B greedy 128/128
+vs llama.cpp (MTP4 68.7 tok/s), DFlash2 128/128 at 106.6 tok/s (4.57 tokens a round); Qwen3.6-35B 28K needles 3/3, prompt
+2,203 tok/s; Gemma 4 E4B 28K 3/3 (3,659 tok/s prompt), 31B 28K 3/3 (533 tok/s); Hy3 (chain39) 2K / 30K / 93K 3/3 at
+50.5 / 62.2 / 74.3 ms a token; Strata Flash-Next 6K 1,941 tok/s prompt, decode 56.5-58.0, tokens md5 c7a041f7db35 (the
+same as before the kernels); strata-q36 pp512 2,109, pp16384 1,857, 16K greedy md5 75a302c75b7c (unchanged).
+
 **Closed today (2026-10-16)**: Strata #7 register-fragment prompt experts (own code from bnk's design; Q2_0 +3.4 / +1.4 %,
 IQ for GLM / Hy3 measured 15 % slower than MMQ - opt-in only; the 35B K-quants +2.5-5.5 % - default); Hy3 KV-stream page
 choice (the 0/3 was the test; re-select once a page +15-24 %); the Gemma 4 31B assistant (one draft a round, +24 %);
