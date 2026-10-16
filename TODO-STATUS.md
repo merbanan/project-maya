@@ -276,6 +276,11 @@ throttled: the attention kernel alone would allow ~24 tok/s at 90K (plain decode
 | 8 | (measured: top-32 walk 205.5 -> 194.0 tok/s, dropped) DSpark walk: W2 top-k pruning + fused walk (28 launches, full-vocab W2 + ds_head) | 35B draft pass 4.8 ms of ~25 | 35B DSpark +4-6% | M |
 | 9 | (done: 2048 stays - 27B 74.0 vs 64.5 / 64.3, 35B 116.4 vs 97.9 / 82.0) DFlash2 window sweep STRATA_DENSE_DFLASH_CTX 2K / 8K / 16K at 28K (35B 5.12 -> 4.34 tok a round) | default 2048 | measure only | S |
 | 10 | (done: embeddings in pinned host -0.67 GiB, decode even - 9028886; a/b single GEMV measured no gain) Embedding in pinned host (not tied heads) + a/b projections as one GEMV | - | VRAM 0.7-1.3 GB; ~1% | S |
+| 11 | Small-K decode / verify matvec (Strata #2221 one warp a 4 rows, #2804 activations in registers for 1-8 columns): the 27B / 35B projections at 1-5 columns (MTP K=4 verify) | verify GEMV 590-630 GB/s at 4 rows | their 2080 Ti: 1.5-2.4x on the kernel; Arc +19.5 % decode | M |
+| 12 | MTP window size from commits per ms (Strata #2529: every size measured, then the best with a 3 % margin) - strata-dense MTP and DFlash2 block | fixed K=4 (27B), adaptive 5 (35B) | +5 % steady text | S |
+| 13 | Prompt attention with one smem stage (Strata #2146: q.k partials over their K cells, 3 CTAs / SM) and register staging (#2092) - the head-256 / Qwen paths (Gemma head-512 already reads K/V in place) | - | 2080 Ti: attention 1.66x | M |
+| 14 | Kernel hygiene: cuobjdump spill guard on the sm_70 build (Strata #2683: 61 spilling kernels upstream), graph nodes per layer counted and back-to-back pairs fused (#2222 / #2223) | - | ~1-3 % each fusion | S |
+| 15 | Multi-block greedy argmax over the vocabulary for verify / drafts (Strata #2357) | one 1024-thread block a row | V100: +0.7-0.8 % decode | S |
 
 ### GLM-5.3-Flash / Hy3 - ranked
 | # | Item | Today | Gain | Effort |
@@ -292,6 +297,14 @@ throttled: the attention kernel alone would allow ~24 tok/s at 90K (plain decode
 | 10 | (closed: the server keeps 31-100K-token slots, no reuse gap to show) Turn snapshot at the last <|user|> (trappsquid): check reuse counts in opencode serve logs first | snapshot before the last prompt token | tbd | S |
 | 11 | (done: 93K 124.3 -> 74.3 ms, 2K -1.5 %, default at >= 64K) Hy3 KV stream without the RAM-tier cost: position-major pinned records lent from the RAM tier's tail as the context grows (today 11.9 GB pinned at load for 131K: short prompts 47 -> 69 ms a token, 93K 124 -> 80) - then the stream can be the long-context default | measured cause: RAM tier 53.1 -> 40.7 GB, disk 0 -> 14 reads a token | short prompts back to 47 ms with the 93K gain kept | L |
 | 12 | CPU-lane defer (Strata #2689 / #2690): layer l's RAM-tier expert rows join the residual after layer l+1's mixer (attention / KDA), the heavy rows (routing weight >= 0.1) waited for first and the light ones late - the CPU computes layer l under the GPU's next mixer. Measure decode + KL (vs the ~0.02 run-to-run floor; fixed STRATA_GLM_RAM_GB) on GLM and Hy3, opt-in until the KL is known | CPU lane ~22-29 ms a token (GLM 2K: 222 rows in 28.7 ms) | their 3080: +15.8 % decode, KL 0.096 with the split | M |
+| 13 | Route-resident tail swap (Strata #2321): a top-k tail expert not in VRAM swapped for a resident one within a logit margin, weights renormalised; and route tail skip of low-weight misses (#2525) - lossy, KL check | misses go to the CPU lane / PCIe | +9.7 % decode (35B), +13.8 % (#2525) | S |
+| 14 | DSA indexer at long context (Strata #2072 recursive-halving block scorer + split radix top-k, #2093 single-read prompt top-k, #2514 decode top-k over live blocks only): check which GLM paths are one CTA a query | GLM dsa_index 495 ms at 27K | 2080 Ti: decode +6-12 % at 410K, prompt top-k 2.3x | M |
+| 15 | Prompt attention with one smem stage, 3 CTAs / SM (Strata #2146) + register staging (#2092) on GLM's DSA prompt attention | dsa_attn 17 % of a 27K prompt | attention 1.66x | M |
+| 16 | CPU prefill share for short prompt chunks (Strata #2525 / #2479): the CPU lane takes part of a short chunk's expert work | agent turns 405-577 ms | +31 % short prompts | M |
+| 17 | Fused CPU-lane pass (Strata #2751): an expert's down queued as soon as its gate/up is done, no layer-wide barrier | CPU lane 22-29 ms a token | layer -8-11 %, +2 % decode, bitwise | S-M |
+| 18 | Hy3 KV page pool: LRFU instead of CLOCK (Strata #2630 / #2458 / #2434) | CLOCK | 2.6-6 % fewer page re-reads | S |
+| 19 | Host RAM for the tiers: O_DIRECT load once RAM holds the experts (Strata #2501: page cache 43 -> 4.8 GiB), the GGUF page cache dropped after start (#2243) | page cache competes with the 62 GB RAM tier | a larger RAM tier | S |
+| 20 | Conversation state: BF16 parked KDA / indexer state (Strata #2247, V100: park 198 -> 101 ms), prompt-cache milestones for far rebranches (#2719: 86K rebranch 60.3 -> 4.1 s, #2640) | - | agent rebranches | S-M |
 
 ### DeepSeek-V4 Flash - ranked
 | # | Item | Today | Gain | Effort |
@@ -305,6 +318,10 @@ throttled: the attention kernel alone would allow ~24 tok/s at 90K (plain decode
 | 7 | (measured: 2K -> 28K +6.9 ms, of it attention + indexer 2.4, expert pool 4.4 - <= ~6 %) Long-context decode attention (28K 25.0 / 93K 21.7 tok/s; +6..12 ms a token over 2K) | - | biggest lever above 28K | M |
 | 8 | (measured: verify 4 / 8 drafts = 4.79 / 6.81 decode steps - cannot gain, not built) DSpark: our GGUFs have only mtp.0 (nextn, 32 tensors); DSpark is a separate 3-stage drafter (Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF, ROCm FP4 -> reconvert). Each extra verify row costs ~23 ms here (CPU-lane bound) -> likely no gain until #2 lands | - | uncertain | L |
 | 9 | CPU-lane defer (Strata #2689 / #2690), as GLM / Hy3 #12: the CPU lane's rows of layer l added after layer l+1's attention, heavy rows first; decode + KL | moe_cpu_wait 7.1 ms of 33.8 a token (2K) | +5-15 % decode | M |
+| 10 | Route-resident tail swap / tail skip (Strata #2321 / #2525), as GLM / Hy3 #13 - lossy, KL check | - | +9.7-13.8 % decode | S |
+| 11 | DSA indexer at long context (Strata #2072 / #2093 / #2514, #2071 / #2080 tiled FP32 prompt scorer below sm_80), as GLM / Hy3 #14 | 93K decode 21.0 tok/s, d4_indexer 0.9 ms a token at 28K | decode +6-12 % at 410K | M |
+| 12 | Prompt attention one smem stage / 3 CTAs (Strata #2146 / #2092) on d4_attn | prompt 667-770 tok/s | attention 1.66x | M |
+| 13 | CPU prefill share for short chunks (#2525 / #2479) and the fused CPU-lane pass (#2751), as GLM / Hy3 #16 / #17 | - | +31 % short prompts; +2 % decode | M |
 
 ### Strata v100 tree (Flash-Next / strata-q36) - ranked
 | # | Item | Today | Gain | Effort |
@@ -316,6 +333,14 @@ throttled: the attention kernel alone would allow ~24 tok/s at 90K (plain decode
 | 5 | (done: strata-q36 +22-25 %, v100 72fa8e79; strata-dense 35B +2.5-5.5 %) strata-q36 FP16-TC experts for Q4_K/Q5_K (experts ~70% of a 4K prompt; bnk's unpack + register fragments) | pp512 1,685 | up to ~+40% | L |
 | 6 | (done as #7: cf55fb32) bnk-style Flash-Next prompt experts v2: Q2_0 sub-blocks unpacked straight into register-resident mma.m8n8k4 fragments, one launch a layer for every (expert, 64-token, 64-row) tile, FP16 activations double-buffered (bnk moe_tc.cu 97b61ed: 32K 1,873 -> 2,782 tok/s on 2 V100s; their WMMA-via-smem variant = jmnargi's shape was slower, 2,412 vs 2,740) | after #3 | maybe +10-15% over #3 | L |
 | 7 | (Q2_0 done: +3.4 / +1.4 %, v100 cf55fb32) **Register-fragment prompt-expert kernel, own implementation** (requested 2026-10-16): bnk has no license, so do not copy its code - study its logic (tiling: one launch a layer over every (expert, 64-token, 64-row) tile; weight sub-blocks dequantized straight into mma.m8n8k4 A/B fragments in registers, no shared-memory staging of weights; FP16 activations double-buffered in smem; IQ grid tables in smem; work list / tile scheduling; epilogue) and write down the algorithm, then reimplement it from that description in our own code for: Strata Flash-Next Q2_0, strata-q36 / 35B K-quants (Q4_K / Q5_K / Q6_K), GLM / Hy3 IQ2_XXS / IQ3_XXS / IQ2_S. Measure against MMQ (our shared-memory FP16 versions lost: 35B -14 %, GLM -24 %) | MMQ dp4a | bnk: 32K 1,873 -> 2,782 tok/s (+48 %) on Q2_0 | L |
+| 8 | strata-q36 K / V in int8, one FP16 scale per 64 (Strata #2698; q8_0 variant #2742), the freed VRAM to expert slots | FP32 K / V; V100 report #2464: q36 decode 154 -> 56 tok/s as the context fills | 3060: 128K 33.9 -> 54.8 tok/s (+53 %) | M |
+| 9 | Route-resident tail swap for 256-expert top-8 (Strata #2321) in strata-q36 - lossy, KL check | - | +9.7 % decode, verify window -13 % | S |
+| 10 | Short prompt chunks: resident experts with <= 8 rows on the decode grouped kernel instead of MMQ (Strata #2774; mind moe_grouped_s2's GMAX=8) - Flash-Next | 14,000 MMQ launches for 170 tokens upstream | 5070 Ti: 177 tokens 473 -> 315 ms | S-M |
+| 11 | Small-K matvec (Strata #2221 one warp a 4 rows, Q2_0; #2804 register activations), INT8-KV decode attention off the smem pipe (#2220), two cells a step (#2075) - Flash-Next decode / verify | - | 2080 Ti: 1.5-2.4x kernels, decode +2-4 % | M |
+| 12 | Verify-window routing in one launch: check STRATA_ROUTE_WIN=1 on strata-q36 / Flash-Next (Strata #2799) | per-token launch pairs | R9700: routing 3.74 -> 1.06 ms a window, +9.7 % | S |
+| 13 | Volta extras: pf_wmma IQ2_S / IQ4_NL prompt experts (Strata #2356), multi-block argmax (#2357), STRATA_GR_NORM_FAST=1 (#2358) | - | V100: prompt +2.5-4.3 %, decode +0.7 / +0.5 % | S |
+| 14 | DSA / QSA long-context selection (Strata #2072 / #2093 / #2514) and fused CPU-lane pass (#2751) in the fork | - | decode +6-12 % at 410K; +2 % | M |
+| 15 | Compare with the community V100 runs (Strata #2654: Flash-Next IQ2_XS 76.1 tok/s, prompt 1,250-1,370 at 4-32K; #2379: UD-Q4_K_XL prompt 596 / 1,017, decode 37.5) | fn_bench 6K 1,941 prompt, decode 56.5-58 | a reference | S |
 
 ### Niko1221/Strata PRs #2068-#2817 (reviewed 2026-10-16: ~446 PRs read, none merged upstream yet) - ranked for this box
 | # | Idea (PR) | Their measurement | Our target | Effort |
