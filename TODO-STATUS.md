@@ -199,6 +199,7 @@ expected gain (guess = not measured), effort S/M/L. Ranked plan per engine; "mea
 | glm / dsv4 / hy3: short prompts (agent turns) through the batched path from 8 tokens (was 32) on one GPU | later turns of a 13.5K session, two cooled rounds: GLM 1,041 / 648 / 521 -> 488 / 405 / 577 ms (-33 %), DSv4 1,070 / 633 / 411 -> 367 / 269 / 427 (-45 %), Hy3 1,521 -> 751 ms on the sub-32-token turn (-24 % average); each default re-measured | glm-dflash ec48632, dsv4 4158cc2, hy3 5e6d222 |
 | strata-dense: MTP drafts 4 on the dense Qwen | 27B K3 65.7 / 65.7, K4 68.0 / 68.2, K5 66.2 / 66.2 tok/s, greedy 128/128 | qwen38 d55ce1a |
 | glm: turn snapshot at the last user token (trappsquid) | the live server saves 31-100K-token conversation slots; no per-request reuse log to show a gap - closed | - |
+| strata-dense: 27B at 64K, decode measured cool (prompt read, GPU cooled to 60 C, then 192 tokens; tests/q35/q38cool.py) | plain 27.5, MTP4 65.2 (3.13 tokens a round), DFlash2 67.1 tok/s (3.24) - the earlier 14.3 / 24.2 / 37.9 were thermal throttling after the 64K prompt (SW slowdown 0x20 in 32 of 546 samples here). Plain matches the 64K stage profile's ~27 tok/s; the repeated filler helps the drafts (38 of ~60 rounds by lookup) | - |
 
 **Left open (with the reason)**: a bnk-style register-fragment prompt-expert kernel (bnk has no license - its code
 cannot be copied; my FP16 shared-memory K-quant version lost to MMQ by 14 %, so the expected gain is small for the effort);
