@@ -77,6 +77,7 @@ struct Layer {
     // Gemma 4: sliding-window (head 256) or full (head 512) attention, KV of its own or of layer kv_src; the FFN's
     // pre / post norms; the per-layer input's gate and projection; the layer's output scale
     int D = 0;
+    int HK = 0;                                     // its K/V heads (Gemma 4 31B: 16 sliding, 4 full)
     bool swa = false;
     int kv_src = -1;
     G4Kv g4kv;
