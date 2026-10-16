@@ -176,6 +176,8 @@ expected gain (guess = not measured), effort S/M/L. Ranked plan per engine; "mea
 | dsv4: prompt indexer two rows a block | score 1,235 -> 1,030 ms at 26K, needles 3/3 | dsv4 57036eb |
 | strata-dense: Gemma 4 31B at 28K | needles 3/3, prompt 455 tok/s, decode 18.8 tok/s | - |
 | strata-dense: 27B at 28K / 64K (cooled) | 28K: plain 30.8, MTP3 55.6, DFlash2 78.8-79.3 tok/s (the earlier 36 was throttling); 64K: plain 14.3, MTP3 24.2, DFlash2 37.9 - a 64K stage profile is running | - |
+| strata-dense: DSpark walk over the top-32 base candidates in one launch (vLLM #56694 idea) | 35B, two cooled rounds: drafter 4.5 -> 3.5 ms but 5.05 -> 4.57 tokens a round: 205.5 / 205.6 -> 194.0 / 194.0 tok/s - dropped (the Markov term promotes tokens outside the base top 32) | - (reverted) |
+| strata-dense: 27B 64K stage profile | one row 37 ms (attention 8.0 ms) = ~27 tok/s plain possible; four rows 65 ms with every stage inflated: the GPU hit SW thermal slowdown (0x20, 81-82 C, 620-930 MHz) after the 64K prompt. The 64K numbers are a cooling limit; code left: 4-8 row verify attention (tile kernel 376 vs one-row kernel 535 GB/s) | - |
 | glm: turn snapshot at the last user token (trappsquid) | the live server saves 31-100K-token conversation slots; no per-request reuse log to show a gap - closed | - |
 
 **Host embedding / reduced draft vocabulary on the other engines** (checked 2026-10-16): GLM-5.3-Flash, Hy3 and DSv4
