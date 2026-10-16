@@ -2102,13 +2102,15 @@ void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const i
         // Maya-S24, 27K prompts: dsa_attn 22.5 / 23.2 -> 12.2 / 12.5 s, the prompt's GPU time 78.5 / 82.1 -> 70.5 /
         // 72.3 s; rel L2 against the F32 kernel 4.4-5.2e-5 (the 16-head one's)
         static const bool want_tc2 = attn_mode == nullptr || std::strcmp(attn_mode, "tc") != 0;
-        static int tc2_ok = -1;
-        if (tc2_ok < 0) {
-            tc2_ok = cudaFuncSetAttribute(mla_attn_tc2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kT2Smem) ==
-                     cudaSuccess;
+        // the shared-memory attribute is per GPU: set on each one (once set only on the first, a split's later GPUs
+        // failed the launch and their layers read stale attention)
+        static int tc2_ok[16] = {};
+        if (tc2_ok[dev] == 0) {
+            tc2_ok[dev] = cudaFuncSetAttribute(mla_attn_tc2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                               (int) kT2Smem) == cudaSuccess ? 1 : -1;
             cudaGetLastError();
         }
-        if (tc_ok[dev] == 1 && want_tc2 && tc2_ok == 1 && n_head % T2_H == 0)
+        if (tc_ok[dev] == 1 && want_tc2 && tc2_ok[dev] == 1 && n_head % T2_H == 0)
             mla_attn_tc2_kernel<<<dim3((unsigned) T, (unsigned) (n_head / T2_H)), 256, kT2Smem, s>>>(
                 q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8);
         else if (tc_ok[dev] == 3)
