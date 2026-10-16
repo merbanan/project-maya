@@ -186,8 +186,11 @@ expected gain (guess = not measured), effort S/M/L. Ranked plan per engine; "mea
 | dsv4: long-context decode (28K vs 2K, stage profile) | 41.3 vs 34.9 ms a token: attention 3.6 -> 5.0, expert fetch 3.4 -> 4.9, disk waits 0.2 -> 2.2, indexer +0.95 ms - the KV cache takes VRAM from the expert pool; no attention rewrite to do | - |
 | dsv4: seed the MTP window with the last prompt rows | not cheaply possible: the batched prompt path keeps no per-position streams for the MTP block's input | - |
 | glm: profile-pinned + LRU eviction (route-log replay, tools/glm_policy_sim.py) | 67K routes at 3,780 slots: LRU 78.5 %, aged LFU 69.5 %, pinned 25/50/75 % + LRU 77.0 / 75.3 / 72.1 %: pinning does not help; LRU the default on one GPU (a split keeps the counts) | glm-dflash (pending A/B) |
-| strata-dense: alpha / beta as one GEMV | greedy 128/128, plain 34.9 / 34.9 vs 34.9 / 34.9 tok/s - no gain, not kept | - |
+| strata-dense: alpha / beta as one GEMV | (the first A/B ran a stale binary - re-running) | - |
 | strata-dense: Gemma 4 31B decode | short 32.5 tok/s (llama.cpp 33.6); 28K 18.8 with attention 25.6 of 55 ms a token: the full layers (head 512, 8 query heads a KV head) ran the 64-row tile at T=1 - now two decode blocks of 4 heads (A/B running); assistant: per-layer KV head counts (A/B running) | - |
+| glm: shared-expert sub-batch 2048 (pr/shexp-sub), re-measured with PREFILL_SUB really unset | 27K prompt 79.4 / 80.1 -> 78.6 / 78.9 s (shexp 2.96 -> 1.55 s): faster - PR sent | mw00/project-maya#215 |
+| glm: LRU eviction by default on one GPU | as measured live: unset 24.1-27.7 vs lru 23.1-26.9 tok/s, VRAM hits 66.3-66.7 % | glm-dflash 2ef6fb2 |
+| (process) a failed build left the old strata-dense in place and build-q38.sh printed BUILT (d8e352d lacked Layer::HK: a hunk filter dropped each file's first hunk) | the m11 / m12 / m13 (ab_cat, 31B assistant) / m14 runs after 01:32 used a stale binary - being re-run (m15 + m14b); qwen38 fixed in 4097fb1, every branch HEAD clean-built on the server since | qwen38 4097fb1 |
 | glm: turn snapshot at the last user token (trappsquid) | the live server saves 31-100K-token conversation slots; no per-request reuse log to show a gap - closed | - |
 
 **Host embedding / reduced draft vocabulary on the other engines** (checked 2026-10-16): GLM-5.3-Flash, Hy3 and DSv4
