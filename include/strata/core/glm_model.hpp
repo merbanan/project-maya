@@ -442,6 +442,8 @@ public:
     bool d4_mtp_load(const std::string& path, std::string& err);
     // kv_only: only the block's K/V row of (token, pos) into its window (an accepted round's first row: no draft)
     bool d4_mtp_draft(int32_t token, int64_t pos, int& draft, std::string& err, bool kv_only = false);
+    float d4_mtp_conf_ = 1.0f;     // the last draft's softmax probability
+    uint64_t d4_gated_ = 0;        // plain steps the confidence gate took instead of a verify
     // ... and the speculative decode on it (STRATA_DSV4_MTP_SPEC=1, greedy): a round runs the pending token and the
     // block's draft through every layer as two rows (the dense weights read once, mv2), keeps both when the trunk
     // agrees with the draft, else rolls the draft row's compressor windows back

@@ -851,6 +851,78 @@ __global__ void __launch_bounds__(256) rows_idx_score_tc_kernel(const float* q, 
             score[(size_t) t * ld + c0 + tid] = sr[tid] + sr[64 + tid] + sr[128 + tid] + sr[192 + tid];
     }
 }
+// the same scores two query rows a block (rows 2 x, 2 x + 1): a K tile is staged once for both and each B fragment
+// feeds four MMAs (rows' 64 heads x 2 = 8 row tiles); per pooled row and query row the head sums are formed exactly as
+// rows_idx_score_tc_kernel forms them (4 groups of 16 heads, each in order, then the groups in order): the same scores
+__global__ void __launch_bounds__(256) rows_idx_score_tc2_kernel(const float* q, const float* w, const uint16_t* k, int p0,
+                                                                int T, float wscale, float* score, int ld) {
+    using namespace nvcuda;
+    extern __shared__ __align__(32) unsigned char smem_tc[];
+    __half* sq = (__half*) smem_tc;                    // 128 x kTcLd (row 0's heads, then row 1's)
+    __half* sk = sq + 128 * kTcLd;                     // 64 x kTcLd
+    float* ss = (float*) (sk + 64 * kTcLd);            // 128 x kTcSld
+    float* sw = ss + 128 * kTcSld;                     // 128 head weights
+    float* sr = sw + 128;                              // 2 rows x 4 groups x 64 partial sums
+    const int t0 = 2 * blockIdx.x, tid = threadIdx.x, wp = tid >> 5;
+    const int nr = min(2, T - t0);
+    const int nv0 = (p0 + t0 + 1) / 4, nv1 = nr > 1 ? (p0 + t0 + 2) / 4 : 0;
+    const int n_vis = max(nv0, nv1), c_lo = blockIdx.y * kIdxRowsB;
+    if (c_lo >= n_vis) return;
+    const int c_hi = min(n_vis, c_lo + kIdxRowsB);
+    for (int i = tid; i < 128 * kDsv4Ihd; i += 256) {
+        const int r = i / (64 * kDsv4Ihd);
+        const float v = r < nr ? q[(size_t) (t0 + r) * 64 * kDsv4Ihd + i % (64 * kDsv4Ihd)] : 0.0f;
+        sq[(i / kDsv4Ihd) * kTcLd + i % kDsv4Ihd] = __float2half(v);
+    }
+    if (tid < 128) sw[tid] = (tid >> 6) < nr ? w[(size_t) (t0 + (tid >> 6)) * 64 + (tid & 63)] * wscale : 0.0f;
+    const __half* kh = (const __half*) k;
+    for (int c0 = c_lo; c0 < c_hi; c0 += 64) {
+        __syncthreads();
+        for (int i = tid; i < 64 * (kDsv4Ihd / 8); i += 256) {
+            const int r = i / (kDsv4Ihd / 8), cc = (i % (kDsv4Ihd / 8)) * 8;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (c0 + r < c_hi) v = *(const uint4*) (kh + (size_t) (c0 + r) * kDsv4Ihd + cc);
+            *(uint4*) (sk + r * kTcLd + cc) = v;
+        }
+        __syncthreads();
+        {   // warp wp: key tile tj = wp & 3, row tiles ti = 4 (wp >> 2) .. + 3
+            const int tj = wp & 3, ti0 = (wp >> 2) * 4;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) wmma::fill_fragment(acc[i], 0.0f);
+#pragma unroll
+            for (int kk = 0; kk < kDsv4Ihd; kk += 16) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b;
+                wmma::load_matrix_sync(b, sk + tj * 16 * kTcLd + kk, kTcLd);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+                    wmma::load_matrix_sync(a, sq + (ti0 + i) * 16 * kTcLd + kk, kTcLd);
+                    wmma::mma_sync(acc[i], a, b, acc[i]);
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                wmma::store_matrix_sync(ss + (ti0 + i) * 16 * kTcSld + tj * 16, acc[i], kTcSld, wmma::mem_row_major);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int rep = 0; rep < 2; ++rep) {   // partial (row r, group g, pooled row c): heads 16 g .. 16 g + 15
+            const int i = tid + rep * 256, r = i >> 8, g = (i >> 6) & 3, c = i & 63, h0 = g * 16;
+            float v = 0.0f;
+#pragma unroll
+            for (int h = h0; h < h0 + 16; ++h) v += fmaxf(ss[(r * 64 + h) * kTcSld + c], 0.0f) * sw[r * 64 + h];
+            sr[(r * 4 + g) * 64 + c] = v;
+        }
+        __syncthreads();
+        if (tid < 128) {
+            const int r = tid >> 6, c = tid & 63, nv = r ? nv1 : nv0;
+            if (r < nr && c0 + c < min(nv, c_hi))
+                score[(size_t) (t0 + r) * ld + c0 + c] = sr[(r * 4) * 64 + c] + sr[(r * 4 + 1) * 64 + c] +
+                                                         sr[(r * 4 + 2) * 64 + c] + sr[(r * 4 + 3) * 64 + c];
+        }
+    }
+}
 // the top k of row t's visible scores (T blocks of 1024): all of them when there are k or fewer
 __global__ void __launch_bounds__(1024) rows_topk_kernel(const float* score, int ld, int p0, int k, int* sel) {
     const int t = blockIdx.x, n = (p0 + t + 1) / 4;
@@ -1289,6 +1361,15 @@ void dsv4_rows_indexer(float* q, const float* w, int n_head, const Dsv4Layer& L,
     if (max_vis > top_k && scalar) {
         rows_idx_score_kernel<<<dim3(T, (max_vis + kIdxRowsB - 1) / kIdxRowsB), 256, 0, s>>>(
             q, w, L.icomp, p0, 1.0f / std::sqrt((float) (kDsv4Ihd * n_head)), score, ld);
+    } else if (max_vis > top_k && !getenv("STRATA_DSV4_IDX_TC1")) {   // (STRATA_DSV4_IDX_TC1: one query row a block)
+        const size_t smem = (size_t) (128 + 64) * kTcLd * 2 + (size_t) (128 * kTcSld + 128 + 512) * 4;
+        static bool opted2 = false;
+        if (!opted2) {
+            cudaFuncSetAttribute(rows_idx_score_tc2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+            opted2 = true;
+        }
+        rows_idx_score_tc2_kernel<<<dim3((T + 1) / 2, (max_vis + kIdxRowsB - 1) / kIdxRowsB), 256, smem, s>>>(
+            q, w, L.icomp, p0, T, 1.0f / std::sqrt((float) (kDsv4Ihd * n_head)), score, ld);
     } else if (max_vis > top_k) {
         const size_t smem = (size_t) 2 * 64 * kTcLd * 2 + (size_t) (64 * kTcSld + 64 + 256) * 4;
         static bool opted = false;

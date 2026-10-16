@@ -5433,6 +5433,31 @@ struct Glm5Model::D4Mtp {
     int64_t last_pos = -2, vpos = 0;
 };
 
+namespace {
+// the softmax probability of the largest of n logits (one block of 1024): 1 / sum exp(l - max)
+__global__ void __launch_bounds__(1024) d4_top1_prob_kernel(const float* __restrict__ l, int n, float* __restrict__ out) {
+    __shared__ float sh[32];
+    float m = -INFINITY;
+    for (int i = threadIdx.x; i < n; i += 1024) m = fmaxf(m, l[i]);
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = m;
+    __syncthreads();
+    m = sh[0];
+    for (int i = 1; i < 32; ++i) m = fmaxf(m, sh[i]);
+    __syncthreads();
+    float z = 0.0f;
+    for (int i = threadIdx.x; i < n; i += 1024) z += __expf(l[i] - m);
+    for (int o = 16; o > 0; o >>= 1) z += __shfl_xor_sync(0xffffffffu, z, o);
+    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = z;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.0f;
+        for (int i = 0; i < 32; ++i) t += sh[i];
+        *out = 1.0f / t;
+    }
+}
+}  // namespace
+
 bool Glm5Model::d4_mtp_load(const std::string& path, std::string& err) {
     const Glm5Geometry& g = g_;
     FastState* F = fast_;
@@ -5578,8 +5603,8 @@ bool Glm5Model::d4_mtp_load(const std::string& path, std::string& err) {
     if (cudaMalloc(&a, fl * sizeof(float)) != cudaSuccess || cudaMalloc(&M->swa, (size_t) g.n_swa * 512 * 2) != cudaSuccess ||
         cudaMalloc(&M->exq, q8(E)) != cudaSuccess || cudaMalloc(&M->xsq, q8(4 * (size_t) E)) != cudaSuccess ||
         cudaMalloc(&M->ehq, q8((size_t) K * FF)) != cudaSuccess || cudaMalloc(&M->shq, q8(FF)) != cudaSuccess ||
-        cudaMalloc(&M->tok, sizeof(int)) != cudaSuccess || cudaMalloc(&M->logits, (size_t) g.n_vocab * sizeof(float)) != cudaSuccess ||
-        cudaHostAlloc((void**) &M->tok_h, sizeof(int), cudaHostAllocDefault) != cudaSuccess ||
+        cudaMalloc(&M->tok, 2 * sizeof(int)) != cudaSuccess || cudaMalloc(&M->logits, (size_t) g.n_vocab * sizeof(float)) != cudaSuccess ||
+        cudaHostAlloc((void**) &M->tok_h, 2 * sizeof(int), cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &M->glog_h, g.n_expert * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
         err = "dsv4 mtp: activation buffers did not allocate";
         return false;
@@ -5770,12 +5795,14 @@ bool Glm5Model::d4_mtp_draft(int32_t token, int64_t pos, int& draft, std::string
     if (ow.type == 0) o.w = ow.f32;
     if (!gf::mv(&o, 1, s)) { err = "dsv4 mtp: output head"; return false; }
     gf::argmax(M->logits, g.n_vocab, M->tok, s);
-    cudaMemcpyAsync(M->tok_h, M->tok, sizeof(int), cudaMemcpyDeviceToHost, s);
+    d4_top1_prob_kernel<<<1, 1024, 0, s>>>(M->logits, g.n_vocab, (float*) (M->tok + 1));
+    cudaMemcpyAsync(M->tok_h, M->tok, 2 * sizeof(int), cudaMemcpyDeviceToHost, s);
     if (cudaStreamSynchronize(s) != cudaSuccess || cudaGetLastError() != cudaSuccess) {
         err = "dsv4 mtp: the draft failed";
         return false;
     }
     draft = M->tok_h[0];
+    std::memcpy(&d4_mtp_conf_, M->tok_h + 1, sizeof(float));
     mtp_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_in).count();
     return true;
 }
@@ -6130,11 +6157,35 @@ bool Glm5Model::d4_decode_spec(strata::kernels::SamplerParams& sp, int64_t max_n
     double verify_ms = 0.0;
     const double mtp0 = mtp_ms_;
     bool go = true;
+    // STRATA_DSV4_MTP_GATE=<p> (default 0.5, 0: off): a draft whose softmax probability is below p is not verified - a
+    // plain step instead (measured: rounds under 0.5 were accepted 25-45%, at 0.95+ 97%; two cooled rounds 34.9 / 34.8
+    // -> 35.4 / 35.2 tok/s) (a
+    // rejected round costs a two-row pass for one token); STRATA_DSV4_MTP_CONFLOG=<file>: "conf accepted" a round
+    static const float gate = getenv("STRATA_DSV4_MTP_GATE") ? (float) atof(getenv("STRATA_DSV4_MTP_GATE")) : 0.5f;
+    static FILE* conflog = getenv("STRATA_DSV4_MTP_CONFLOG") ? std::fopen(getenv("STRATA_DSV4_MTP_CONFLOG"), "a") : nullptr;
+    std::vector<float> lg;
     while (go) {
         int ya = -1, yb = -1;
         const int64_t p = pos_;
+        if (gate > 0.0f && d4_mtp_conf_ < gate) {   // the plain step: a's row, then the next draft from its streams
+            ++d4_gated_;
+            if (!forward({(int32_t) a}, lg, err)) return false;
+            F->tokens += 1;
+            int y = sample_token(sp, err);
+            if (y < 0) return false;
+            y = forced(y);
+            sp.counter += 1;
+            ++produced;
+            last_tok_ = y;
+            if (!emit(y)) break;
+            a = y;
+            if (!d4_mtp_draft(a, pos_, dft, err)) return false;
+            continue;
+        }
+        const float conf = d4_mtp_conf_;
         const auto tv = std::chrono::steady_clock::now();
         if (!d4_verify2(a, dft, ya, yb, err)) return false;
+        if (conflog) std::fprintf(conflog, "%.4f %d\n", conf, forced(ya) == dft && ya == dft ? 1 : 0);
         verify_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tv).count();
         ++d4_rounds_;
         const int t1 = forced(ya);
@@ -6174,6 +6225,8 @@ bool Glm5Model::d4_decode_spec(strata::kernels::SamplerParams& sp, int64_t max_n
     (void) tok0;
     const double wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     const double nr = (double) std::max<uint64_t>(1, d4_rounds_ - r0);
+    if (conflog) std::fflush(conflog);
+    std::fprintf(stderr, "dsv4 mtp spec: %llu plain steps by the gate\n", (unsigned long long) d4_gated_);
     std::fprintf(stderr, "dsv4 mtp spec: %llu / %llu drafts accepted (%.1f%%); a round %.1f ms: verify %.1f, drafts %.1f\n",
                  (unsigned long long) d4_accepts_, (unsigned long long) d4_rounds_,
                  100.0 * d4_accepts_ / std::max<uint64_t>(1, d4_rounds_), wall / nr, verify_ms / nr, (mtp_ms_ - mtp0) / nr);
