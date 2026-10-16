@@ -331,10 +331,12 @@ int main(int argc, char** argv) {
     const bool use_df = model.has_dflash();
     // (a MoE model's MTP drafts adaptively from 5 - measured on Qwen3.6-35B-A3B: 141 -> 168 tok/s at 5, 125 -> 172 at 7;
     // the dense Qwen3.8-27B a fixed 4 (with the 32K draft vocabulary, two cooled rounds: K3 65.7 / 65.7, K4 68.0 / 68.2,
-    // K5 66.2 / 66.2, adaptive from 4 63.3 / 63.5 tok/s); Gemma / Muse keep 3)
+    // K5 66.2 / 66.2, adaptive from 4 63.3 / 63.5 tok/s); the Gemma 4 assistants by size - 31B 1 (short: K1 41.1, K2 38.8,
+    // K3 33.0, K4 29.2, plain 33.2; 28K K1 29.6 vs K3 27.2 tok/s), E4B 2 (K1 128.4, K2 157.4, K3 146.7); Muse keeps 3)
     const bool qwen_dense = cfg.n_expert == 0 && cfg.arch.rfind("qwen3", 0) == 0;
+    const int gemma_k = cfg.arch == "gemma4" ? (cfg.n_embd >= 4096 ? 1 : 2) : 0;
     if (draft < 0) draft = std::getenv("STRATA_DENSE_DRAFT") ? std::atoi(std::getenv("STRATA_DENSE_DRAFT"))
-                                                             : (use_df ? 7 : cfg.n_expert > 0 ? 5 : qwen_dense ? 4 : 3);
+                                                             : (use_df ? 7 : cfg.n_expert > 0 ? 5 : qwen_dense ? 4 : gemma_k > 0 ? gemma_k : 3);
     draft = std::max(0, std::min(draft, use_df ? model.dflash_max() : 7));
     if (!use_df && !model.has_mtp()) draft = 0;
     cudaStream_t cs = (cudaStream_t) model.stream();
