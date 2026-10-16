@@ -3800,11 +3800,22 @@ bool Glm5Model::fast_gqa(int il, int64_t p, std::string& err) {
         const gf::GqaStream& st = kvs_->lay[(size_t) il];
         gf::gqa_stream_summarize(kv, st, (int) p, (int) p + 1, s);
         if (F->prof_on) F->mark("gqa_st_summ");
-        gf::gqa_stream_select(F->gq, g.n_head, g.n_kv, st, (int) p + 1, kvs_->budget, kvs_->sink, kvs_->recent,
-                              kvs_->sel, s);
-        if (F->prof_on) F->mark("gqa_st_select");
-        gf::gqa_stream_resolve(st, (int) kvs_->slice, kvs_->sel, s);
-        if (F->prof_on) F->mark("gqa_st_resolve");
+        KvStream* K = kvs_;
+        gf::GqaSelBufs b = K->sel;
+        bool keep = false;
+        if (K->lsel != nullptr) {   // (STRATA_GLM_KV_RESELECT: the layer's last selection while it still covers p)
+            b.sel = K->lsel + (size_t) il * b.max_sel;
+            b.nsel = K->lnsel + il;
+            const int64_t last = K->sel_pos[(size_t) il];
+            keep = last >= 0 && p > last && p - last < K->reselect && p / gf::kGqaPage == last / gf::kGqaPage;
+        }
+        if (!keep) {
+            gf::gqa_stream_select(F->gq, g.n_head, g.n_kv, st, (int) p + 1, K->budget, K->sink, K->recent, b, s);
+            if (F->prof_on) F->mark("gqa_st_select");
+            gf::gqa_stream_resolve(st, (int) K->slice, b, s);
+            if (F->prof_on) F->mark("gqa_st_resolve");
+            if (K->lsel != nullptr) K->sel_pos[(size_t) il] = p;
+        }
     }
     if (!gf::gqa_attn(F->gq, kv, (int) p + 1, g.n_head, F->gscr, F->attn_q, s)) {
         err = "glm fast: gqa attention";
@@ -3866,8 +3877,11 @@ bool Glm5Model::kv_stream_init(int64_t resident, std::string& err) {
     const size_t lay_dev = al((size_t) R * page_b) + al((size_t) max_pages * 4) + 3 * al((size_t) R * 4) + al(8) + al(summ_b);
     const size_t sel_b = 4 * al((size_t) max_sel * 4) + al(8) + al((size_t) g.n_head * max_pages * 4) +
                          al((size_t) g.n_head * 4) + al((size_t) max_pages * 4);
+    // (64: once a page - 93K, select 8192: decode 91.6 / 98.5 -> 79.6 / 79.6 ms a token, needles 3/3; 16: 85.3)
+    K->reselect = (int) std::max<int64_t>(1, envi("STRATA_GLM_KV_RESELECT", 64));
+    const size_t lsel_b = (size_t) (g.n_layers + 1) * max_sel * 4, lnsel_b = (size_t) (g.n_layers + 1) * 4;
     const size_t stage_b = al(lay_host);
-    const size_t dev_b = NL * lay_dev + sel_b + stage_b;
+    const size_t dev_b = NL * lay_dev + sel_b + stage_b + (K->reselect > 1 ? al(lsel_b) + al(lnsel_b) : 0);
     if (cudaMalloc(&K->dev, dev_b) != cudaSuccess) {
         cudaGetLastError();
         K->dev = nullptr;
@@ -3900,6 +3914,11 @@ bool Glm5Model::kv_stream_init(int64_t resident, std::string& err) {
     K->sel.hm = (unsigned int*) take((size_t) g.n_head * 4);
     K->sel.sc = (float*) take((size_t) max_pages * 4);
     K->sel.max_sel = max_sel;
+    if (K->reselect > 1) {
+        K->lsel = (int*) take(lsel_b);
+        K->lnsel = (int*) take(lnsel_b);
+        K->sel_pos.assign((size_t) g.n_layers + 1, -1);
+    }
     K->stage = take(lay_host);
     cudaDeviceSynchronize();
     std::fprintf(stderr, "glm kv stream: CUDA%d the K/V cache in host memory (%.2f GB pinned, %zu bytes a position and "
@@ -3923,8 +3942,8 @@ gf::GqaKv Glm5Model::kv_host_view(int il) const {
     gf::GqaKv kv = gf::gqa_kv_view(st.host, nullptr, max_ctx_, (int64_t) kvs_->slice, 0, g_.n_kv, max_ctx_, gqa_kvm_);
     kv.ptab = st.ptab;
     kv.slots = st.slots;
-    kv.sel = kvs_->sel.sel;
-    kv.nsel = kvs_->sel.nsel;
+    kv.sel = kvs_->lsel != nullptr ? kvs_->lsel + (size_t) il * kvs_->sel.max_sel : kvs_->sel.sel;
+    kv.nsel = kvs_->lnsel != nullptr ? kvs_->lnsel + il : kvs_->sel.nsel;
     kv.max_sel = kvs_->sel.max_sel;
     return kv;
 }
@@ -3937,6 +3956,7 @@ gf::GqaKv Glm5Model::kv_stage_view(int il) const {
 void Glm5Model::kv_stream_reload(int64_t n) {
     if (kvs_ == nullptr) return;
     cudaStream_t s = fast_ != nullptr ? fast_->cs : 0;
+    kvs_->forget();
     for (int il : kvs_->layers) {
         const gf::GqaStream& st = kvs_->lay[(size_t) il];
         gf::gqa_stream_reset(st, s);
