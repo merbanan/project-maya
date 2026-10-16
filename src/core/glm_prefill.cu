@@ -29,6 +29,7 @@
 #include "strata/prefill/moe_fused_rdna4.hpp"
 #endif
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/moe_tc_iq.hpp"
 
 #include "ggml.h"
 
@@ -2362,7 +2363,17 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     gu.max_rows = max_rows;
                     gu.dst = GU - (size_t) a * (2 * nff);
                     gu.ld_dst = 2 * nff;
-                    if (glu) {
+                    // STRATA_GLM_PREFILL_TC=1 (sm_70, opt-in): the IQ experts' products on the FP16 tensor cores (moe_tc_iq) - measured
+                    // slower than MMQ (27K prompt 36.9 s; register fragments 42.6, STRATA_GLM_PREFILL_TC_RF=0 WMMA 45.8), kept for A/B
+                    static const bool tc_env = getenv("STRATA_GLM_PREFILL_TC") && atoi(getenv("STRATA_GLM_PREFILL_TC")) != 0;
+                    const bool tc = tc_env && strata::prefill::tciq::available() &&
+                                    strata::prefill::tciq::supported(Ly.gu_type, E, 2 * nff) &&
+                                    strata::prefill::tciq::supported(Ly.d_type, nff, E);
+                    if (tc) {
+                        strata::prefill::tciq::product(Ly.gu_type, gu.w, stride, E, 2 * nff, gu.n, gu.bounds, max_rows, gu.xq,
+                                                       nrows, gu.dst, 2 * nff, s, true);
+                        gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);
+                    } else if (glu) {
                         S->mq->run_glu(gu, g.swiglu_exp, s);   // (h in each row's first n_ff floats, as below)
                     } else {
                         S->mq->run(gu, s);
@@ -2383,7 +2394,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     dn.max_rows = max_rows;
                     dn.dst = M.OUTP + (size_t) (o - a) * E;
                     dn.ld_dst = E;
-                    S->mq->run(dn, s);
+                    if (tc) strata::prefill::tciq::product(Ly.d_type, dn.w, stride, nff, E, dn.n, dn.bounds, max_rows, dn.xq, nrows,
+                                                           dn.dst, E, s);
+                    else S->mq->run(dn, s);
                 }
                 i0 = i1;
             }
