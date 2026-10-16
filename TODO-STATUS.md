@@ -368,3 +368,29 @@ Not applicable here: SYCL / Metal / HIP-only kernels, multi-GPU (#2395, #2720), 
 |---|---|---|
 | Tokenizers: llama4 (Muse), gemma4 (Gemma) | done | 13/13 texts = llama.cpp (tests/q35/tokcheck.py); O(n log n) BPE for long pieces |
 | Benchmarks in BENCHMARK.md | done | every model, contexts, drafters |
+
+## GPU power / clock (V100, se-1-ai-01) - resume
+
+Since 2026-10-16 the account may run `sudo -n /usr/bin/nvidia-smi -pm 0|1 / -pl <W> / -lgc <a>,<b> / -rgc` without a
+password (/etc/sudoers.d/nvidia-smi-power). **The card is set to 175 W, persistence on, clocks unlocked** (user's choice
+2026-10-16; not persistent across a reboot - a systemd unit if it stays).
+
+Partial sweep (powersweep.sh, one cooled run each; needles 3/3 everywhere; clocks from a 1 Hz log under load):
+
+| Setting | 27B MTP4 decode | 27B 28K prompt / decode | GLM 27K prompt | SM clock under load (mean, sd, min) | max temp | power-capped |
+|---|---:|---:|---:|---|---:|---:|
+| 250 W | 68.6 | 912 / 76.1 | 36.5 s | 1312, 72, 1185 | 77 C | 21 % |
+| 225 W | 68.3 | 895 / 76.1 | 37.1 s | 1283, 81, 1132 | 76 C | 23 % |
+| 200 W | 68.2 | 858 / 75.9 | 38.2 s | 1237, 107, 1057 | 74 C | 31 % |
+| 175 W | 68.4 | 786 / 75.4 | 39.9 s | 1168, 153, 870 | 72 C | 42 % |
+| 1380 MHz locked (250 W) | 68.6 | 925 / 76.1 | (stopped) | 1261, 71, 1162 | 79 C | 51 % |
+
+Decode does not move (it is not compute-bound); prompts lose 9-14 % at 175 W; a lower limit lowers the peak temperature
+(77 -> 72 C) but makes the clock swing MORE (sd 72 -> 153 MHz, min 870), not less - a power limit does not steady the
+clock; a locked clock below the power-limited level would.
+
+| # | Item | Effort |
+|---|---|---|
+| 1 | Resume the sweep: locked clocks 1290 / 1230 / 1155 MHz (at 250 W and at 175 W), the GLM 27K run at 1380, a final 250 W drift check; add Hy3 93K decode and a sustained 10-minute load (does 175 W avoid the 81 C SW thermal slowdown the long runs hit?) | S |
+| 2 | Pick the measurement setting: the highest locked clock that never power-caps or thermal-throttles (steady clock for A/B runs) - cool.sh option to lock it per run and -rgc after | S |
+| 3 | If 175 W (or a lock) stays: a systemd unit for `nvidia-smi -pm 1; -pl 175` at boot | S |
