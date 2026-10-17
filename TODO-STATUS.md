@@ -414,4 +414,4 @@ prompts 9-14 % and no decode.
 |---|---|---|
 | 1 | (done: the table above) Resume the sweep | S |
 | 2 | (done: tools/gpu/lockclk.sh on = 250 W + 1230 MHz locked (sd 9 MHz, decode -4 %), off = the standing 175 W / free / persistence) A steady clock for A/B measurements | S |
-| 3 | (unit written: tools/gpu/nvidia-power.service - installing it needs root: `sudo cp tools/gpu/nvidia-power.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now nvidia-power.service`) 175 W kept across a reboot | S |
+| 3 | (unit written: tools/gpu/nvidia-power.service - installing it needs root: `sudo cp tools/gpu/nvidia-power.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now nvidia-power.service`; or a user unit (linger is on, -pm / -pl are NOPASSWD) - Claude Code's auto mode blocks both as persistence, so the user installs it) 175 W kept across a reboot | S |
