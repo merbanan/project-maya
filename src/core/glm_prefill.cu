@@ -2236,12 +2236,22 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         };
         // FP16 EXPERTS (Volta; as glm-dflash d7531c6): a quantized expert routed by at least STRATA_GLM_PREFILL_BLAS rows
         // of the chunk is dequantized to FP16 (llama.cpp's convert.cu) and multiplied by cuBLAS on the FP16 tensor cores;
-        // lighter experts stay on MMQ.  OPT-IN on Hy3 (unset / 0 = MMQ only): one V100, 28K prompt 79.6 / 76.9 -> 69.1 /
-        // 69.1 s, 8K 14.20 / 14.27 -> 13.51 / 13.55 s, but KL against MMQ 0.058 (MMQ against itself 0), top-1 88.3 %,
-        // the target token's log-prob -0.073 - Hy3's activations lose more in FP16 than GLM's / DSv4's (their KL is noise).
+        // lighter experts stay on MMQ.  Default 128 rows on compute capability 7.0, 0 (MMQ only) elsewhere and on HIP:
+        // one V100, 28K prompt 79.6 / 76.9 -> 69.1 / 69.1 s, 8K 14.20 / 14.27 -> 13.51 / 13.55 s.  KL against MMQ 0.058-0.08
+        // (MMQ against itself 0), the target token's log-prob -0.02 to -0.07: no single expert is wrong (each output is
+        // within ~1 % of MMQ, which rounds the activations to q8_1), the differences add up over 79 layers.
+        // STRATA_GLM_PREFILL_BLAS=0 keeps MMQ only.
         static const int blas_rows = [] {
-            const char* v = getenv("STRATA_GLM_PREFILL_BLAS");
-            return v ? std::max(0, std::atoi(v)) : 0;
+            if (const char* v = getenv("STRATA_GLM_PREFILL_BLAS")) return std::max(0, std::atoi(v));
+#if defined(STRATA_USE_HIP)
+            return 0;
+#else
+            int dev = 0, major = 0, minor = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+            return major == 7 && minor == 0 ? 128 : 0;
+#endif
         }();
         const bool use_blas = blas_rows > 0 && mmq::to_f16_supported(Ly.gu_type) && mmq::to_f16_supported(Ly.d_type) &&
                               S->w16_elems >= (int64_t) 2 * nff * E + E;
