@@ -1284,9 +1284,170 @@ void dsv4_indexer(float* q, const float* w, int n_head, const Dsv4Layer& L, int 
     check("indexer");
 }
 
+// Decode attention split over the keys (flash-decoding): every head reads the same latent rows (one 512-wide K = V
+// head), so a block takes kSplitHeads heads and one chunk of rows - a row is read once for 8 heads, not once a
+// head, and 64 / 8 x chunks blocks fill the card instead of 64.  Each block leaves its heads' unnormalised partial
+// output, max and sum; attn_combine_kernel merges the chunks with the sink, normalises and undoes the tail's rope.
+constexpr int kSplitHeads = 8, kSplitMax = 32;
+__global__ void __launch_bounds__(256) attn_split_kernel(const float* q, const uint16_t* swa, const uint16_t* comp,
+                                                         int n_swa, int pos, const int* sel, int n_sel, int rows,
+                                                         Dsv4Rope r, float eps, float* part, float* ml) {
+    constexpr int HB = kSplitHeads;
+    extern __shared__ float smem_s[];
+    float* sq = smem_s;                       // HB x 512
+    float* sp = sq + HB * kDsv4Hd;            // HB x rows: scores, then exp(s - m)
+    __shared__ const uint16_t* rowp[1024];
+    __shared__ float sm[HB];
+    const int h0 = blockIdx.x * HB, ch = blockIdx.y, t = threadIdx.x, lane = t & 31, wp = t >> 5;
+    const int n_raw = min(pos + 1, n_swa), n_all = n_raw + n_sel;
+    const int i0 = ch * rows, nr = max(0, min(rows, n_all - i0));
+    for (int i = t; i < nr; i += 256) {
+        const int ii = i0 + i;
+        rowp[i] = ii < n_raw ? swa + (size_t) ((pos - n_raw + 1 + ii) % n_swa) * kDsv4Hd
+                             : comp + (size_t) (sel != nullptr ? sel[ii - n_raw] : ii - n_raw) * kDsv4Hd;
+    }
+    {   // q of head h0 + wp: the RMS norm (no weight), the tail's rope
+        const float* qh = q + (size_t) (h0 + wp) * kDsv4Hd;
+        float v[16], ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            v[j] = qh[lane + 32 * j];
+            ss += v[j] * v[j];
+        }
+        const float inv = rsqrtf(wsum(ss) / (float) kDsv4Hd + eps);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) sq[wp * kDsv4Hd + lane + 32 * j] = v[j] * inv;
+        __syncwarp();
+        const int d = kDsv4Hd - kDsv4Rot + 2 * lane;   // 32 pairs, a lane each
+        float x0 = sq[wp * kDsv4Hd + d], x1 = sq[wp * kDsv4Hd + d + 1];
+        rope_pair(x0, x1, lane, (float) pos, r, false);
+        sq[wp * kDsv4Hd + d] = x0;
+        sq[wp * kDsv4Hd + d + 1] = x1;
+    }
+    __syncthreads();
+    const float scale = rsqrtf((float) kDsv4Hd);
+    // the scores: a warp a row, lane l dims 8 l .. 8 l + 7 and 256 + 8 l .. (two 16-byte loads a lane)
+    for (int i = wp; i < nr; i += 8) {
+        const uint4 ka = ((const uint4*) rowp[i])[lane], kb = ((const uint4*) rowp[i])[32 + lane];
+        float k[16];
+        const __half2* ha = (const __half2*) &ka;
+        const __half2* hb = (const __half2*) &kb;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 fa = __half22float2(ha[j]), fb = __half22float2(hb[j]);
+            k[2 * j] = fa.x;
+            k[2 * j + 1] = fa.y;
+            k[8 + 2 * j] = fb.x;
+            k[8 + 2 * j + 1] = fb.y;
+        }
+#pragma unroll
+        for (int h = 0; h < HB; ++h) {
+            const float* qq = sq + h * kDsv4Hd;
+            float s = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) s += qq[8 * lane + j] * k[j] + qq[256 + 8 * lane + j] * k[8 + j];
+            s = wsum(s);
+            if (lane == 0) sp[h * rows + i] = s * scale;
+        }
+    }
+    __syncthreads();
+    {   // head wp: the chunk's max and sum, the weights in place
+        float m = -INFINITY;
+        for (int i = lane; i < nr; i += 32) m = fmaxf(m, sp[wp * rows + i]);
+        m = wmax(m);
+        float l = 0.0f;
+        for (int i = lane; i < nr; i += 32) {
+            const float e = expf(sp[wp * rows + i] - m);
+            sp[wp * rows + i] = e;
+            l += e;
+        }
+        l = wsum(l);
+        if (lane == 0) {
+            sm[wp] = m;
+            ml[((size_t) ch * 64 + h0 + wp) * 2] = m;
+            ml[((size_t) ch * 64 + h0 + wp) * 2 + 1] = l;
+        }
+    }
+    __syncthreads();
+    // the partial output: thread t dims 2 t, 2 t + 1 for the 8 heads
+    float acc[HB][2];
+#pragma unroll
+    for (int h = 0; h < HB; ++h) acc[h][0] = acc[h][1] = 0.0f;
+    for (int i = 0; i < nr; ++i) {
+        const float2 v = __half22float2(((const __half2*) rowp[i])[t]);
+#pragma unroll
+        for (int h = 0; h < HB; ++h) {
+            const float w = sp[h * rows + i];
+            acc[h][0] += w * v.x;
+            acc[h][1] += w * v.y;
+        }
+    }
+#pragma unroll
+    for (int h = 0; h < HB; ++h)
+        ((float2*) (part + ((size_t) ch * 64 + h0 + h) * kDsv4Hd))[t] = make_float2(acc[h][0], acc[h][1]);
+}
+
+__global__ void __launch_bounds__(256) attn_combine_kernel(const float* sinks, const float* part, const float* ml,
+                                                           int chunks, int pos, Dsv4Rope r, float* out) {
+    __shared__ float so[kDsv4Hd];
+    const int h = blockIdx.x, t = threadIdx.x;
+    float M = sinks[h];
+    for (int c = 0; c < chunks; ++c) M = fmaxf(M, ml[((size_t) c * 64 + h) * 2]);
+    float den = expf(sinks[h] - M), o0 = 0.0f, o1 = 0.0f;
+    for (int c = 0; c < chunks; ++c) {
+        const float m = ml[((size_t) c * 64 + h) * 2], l = ml[((size_t) c * 64 + h) * 2 + 1];
+        if (l == 0.0f) continue;
+        const float f = expf(m - M);
+        den += l * f;
+        const float* pp = part + ((size_t) c * 64 + h) * kDsv4Hd;
+        o0 += pp[t] * f;
+        o1 += pp[t + 256] * f;
+    }
+    const float id = 1.0f / den;
+    so[t] = o0 * id;
+    so[t + 256] = o1 * id;
+    __syncthreads();
+    if (t < kDsv4Rot / 2) {   // the output's rope undone (the tail)
+        const int d = kDsv4Hd - kDsv4Rot + 2 * t;
+        float x0 = so[d], x1 = so[d + 1];
+        rope_pair(x0, x1, t, (float) pos, r, true);
+        so[d] = x0;
+        so[d + 1] = x1;
+    }
+    __syncthreads();
+    out[(size_t) h * kDsv4Hd + t] = so[t];
+    out[(size_t) h * kDsv4Hd + t + 256] = so[t + 256];
+}
+
 void dsv4_attn(const float* q, const float* sinks, const Dsv4Layer& L, int n_swa, int pos, const int* sel, int n_sel,
                const Dsv4Rope& rope, float eps, int n_head, float* out, cudaStream_t s) {
     const int n_all = std::min(pos + 1, n_swa) + n_sel;
+    // the split kernel (default; STRATA_DSV4_ATTN_SPLIT=0 = one block a head): ~32 rows a chunk, at most 32 chunks
+    static const bool split = !(getenv("STRATA_DSV4_ATTN_SPLIT") && getenv("STRATA_DSV4_ATTN_SPLIT")[0] == '0');
+    const int chunks = std::min(kSplitMax, std::max(1, (n_all + 31) / 32)), rows = (n_all + chunks - 1) / chunks;
+    if (split && n_head == 64 && n_all > 0 && rows <= 1024) {
+        static float* scratch[16] = {};
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (scratch[dev] == nullptr &&
+            cudaMalloc(&scratch[dev], (size_t) kSplitMax * 64 * (kDsv4Hd + 2) * sizeof(float)) != cudaSuccess) {
+            std::fprintf(stderr, "glm_dsv4 attention: no split scratch\n");
+            return;
+        }
+        float* part = scratch[dev];
+        float* ml = part + (size_t) kSplitMax * 64 * kDsv4Hd;
+        const size_t sm = (size_t) kSplitHeads * (kDsv4Hd + rows) * sizeof(float);
+        static size_t opted_s = 48 * 1024;
+        if (sm > opted_s) {
+            cudaFuncSetAttribute(attn_split_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm);
+            opted_s = sm;
+        }
+        attn_split_kernel<<<dim3(64 / kSplitHeads, chunks), 256, sm, s>>>(q, L.swa, L.comp, n_swa, pos, sel, n_sel, rows,
+                                                                          rope, eps, part, ml);
+        attn_combine_kernel<<<64, 256, 0, s>>>(sinks, part, ml, chunks, pos, rope, out);
+        check("attn_split");
+        return;
+    }
     const size_t smem = (size_t) (((n_all + 31) & ~31) + 8 * kDsv4Hd) * sizeof(float);   // scores + the warps' sums
     static size_t opted = 48 * 1024;
     if (smem > opted) {
