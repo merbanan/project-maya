@@ -445,3 +445,13 @@ prompts 9-14 % and no decode.
 - Issue #130's 4x V100: the split pipelines chunks only when a prompt has more than one; auto = 8192 there, so <= 8K
   prompts run one GPU at a time (their 16K: 1 chunk 536 vs 2 chunks 745 tok/s). Chunk 4096 / 2048 should be
   ~1.4x at 16K and more below - untestable on one GPU; an auto chunk of prompt / (2 x GPUs) is the upstream idea.
+- Hy3 FP16 experts now DEFAULT on sm_70 (hy3 447db64, 2026-10-17): 28K 76.8 / 76.9 -> 69.1 / 71.9 s GPU, 8K 14.18 /
+  14.28 -> 13.49 / 13.58 s, needles 3/3 at 30K. Against a near-exact reference (every expert FP16 weights x ~22-bit
+  activations as two FP16 parts) MMQ is as far off as FP16: 8K KL MMQ 0.056 / FP16 0.070, 4K 0.132 / 0.124 - Hy3 just
+  amplifies any rounding; FP16 is not worse. Only gate/up or only down in FP16: KL 0.056 / 0.058 (no help), 28K 72.0 /
+  74.9 s (slower) - dropped.
+- GLM kda_proj split (27K): q/k/v FP16 GEMMs 4.0 s (12 %), FP32 f_a/g_a/beta 0.35 + f_b/g_b 0.43 s, conv 0.44 - the
+  FP32 parts are 2.4 %, not worth FP16. All hgemm_q users: dequant 1.7 s, GEMM 5.8 s. Mixer sub-batch 8192 instead of
+  4096: 27K 31.4 / 31.6 -> 30.6 / 31.0 s (-2 %), 2K / 8K prompt unchanged, but decode after 8K 32.1 / 31.9 -> 29.7 /
+  30.0 tok/s (-7 %: the larger activations take expert-pool VRAM, 2,000+ disk experts vs 1,350) - dropped.
+- Hy3 prompt disk reads: 28K reads ~1,430 experts but waits 0 ms on disk (hidden) - nothing to win.
