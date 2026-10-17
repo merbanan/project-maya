@@ -27,6 +27,7 @@
 #include "ggml.h"
 
 #include <cuda_profiler_api.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #if !defined(STRATA_USE_HIP)
 #include <nvtx3/nvToolsExt.h>
@@ -5937,6 +5938,20 @@ bool Glm5Model::snapshot_restore() {
 // A checkpoint is the snapshot's content at another position, kept in (pageable) host RAM: each half's KDA runs in
 // layer order, then its open pool's rows (per DSA layer kpool-1 ik rows, then kpool-1 ig rows; snap_pool_copy's layout).
 
+// ckpt_pool_copy's device regions at `pos`, in its order: f(float* rows, int64_t n) for each
+template <class F>
+void Glm5Model::ckpt_pool_regions(int64_t pos, F&& f) {
+    const Glm5Geometry& g = g_;
+    const std::vector<int> ls = dsa_layers();
+    const int64_t rows = (int64_t) (g.idx_kpool - 1) * g.idx_key;
+    if (ls.empty() || rows <= 0 || ik_ring_ <= 0) return;
+    const int64_t at = (int64_t) g.idx_key * ((pos - pos % g.idx_kpool) % ik_ring_);
+    for (size_t i = 0; i < ls.size(); ++i) {
+        f(state_ + dsa_ik_[(size_t) ls[i]] + at, rows);
+        f(state_ + dsa_ig_[(size_t) ls[i]] + at, rows);
+    }
+}
+
 // the open pool's rows at `pos` (pool start .. + kpool - 2: contiguous in the ring) <-> host; on fast_->cs
 void Glm5Model::ckpt_pool_copy(int64_t pos, float* host, bool restore) {
     const Glm5Geometry& g = g_;
@@ -5958,6 +5973,33 @@ void Glm5Model::ckpt_pool_copy(int64_t pos, float* host, bool restore) {
 static bool ckpt_stats() {
     static const bool on = getenv("STRATA_GLM_CKPT_STATS") != nullptr;
     return on;
+}
+// STRATA_GLM_CKPT_BF16=1 (opt-in, lossy): a checkpoint's KDA runs and pool rows kept in host RAM as BF16 - half the
+// bytes and the copy; converted on the device through a scratch buffer of the checkpoint's size
+static bool ckpt_bf16() {
+    static const bool on = [] { const char* v = getenv("STRATA_GLM_CKPT_BF16"); return v != nullptr && atoi(v) != 0; }();
+    return on;
+}
+static __global__ void ckpt_f32_to_bf16(const float* __restrict__ src, __nv_bfloat16* __restrict__ dst, int64_t n) {
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        dst[i] = __float2bfloat16_rn(src[i]);
+}
+static __global__ void ckpt_bf16_to_f32(const __nv_bfloat16* __restrict__ src, float* __restrict__ dst, int64_t n) {
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        dst[i] = __bfloat162float(src[i]);
+}
+// the device scratch for the BF16 conversion (one per GPU, grown as needed)
+static __nv_bfloat16* ckpt_scratch(int dev, size_t n) {
+    static std::vector<std::pair<__nv_bfloat16*, size_t>> per(64, {nullptr, 0});
+    if (dev < 0 || dev >= 64) return nullptr;
+    auto& e = per[(size_t) dev];
+    if (e.second < n) {
+        if (e.first) cudaFree(e.first);
+        e = {nullptr, 0};
+        if (cudaMalloc(&e.first, n * sizeof(__nv_bfloat16)) != cudaSuccess) { cudaGetLastError(); e.first = nullptr; return nullptr; }
+        e.second = n;
+    }
+    return e.first;
 }
 
 bool Glm5Model::ckpt_save(int slot, std::string& err) {
@@ -5983,8 +6025,14 @@ bool Glm5Model::ckpt_save(int slot, std::string& err) {
         }
         std::vector<float>& b = m->ckpt_buf_[(size_t) slot];
         m->ckpt_pos_[(size_t) slot] = -1;
+        const size_t total = (size_t) n_rec * run + pool;
+        __nv_bfloat16* scr = nullptr;
+        if (ckpt_bf16()) {
+            cudaSetDevice(m->dev_);
+            scr = ckpt_scratch(m->dev_, total);
+        }
         try {
-            b.resize((size_t) n_rec * run + pool);
+            b.resize(scr ? (total + 1) / 2 : total);
         } catch (const std::bad_alloc&) {
             b.clear();
             b.shrink_to_fit();
@@ -5992,12 +6040,24 @@ bool Glm5Model::ckpt_save(int slot, std::string& err) {
             return false;
         }
         cudaSetDevice(m->dev_);
+        if (scr) {   // the same regions in the same order, as BF16 in the scratch, then one copy down
+            size_t o = 0;
+            auto put = [&](const float* src, int64_t n) {
+                ckpt_f32_to_bf16<<<512, 256, 0, m->fast_->cs>>>(src, scr + o, n);
+                o += (size_t) n;
+            };
+            for (int il = m->l0_; il < m->l1_; ++il)
+                if (g.is_recr(il)) put(m->state_ + m->kda_S_[(size_t) il], (int64_t) run);
+            m->ckpt_pool_regions(m->pos_, put);
+            cudaMemcpyAsync(b.data(), scr, total * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost, m->fast_->cs);
+        } else {
         int k = 0;
         for (int il = m->l0_; il < m->l1_; ++il)
             if (g.is_recr(il))
                 cudaMemcpyAsync(b.data() + (size_t) k++ * run, m->state_ + m->kda_S_[(size_t) il], run * sizeof(float),
                                 cudaMemcpyDeviceToHost, m->fast_->cs);
         m->ckpt_pool_copy(m->pos_, b.data() + (size_t) n_rec * run, false);
+        }
         if (cudaStreamSynchronize(m->fast_->cs) != cudaSuccess) {
             err = std::string("checkpoint: ") + cudaGetErrorString(cudaGetLastError());
             cudaSetDevice(dev_);
@@ -6029,12 +6089,32 @@ bool Glm5Model::ckpt_restore(int slot, std::string& err) {
         const std::vector<float>& b = m->ckpt_buf_[(size_t) slot];
         const int64_t pos = m->ckpt_pos_[(size_t) slot];
         cudaSetDevice(m->dev_);
+        const size_t pool = m->dsa_layers().size() * 2 * (size_t) (g.idx_kpool - 1) * (size_t) g.idx_key;
+        const size_t total = (size_t) n_rec * run + pool;
+        if (b.size() < total) {   // a BF16 checkpoint (STRATA_GLM_CKPT_BF16): up into the scratch, then widened in place
+            __nv_bfloat16* scr = ckpt_scratch(m->dev_, total);
+            if (scr == nullptr) {
+                err = "checkpoint restore: no device scratch for the BF16 checkpoint";
+                cudaSetDevice(dev_);
+                return false;
+            }
+            cudaMemcpyAsync(scr, b.data(), total * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice, m->fast_->cs);
+            size_t o = 0;
+            auto get = [&](float* dst, int64_t n) {
+                ckpt_bf16_to_f32<<<512, 256, 0, m->fast_->cs>>>(scr + o, dst, n);
+                o += (size_t) n;
+            };
+            for (int il = m->l0_; il < m->l1_; ++il)
+                if (g.is_recr(il)) get(m->state_ + m->kda_S_[(size_t) il], (int64_t) run);
+            m->ckpt_pool_regions(pos, get);
+        } else {
         int k = 0;
         for (int il = m->l0_; il < m->l1_; ++il)
             if (g.is_recr(il))
                 cudaMemcpyAsync(m->state_ + m->kda_S_[(size_t) il], b.data() + (size_t) k++ * run, run * sizeof(float),
                                 cudaMemcpyHostToDevice, m->fast_->cs);
         m->ckpt_pool_copy(pos, const_cast<float*>(b.data()) + (size_t) n_rec * run, true);
+        }
         if (cudaStreamSynchronize(m->fast_->cs) != cudaSuccess) {
             err = std::string("checkpoint restore: ") + cudaGetErrorString(cudaGetLastError());
             cudaSetDevice(dev_);

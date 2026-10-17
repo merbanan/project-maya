@@ -499,6 +499,7 @@ public:
     std::vector<int> dsa_layers() const;                   // this half's DSA layers (NextN block first), slot order
     void snap_pool_copy(bool restore);
     int64_t snap_pos_ = -1;
+    template <class F> void ckpt_pool_regions(int64_t pos, F&& f);   // (glm_fast_path.cu)
     std::vector<std::vector<float>> ckpt_buf_;             // ckpt_save's checkpoints (this half): KDA runs, pool rows
     std::vector<int64_t> ckpt_pos_;                        // ... their positions (-1: none)
     void ckpt_pool_copy(int64_t pos, float* host, bool restore);   // the open pool's rows at pos <-> host
