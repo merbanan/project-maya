@@ -436,6 +436,12 @@ prompts 9-14 % and no decode.
 - Ported, two rounds each: DSv4 (dsv4 b2887bc, default on sm_70) 8K 11.31 / 11.36 -> 9.24 / 9.22 s, 28K 36.38 / 36.44
   -> 26.41 / 26.39 s (-27 %), KL 0.0069 = its own run-to-run 0.0070. Hy3 (hy3 631bb90, OPT-IN) 8K -5 %, 28K 79.6 /
   76.9 -> 69.1 / 69.1 s, but KL 0.058 (floor 0), top-1 88 %, target log-prob -0.073 - Hy3 loses in FP16.
+- Hy3's KL explained (2026-10-17): not a bug. Dispatch alone (threshold never reached) KL 0; no FP16 overflow (max |x|
+  3.6, |h| 676; h pre-scaled by 2^-8 / 2^-16 changes nothing); per expert on the same inputs FP16 vs MMQ differ by
+  0.5-0.7 % (h) / 0.8-1.15 % (out) rel L2, evenly in layers 2-78 = MMQ's own q8_1 rounding. Hy3 (79 MoE layers)
+  amplifies that ~4-5x more than GLM (43): 512 positions, Hy3 KL 0.080 / 0.083, target log-prob -0.023 / -0.032;
+  GLM KL 0.020 / 0.016, log-prob +0.002 / -0.017 (neutral - the earlier +0.025 was noise; PR #254 text corrected).
+  Hy3 stays opt-in. Upstream PR #254 (CI green after the HIP guard, cc1169d).
 - Issue #130's 4x V100: the split pipelines chunks only when a prompt has more than one; auto = 8192 there, so <= 8K
   prompts run one GPU at a time (their 16K: 1 chunk 536 vs 2 chunks 745 tok/s). Chunk 4096 / 2048 should be
   ~1.4x at 16K and more below - untestable on one GPU; an auto chunk of prompt / (2 x GPUs) is the upstream idea.
