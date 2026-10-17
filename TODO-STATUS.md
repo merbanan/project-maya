@@ -481,3 +481,14 @@ prompts 9-14 % and no decode.
   20.6-30.3 / 22.1-39.6, DFlash 27.1 / 34.7 tok/s (a 2-4 row window ~3 tokens' time). Opt-in only.
 - MiMo quant choice: BPW2.0 is PPL +27 % / KLD 0.366 vs MXFP4 (AesSedai's table); BPW2.5 (96.7 GB, +10.5 %, 0.227)
   is the suggested step up - ~15-20 GB of experts on the NVMe; to download and measure if wanted.
+
+## Open engineering work (added 2026-10-18)
+
+| # | Item | Status |
+|---|---|---|
+| E1 | MiMo full-context prompt attention: 6.3 s of a 28K prompt at ~23 TFLOPS (rows_tc_kernel); restructure (the heads-inner grid order was slower: 6.82 vs 6.26 s) | open |
+| E2 | MiMo decode attention: ~4 ms a token in the 9 global layers at 19.5K, far under bandwidth - profile (ncu / nsys) | open |
+| E3 | MiMo K/V cache quantization (FP16 only; Hy3 has int8 / TQ modes) | open |
+| E4 | Re-port hy3's sampler92 kernel pair (ffc6335), dropped in the mimo-dflash merge | open |
+| E5 | Branch consolidation: mimo-dflash carries GLM + Hy3 + MiMo - replace glm-dflash as the fork's main line? (the user's call) | open |
+| E6 | DeepSeek-V4.1-Flash (vLLM #59857): scope a port | open |
