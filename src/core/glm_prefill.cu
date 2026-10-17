@@ -321,6 +321,14 @@ int mixer_sub(size_t T, const Glm5Geometry& g, bool kda, bool dsa, bool dense, b
 #endif
 }
 
+// rows of x (row ids[i], or i without ids; ldx floats apart) as FP16, cols each, packed (the FP16 experts' input)
+__global__ void rows_to_f16(const float* __restrict__ x, int64_t ldx, const int32_t* __restrict__ ids, int n, int cols,
+                            __half* __restrict__ dst) {
+    for (int r = blockIdx.x; r < n; r += gridDim.x) {
+        const float* src = x + (size_t) (ids ? ids[r] : r) * ldx;
+        for (int c = threadIdx.x; c < cols; c += blockDim.x) dst[(size_t) r * cols + c] = __float2half(src[c]);
+    }
+}
 void blas_ck(cublasStatus_t st, const char* what) {
     if (st != CUBLAS_STATUS_SUCCESS) std::fprintf(stderr, "glm prefill: %s: cuBLAS status %d\n", what, (int) st);
 }
@@ -2176,8 +2184,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const size_t qblk = mmq::q8_block_bytes();
         // one expert set through gate/up, swiglu and down: its rows [r0 + hb[0], r0 + hb[n_exp]) of the sorted order
         // (hb: the set's bounds on the host, d_bounds the same on the device), in parts of at most W rows
-        const auto run_set = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
-                                 int r0) {
+        const auto run_set_mmq = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
+                                     int r0) {
             for (int i0 = 0; i0 < n_exp;) {
                 int i1 = i0 + 1;   // (one expert never has more rows than T <= W)
                 while (i1 < n_exp && hb[i1 + 1] - hb[i0] <= W) ++i1;
@@ -2224,6 +2232,64 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     S->mq->run(dn, s);
                 }
                 i0 = i1;
+            }
+        };
+        // FP16 EXPERTS (Volta; as glm-dflash d7531c6): a quantized expert routed by at least STRATA_GLM_PREFILL_BLAS rows
+        // of the chunk is dequantized to FP16 (llama.cpp's convert.cu) and multiplied by cuBLAS on the FP16 tensor cores;
+        // lighter experts stay on MMQ.  OPT-IN on Hy3 (unset / 0 = MMQ only): one V100, 28K prompt 79.6 / 76.9 -> 69.1 /
+        // 69.1 s, 8K 14.20 / 14.27 -> 13.51 / 13.55 s, but KL against MMQ 0.058 (MMQ against itself 0), top-1 88.3 %,
+        // the target token's log-prob -0.073 - Hy3's activations lose more in FP16 than GLM's / DSv4's (their KL is noise).
+        static const int blas_rows = [] {
+            const char* v = getenv("STRATA_GLM_PREFILL_BLAS");
+            return v ? std::max(0, std::atoi(v)) : 0;
+        }();
+        const bool use_blas = blas_rows > 0 && mmq::to_f16_supported(Ly.gu_type) && mmq::to_f16_supported(Ly.d_type) &&
+                              S->w16_elems >= (int64_t) 2 * nff * E + E;
+        // one expert: gate/up into its OUTP rows (2 n_ff floats a row, as MMQ writes them), SwiGLU, down over them
+        const auto run_blas_q = [&](const uint8_t* blob, int a, int nrows, int r0) {
+            const int64_t wgu = (int64_t) 2 * nff * E, wdn = (int64_t) E * nff;
+            const int gu_rows = (int) std::max<int64_t>(1, (S->w16_elems - wgu) / E);
+            const int dn_rows = (int) std::max<int64_t>(1, (S->w16_elems - wdn) / nff);
+            const int o = place(r0 + a, nrows);
+            float* GU = M.OUTP + (size_t) o * E;
+            mmq::to_f16(Ly.gu_type, blob, (uint16_t*) S->w16, wgu, s);
+            __half* X16 = (__half*) S->w16 + wgu;
+            for (int c0 = 0; c0 < nrows; c0 += gu_rows) {
+                const int n = std::min(gu_rows, nrows - c0);
+                rows_to_f16<<<std::min(n, 4096), 256, 0, s>>>(S->x, E, M.row_tok + r0 + a + c0, n, (int) E, X16);
+                blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, S->w16, CUDA_R_16F, E,
+                                     X16, CUDA_R_16F, E, &zero, GU + (size_t) c0 * 2 * nff, CUDA_R_32F, 2 * nff,
+                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                        "gemm q gate/up");
+            }
+            gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);
+            mmq::to_f16(Ly.d_type, blob + Ly.down_off, (uint16_t*) S->w16, wdn, s);
+            __half* H16 = (__half*) S->w16 + wdn;
+            // (the down product overwrites rows its later chunks still read: H16 holds a chunk's inputs first)
+            for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
+                const int n = std::min(dn_rows, nrows - c0);
+                rows_to_f16<<<std::min(n, 4096), 256, 0, s>>>(GU + (size_t) c0 * 2 * nff, 2 * nff, nullptr, n, nff, H16);
+                blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, S->w16, CUDA_R_16F, nff, H16,
+                                     CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                        "gemm q down");
+            }
+        };
+        // in set order: runs of lighter experts through MMQ, the heavy ones alone through cuBLAS
+        const auto run_set = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
+                                 int r0) {
+            if (!use_blas) return run_set_mmq(wbase, n_exp, stride, d_bounds, hb, r0);
+            for (int i = 0; i < n_exp;) {
+                const int rows = hb[i + 1] - hb[i];
+                if (rows >= blas_rows) {
+                    run_blas_q(wbase + (size_t) i * stride, hb[i], rows, r0);
+                    ++i;
+                } else {
+                    int j = i + 1;
+                    while (j < n_exp && hb[j + 1] - hb[j] < blas_rows) ++j;
+                    run_set_mmq(wbase + (size_t) i * stride, j - i, stride, d_bounds + i, hb + i, r0);
+                    i = j;
+                }
             }
         };
         // (GLM: 2 x 2048 = 4096; Hy3's 2 x 1536 fits with room to spare - packed at 2 * n_ff, the down rows at n_embd)
