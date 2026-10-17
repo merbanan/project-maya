@@ -5250,7 +5250,9 @@ void rms_q8(float* h, const float* add, const float* w, float eps, int n, float*
 void set_skip(const int* flag) { g_skip = flag; }
 void route_defaults(int arch) {
     g_route_affinity = arch == 0 ? 0.02f : 0.0f;   // (GLM's measured default; hy_v3 / mimo2 not measured with it)
-    g_route_swap = arch == 1 ? 2 : 0;              // (hy_v3's measured default)
+    // (hy_v3's measured default; mimo2 the same - one V100, 9K prompts: decode 31.9 / 31.0 -> 35.2 / 32.7 tok/s, KL
+    // against the mimo branch's build 0.027 with it, 0.025 without)
+    g_route_swap = arch == 1 || arch == 2 ? 2 : 0;
 }
 
 void skip_gate(const volatile int* host_from, int t, int* flag, cudaStream_t s) {

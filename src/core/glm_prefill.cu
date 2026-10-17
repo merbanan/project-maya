@@ -109,15 +109,18 @@ struct Carve {
 constexpr int kSub = 256;   // the sub-batch the mixers, the dense FFN and the shared expert start from
 // STRATA_GLM_PREFILL_SUB: 16-8192 sets every sub-batch, "auto" the sizes below (mixer_sub, the shared expert kSub).
 // Unset: 1024 on CUDA - the auto sizes left the shared expert at 256 (its weights dequantized to FP16 every 256 tokens)
-// and made a 27K GLM prompt ~4x slower on a V100 (314 s of GPU time against 78.6 s); HIP keeps auto
-int prefill_sub_env() {
+// and made a 27K GLM prompt ~4x slower on a V100 (314 s of GPU time against 78.6 s); HIP keeps auto.  The GQA models
+// (hy_v3, mimo2) keep auto too - their shared expert is already sized by shexp_sub (Hy3, one V100, 8K prompt: 13.46 /
+// 13.51 s auto, 14.07 / 14.09 at 1024)
+int prefill_sub_env(bool gqa) {
     const char* v = getenv("STRATA_GLM_PREFILL_SUB");
     if (v && std::strcmp(v, "auto") == 0) return 0;
     if (v) return std::clamp(std::atoi(v), 16, 8192);
 #if defined(STRATA_USE_HIP)
+    (void) gqa;
     return 0;
 #else
-    return 1024;
+    return gqa ? 0 : 1024;
 #endif
 }
 constexpr int kShSub = 2048;   // the shared expert's on CUDA (shexp_sub)
@@ -693,7 +696,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
     S->has_dense = has_dense;
     S->has_moe = has_moe;
     S->max_pools = (int) std::max<int64_t>(1, max_ctx_ / g.idx_kpool);
-    S->sub_env = prefill_sub_env();
+    S->sub_env = prefill_sub_env(g.gqa());
     S->prof = getenv("STRATA_GLM_PREFILL_PROF") != nullptr;
     S->gstride = gstride;
 
@@ -1046,7 +1049,7 @@ std::pair<size_t, size_t> Glm5Model::prefill_bytes_for(size_t T, size_t kv_stage
 size_t glm_prefill_lend_bytes(const Glm5Geometry& g, size_t T, bool has_kda, bool has_dsa, bool has_dense,
                               bool has_moe, bool mtp, int64_t max_ctx, size_t gstride, size_t kv_stage) {
     const int max_pools = (int) std::max<int64_t>(1, max_ctx / g.idx_kpool);
-    const int sub_env = prefill_sub_env();
+    const int sub_env = prefill_sub_env(g.gqa());
     const auto pu = chunk_bytes(g, T, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env, mtp, kv_stage);
     const auto ws = weight_scratch(g, has_dsa);
     Carve c;
@@ -1529,7 +1532,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // updates, but omit the output projection and FFN (including both mHC write halves). Split boundaries and seam
     // dumps consume these rows, so keep their full path. STRATA_GLM_PREFILL_TAIL_SKIP=0 is the A/B baseline.
     const char* tail_env = getenv("STRATA_GLM_PREFILL_TAIL_SKIP");
-    const bool tail_skip = l0_ == 0 && l1_ == g.n_layers && split_next_ == nullptr && mtp_il_ < 0 &&
+    // (nor when a DFlash drafter reads the final hidden state - mimo2's reads layer n_layers)
+    const bool reads_final = cap_d_ != nullptr && cap_k_.size() > (size_t) g.n_layers && cap_k_[(size_t) g.n_layers] >= 0;
+    const bool tail_skip = l0_ == 0 && l1_ == g.n_layers && split_next_ == nullptr && mtp_il_ < 0 && !reads_final &&
                            (cb_dir == nullptr || !cb_dir[0]) && (tail_env == nullptr || std::atoi(tail_env) != 0);
     const auto dump_row = [&](const std::string& name, const float* rows, int width, int row = -1) {
         if (cb_dir == nullptr || !cb_dir[0]) return;
@@ -3172,6 +3177,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         if (g.gqa()) blas_ck(cublasSaxpy(S->blas, T * E, &one, S->ffn, 1, S->R, 1), "residual add");
         else gb::hc_update(S->ffn, S->R, S->post, S->comb, nullptr, T, E, s);
         S->mark("hc", s);
+        if (l1_ == g.n_layers) dflash_capture(g.n_layers, S->R, T, p0, S->mixer, T, s);   // (the final hidden states)
     }
     // ---- the NextN block's caches for these positions (the half that carries it): position p reads h_p and the
     //      embedding of the token at p + 1 - an image's row where p + 1 is one of its positions (next_img), as the
@@ -3200,16 +3206,30 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             float* emb = c.take<float>((size_t) Tv * E);
             uint16_t* cat16 = c.take<uint16_t>((size_t) Tv * 2 * E);
             float* hid = c.take<float>((size_t) Tv * E);
-            float* kv = c.take<float>((size_t) Tv * (g.gqa() ? 2 * g.n_kv * g.head_dim : g.kv_lora));
+            float* kv = c.take<float>((size_t) Tv * (g.mimo() ? g.n_head * g.head_dim + g.n_kv * (g.head_dim + g.v_dim)
+                                                     : g.gqa() ? 2 * g.n_kv * g.head_dim : g.kv_lora));
             float* ik = c.take<float>((size_t) Tv * g.idx_key);
             float* ig = c.take<float>((size_t) Tv * g.idx_key);
             cudaMemcpyAsync(emb, S->emb_h, (size_t) Tv * E * sizeof(float), cudaMemcpyHostToDevice, s);
-            if (g.gqa()) gb::rms_rows(S->R, w_.at("output_norm.weight"), g.norm_eps, Tv, E, h, S->x16, s);   // (x16: scratch)
+            // (mimo2: the block reads the trunk's raw final hidden state, as llama.cpp's mimo2 MTP; hy_v3 / GLM its normed one)
+            if (g.mimo()) cudaMemcpyAsync(h, S->R, (size_t) Tv * E * sizeof(float), cudaMemcpyDeviceToDevice, s);
+            else if (g.gqa()) gb::rms_rows(S->R, w_.at("output_norm.weight"), g.norm_eps, Tv, E, h, S->x16, s);   // (x16: scratch)
             else gb::head_rows(S->R, w_.at("output_norm.weight"), g.norm_eps, Tv, E, h, s);
             gb::mtp_in_rows(emb, h, Ly.enorm, Ly.hnorm, g.norm_eps, Tv, E, cat16, s);
             hgemm_q(Ly.eh, E, 2 * E, cat16, 2 * E, hid, E, Tv, 0.0f);
             gb::rms_rows(hid, Ly.attn_norm, g.norm_eps, Tv, E, S->x, S->x16, s);
-            if (g.gqa()) {
+            if (g.mimo()) {
+                // mimo2: the block's fused q/k/v for these positions, rope + K / V into its ring - the last ring's worth
+                // of rows only (the ring keeps no more; earlier rows would race for its slots)
+                const int nkv = g.n_head_kv[(size_t) mtp_il_];
+                const int QKV = g.n_head * g.head_dim + nkv * (g.head_dim + g.v_dim);
+                const mimo::Kv mk = mimo_view(mtp_il_);
+                const int r0 = std::max(0, Tv - mk.cap);
+                hgemm_q(Ly.q, QKV, E, S->x16 + (size_t) r0 * E, E, kv, QKV, Tv - r0, 0.0f);
+                mimo::prep(kv, QKV, Tv - r0, p0 + r0, g.n_head, g.n_rot, g.swa(mtp_il_) ? g.rope_base_swa : g.rope_base,
+                           mk, s);
+                S->mark("mtp_cache", s);
+            } else if (g.gqa()) {
                 // hy_v3: the block's K / V for these positions (k / v projections, the k norm + rope) - no queries
                 const int KD = g.n_kv * g.head_dim;
                 float* kk = kv;                              // (Tv x KD each: kv's and ik's room, re-carved)

@@ -329,6 +329,7 @@ struct Glm5Model::FastState {
     int* tok = nullptr;
     // the NextN block (the half that carries it): its residual, eh_proj's q8_1 input, its logits and token
     float* mtp_h = nullptr;
+    float* mtp_hin = nullptr;   // mimo2: the trunk's raw hidden state its draft block reads (head_x's position)
     void* mtp_catq = nullptr;
     float* mtp_logits = nullptr;
     int* mtp_tok = nullptr;

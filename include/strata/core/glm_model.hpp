@@ -517,6 +517,7 @@ public:
     std::vector<std::pair<int64_t, int64_t>> running_runs() const;   // the snapshot's (state_ offset, floats) runs
     int64_t running_floats() const;
     bool fast_mimo(int il, int64_t p, std::string& err);  // mimo2: one attention mixer (x -> mixer)
+    bool fast_window_layers_mimo(int64_t p0, int T, std::string& err);   // mimo2: a verify window's layers
     // the slots of the pool's lendable tail whose memory meets [lo, hi): lent (to the prompt path: kLent, to the cache:
     // kKvLent) - their experts moved over colder main-slot ones or parked in the RAM tier
     bool lend_range(const uint8_t* lo, const uint8_t* hi, char state, uint64_t& moved, uint64_t& dropped, std::string& err);

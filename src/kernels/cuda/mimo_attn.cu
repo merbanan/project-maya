@@ -70,20 +70,37 @@ __global__ void __launch_bounds__(256) copy_kernel(Kv src, Kv dst, int64_t lo) {
 // head go to part, merged with the sink by combine_kernel.  The splits are sized so that a layer is about two blocks
 // an SM (a 128-key split a block left a full-context layer at 19.5K positions with 612 blocks and a 153-part combine).
 constexpr int kSplit = 128, kDecW = 4, kMaxG = 16, kPart = kDV + 2;
+// a decode row's split layout: its keys' first position and the keys a split - the same for a row alone (T = 1) and
+// in a verify window, so a window's row sums its keys in the order the token path does
+__host__ __device__ __forceinline__ void dec_layout(int64_t pos, int window, int n_kv, int keys_env, int64_t& base,
+                                                    int64_t& kpb, int& n_split) {
+    base = window > 0 ? (pos - window + 1 > 0 ? pos - window + 1 : 0) : 0;
+    const int64_t keys = pos + 1 - base;
+    kpb = (keys * n_kv + 159) / 160;
+    if (kpb < 128) kpb = 128;
+    if (kpb < keys_env) kpb = keys_env;
+    kpb = (kpb + 31) / 32 * 32;
+    n_split = (int) ((keys + kpb - 1) / kpb);
+}
+
 __global__ void __launch_bounds__(kDecW * 32) dec_kernel(const float* __restrict__ q, int64_t qld, int64_t p0,
-                                                         int n_head, Kv kv, int window, float scale, int64_t base,
-                                                         int kpb, int n_split, float* __restrict__ part) {
+                                                         int n_head, Kv kv, int window, float scale, int keys_env,
+                                                         int n_split, float* __restrict__ part) {
     const int kvh = blockIdx.x, sp = blockIdx.y, t = blockIdx.z;
     const int G = n_head / kv.n_kv;
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     const int64_t pos = p0 + t, lo = window > 0 ? max((int64_t) 0, pos - window + 1) : 0;
+    int64_t base, kpb;
+    int n_mine;
+    dec_layout(pos, window, kv.n_kv, keys_env, base, kpb, n_mine);
     __shared__ float sq[kMaxG][kDK];
     __shared__ float sm[kDecW][kMaxG], sl[kDecW][kMaxG];
     __shared__ float so[kDecW][kMaxG][kDV];
     for (int i = threadIdx.x; i < G * kDK; i += blockDim.x)
         sq[i / kDK][i % kDK] = q[(size_t) t * qld + (size_t) (kvh * G + i / kDK) * kDK + i % kDK] * scale;
     __syncthreads();
-    const int64_t kb0 = base + (int64_t) sp * kpb, kb1 = min(kb0 + kpb, pos + 1);
+    // (a split past this row's own: empty - kb0 >= kb1)
+    const int64_t kb0 = sp < n_mine ? base + (int64_t) sp * kpb : pos + 1, kb1 = min(kb0 + kpb, pos + 1);
     float m[kMaxG], l[kMaxG], acc[kMaxG][4];
 #pragma unroll
     for (int g = 0; g < kMaxG; ++g) {
@@ -360,13 +377,14 @@ void prep(float* qkv, int64_t ld, int T, int64_t p0, int n_head, int n_rot, floa
     prep_kernel<<<T, 256, 0, s>>>(qkv, ld, p0, n_head, n_rot, powf(base, -2.0f / (float) n_rot), kv);
 }
 
-size_t attn_scratch_floats(int n_head, int T, int64_t max_keys) {
+size_t attn_scratch_floats(int n_head, int T, int64_t max_keys, int min_kv) {
 #if defined(STRATA_USE_HIP)
     T = std::min(T, kDecRows);   // (no tensor-core prompt kernel: the rows go through the decode kernel 16 at a time)
 #else
     if (T > kDecRows) return 0;
 #endif
-    const int64_t n_split = (max_keys + T + kSplit) / kSplit + 1;
+    // (attn's splits: at least kSplit keys each, about 160 blocks a layer - at most 160 / n_kv + 1 of them)
+    const int64_t n_split = std::min<int64_t>((max_keys + T + kSplit) / kSplit + 1, 160 / std::max(1, min_kv) + 2);
     return (size_t) T * n_head * n_split * kPart;
 }
 
@@ -386,16 +404,18 @@ void attn(const float* q, int64_t qld, int T, int64_t p0, int n_head, const Kv& 
     }
 #endif
     if (T <= kDecRows && scratch != nullptr) {   // (no scratch: the prompt kernel, whatever T)
-        const int64_t base = window > 0 ? std::max<int64_t>(0, p0 - window + 1) : 0;
-        // splits: about 160 blocks a layer (two an SM on a V100), at least 128 keys each (STRATA_MIMO_DEC_KEYS=<n>:
-        // n keys a split)
+        // splits: about 160 blocks a layer (two an SM on a V100), at least 128 keys each, each row's own layout
+        // (dec_layout); STRATA_MIMO_DEC_KEYS can only make them larger (the scratch holds at most ~160 / n_kv)
         static const int keys_env = getenv("STRATA_MIMO_DEC_KEYS") != nullptr ? std::atoi(getenv("STRATA_MIMO_DEC_KEYS")) : 0;
-        const int64_t keys = p0 + T - base;
-        int64_t kpb = std::max<int64_t>(kSplit, keys_env > 0 ? keys_env : (keys * kv.n_kv + 159) / 160);
-        kpb = (kpb + 31) / 32 * 32;
-        const int n_split = (int) ((keys + kpb - 1) / kpb);
-        dec_kernel<<<dim3(kv.n_kv, n_split, T), kDecW * 32, 0, s>>>(q, qld, p0, n_head, kv, window, scale, base,
-                                                                   (int) kpb, n_split, scratch);
+        int n_split = 1;
+        for (int t = 0; t < T; ++t) {
+            int64_t b, k;
+            int n;
+            dec_layout(p0 + t, window, kv.n_kv, keys_env, b, k, n);
+            n_split = std::max(n_split, n);
+        }
+        dec_kernel<<<dim3(kv.n_kv, n_split, T), kDecW * 32, 0, s>>>(q, qld, p0, n_head, kv, window, scale, keys_env,
+                                                                   n_split, scratch);
         combine_kernel<<<dim3(n_head, T), kDV, 0, s>>>(scratch, n_split, n_head, sinks, out_scale, out, ldo);
         return;
     }

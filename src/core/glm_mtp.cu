@@ -309,7 +309,9 @@ bool Glm5Model::mtp_cache_setup(std::string& err) {
     const size_t a = 256;
     const auto up = [&](size_t b) { return (b + a - 1) / a * a; };
     const size_t f = sizeof(float);
-    const size_t sz[8] = {up(rows * E * f), up(rows * E * f), up(rows * E * f), up(rows * g.kv_lora * f),
+    // (row 3: the DSA latent rows - or mimo2's fused q/k/v rows of the draft block)
+    const int64_t r3 = g.mimo() ? (int64_t) g.n_head * g.head_dim + (int64_t) g.n_kv * (g.head_dim + g.v_dim) : g.kv_lora;
+    const size_t sz[8] = {up(rows * E * f), up(rows * E * f), up(rows * E * f), up(rows * r3 * f),
                           up(rows * g.idx_key * f), up(rows * g.idx_key * f), up(rows * q8_bytes(2 * E)),
                           up(rows * q8_bytes(E))};
     size_t total = 0;
@@ -393,6 +395,29 @@ bool Glm5Model::mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t*
     for (int i = 0; i < n; ++i)
         gf::rms_q8(C.hid + (size_t) i * E, nullptr, Ly.attn_norm, g.norm_eps, g.n_embd, C.x + (size_t) i * E,
                    (uint8_t*) C.xq + (size_t) i * q8_bytes(E), s);
+    if (g.mimo()) {
+        // mimo2's draft block: the fused q/k/v of the rows, rope + their K / V into the block's ring (the q half is
+        // roped and left unread)
+        const int nkv = g.n_head_kv[(size_t) mtp_il_];
+        const int QKV = g.n_head * g.head_dim + nkv * (g.head_dim + g.v_dim);
+        gf::MvJob jq = {Ly.q.q, C.xq, C.x, C.kv_raw, nullptr, 1.0f, Ly.q.type, g.n_embd, QKV};
+        jq.ncol = n;
+        jq.xq_cstride = (int64_t) q8_bytes(E);
+        jq.xf_cstride = E;
+        jq.y_cstride = QKV;
+        if (!gf::mv(&jq, 1, s)) {
+            err = "glm mtp: the cache rows' q/k/v";
+            return false;
+        }
+        strata::kernels::mimo::prep(C.kv_raw, QKV, n, p0, g.n_head, g.n_rot,
+                                    g.swa(mtp_il_) ? g.rope_base_swa : g.rope_base, mimo_view(mtp_il_), s);
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            err = std::string("glm mtp cache: ") + cudaGetErrorString(e);
+            return false;
+        }
+        return true;
+    }
     gf::MvJob j[3];
     j[0] = {Ly.kv_a.q, C.xq, C.x, C.kv_raw, nullptr, 1.0f, Ly.kv_a.type, g.n_embd, g.kv_lora};
     j[1] = {Ly.idx_k, nullptr, C.x, C.ik_raw, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.idx_key};
@@ -444,7 +469,7 @@ bool Glm5Model::mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t*
 bool Glm5Model::mtp_fill_prev(int32_t token, int64_t p, std::string& err) {
     if (!mtp_dec_ || fast_ == nullptr || mtp_il_ < 0 || fast_->mtpc.cap < 1 || p < 1 || mtp_hx_pos_ != p - 1)
         return true;
-    return mtp_cache_rows(p - 1, 1, fast_->head_x, &token, err);
+    return mtp_cache_rows(p - 1, 1, g_.mimo() ? fast_->mtp_hin : fast_->head_x, &token, err);
 }
 
 // ---------------------------------------------------------------- the draft length
@@ -703,13 +728,14 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
             }
             // ---- 5. the NextN cache: entries p0 .. p0 + keep - 2 from the kept rows' trunk states and the accepted
             //         drafts; entry p0 + keep - 1 is the next round's first draft step (or the token path's)
-            const float* rows_hx = F->win.head_x;
+            // (mimo2's block reads the trunk's raw hidden states: the window's residual rows, kept in mtp_hin)
+            const float* rows_hx = g.mimo() ? F->win.R[F->win.out] : F->win.head_x;
             if (keep > 1 && !mtp_cache_rows(p0, keep - 1, rows_hx, win.data() + 1, err, !chain)) {
                 ok = false;
                 break;
             }
             cudaSetDevice(dev_);
-            cudaMemcpyAsync(F->head_x, rows_hx + (size_t) (keep - 1) * E, (size_t) E * sizeof(float),
+            cudaMemcpyAsync(g.mimo() ? F->mtp_hin : F->head_x, rows_hx + (size_t) (keep - 1) * E, (size_t) E * sizeof(float),
                             cudaMemcpyDeviceToDevice, F->cs);
             mtp_hx_pos_ = p0 + keep - 1;
             ph[2] += ms_since(t2);

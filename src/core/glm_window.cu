@@ -36,6 +36,7 @@
 #include <vector>
 
 namespace gf = strata::kernels::glmf;
+namespace mimo = strata::kernels::mimo;
 
 namespace strata::core {
 
@@ -479,19 +480,27 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
     if (part != 2) {
         gf::MvJob j[3];
         const void* xq0 = (const uint8_t*) W.xq + (size_t) t0 * W.xq_s;
-        j[0] = {Ly.router, nullptr, W.x + (size_t) t0 * E, W.rlog + (size_t) t0 * g.n_expert, nullptr, 1.0f, gf::kTypeBF16, E,
-                g.n_expert};
+        // (the router in F32 where the GGUF keeps it so - hy_v3 / mimo2 - else BF16)
+        if (Ly.router32 != nullptr)
+            j[0] = {Ly.router32, nullptr, W.x + (size_t) t0 * E, W.rlog + (size_t) t0 * g.n_expert, nullptr, 1.0f,
+                    gf::kTypeF32, E, g.n_expert};
+        else
+            j[0] = {Ly.router, nullptr, W.x + (size_t) t0 * E, W.rlog + (size_t) t0 * g.n_expert, nullptr, 1.0f,
+                    gf::kTypeBF16, E, g.n_expert};
         const float* x0 = W.x + (size_t) t0 * E;
-        j[1] = {Ly.sh_gate.q, xq0, x0, W.sh_g + (size_t) t0 * FFs, nullptr, 1.0f, Ly.sh_gate.type, E, FFs};
-        j[2] = {Ly.sh_up.q, xq0, x0, W.sh_u + (size_t) t0 * FFs, nullptr, 1.0f, Ly.sh_up.type, E, FFs};
+        int nj = 1;
+        if (FFs > 0) {   // (mimo2 has no shared expert)
+            j[nj++] = {Ly.sh_gate.q, xq0, x0, W.sh_g + (size_t) t0 * FFs, nullptr, 1.0f, Ly.sh_gate.type, E, FFs};
+            j[nj++] = {Ly.sh_up.q, xq0, x0, W.sh_u + (size_t) t0 * FFs, nullptr, 1.0f, Ly.sh_up.type, E, FFs};
+        }
         const int64_t ys[3] = {g.n_expert, FFs, FFs};
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < nj; ++i) {
             j[i].ncol = T;
             j[i].xq_cstride = (int64_t) W.xq_s;
             j[i].xf_cstride = E;
             j[i].y_cstride = ys[i];
         }
-        if (!gf::mv(j, 3, s)) { err = "glm window: router / shared expert"; return false; }
+        if (!gf::mv(j, nj, s)) { err = "glm window: router / shared expert"; return false; }
         if (prof) W.mark("moe_mv", s);
     }
     gf::MoeDev md = F->md;
@@ -762,7 +771,80 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
     return true;
 }
 
+// mimo2's window layers: one residual stream (W.R[0]); per layer the attention-side read and residual add (rms_q8,
+// token by token as fast_layers_gqa), the drafter's capture, the fused q/k/v as a T-column GEMV, rope + the records
+// for all T positions, each row's attention (the decode kernel, T rows), the output GEMV, the FFN-side read, then the
+// dense FFN or the window's MoE.  The window layers' rings take the T positions (a rejected one is rewritten before
+// any query reads it: the ring keeps 64 positions beyond the window).
+bool Glm5Model::fast_window_layers_mimo(int64_t p0, int T, std::string& err) {
+    FastState* F = fast_;
+    auto& W = F->win;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const int E = g.n_embd, OD = g.n_head * g.v_dim;
+    const size_t aq2 = (size_t) OD / 32 * 36;   // the attention output's q8_1 rows (in W.attn_q)
+    const auto cols = [&](gf::MvJob& j, int n, int64_t xq_s, int64_t xf_s, int64_t y_s) {
+        j.ncol = n;
+        j.xq_cstride = xq_s;
+        j.xf_cstride = xf_s;
+        j.y_cstride = y_s;
+    };
+    float* R = W.R[0];
+    for (int il = l0_; il < l1_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        for (int t = 0; t < T; ++t)
+            gf::rms_q8(R + (size_t) t * E, il == l0_ ? nullptr : W.ffn + (size_t) t * E, Ly.attn_norm, g.norm_eps, E,
+                       W.x + (size_t) t * E, (uint8_t*) W.xq + (size_t) t * W.xq_s, s);
+        dflash_capture(il, R, T, p0, F->cap, F->cap_rows, s);
+        const int nkv = g.n_head_kv[(size_t) il];
+        const int QKV = g.n_head * g.head_dim + nkv * (g.head_dim + g.v_dim);
+        gf::MvJob j = {Ly.q.q, W.xq, W.x, W.q, nullptr, 1.0f, Ly.q.type, E, QKV};
+        cols(j, T, (int64_t) W.xq_s, E, QKV);
+        if (!gf::mv(&j, 1, s)) { err = "glm window: mimo2 q/k/v"; return false; }
+        const mimo::Kv kv = mimo_view(il);
+        const bool win = g.swa(il);
+        mimo::prep(W.q, QKV, T, p0, g.n_head, g.n_rot, win ? g.rope_base_swa : g.rope_base, kv, s);
+        mimo::attn(W.q, QKV, T, p0, g.n_head, kv, win ? g.swa_window : 0, Ly.sinks, 1.0f / std::sqrt((float) g.head_dim),
+                   g.v_scale, W.ctx, OD, F->gscr, s);
+        gf::quantize_q8_1(W.ctx, W.attn_q, T * OD, s);   // (rows of OD values, aq2 bytes apart)
+        gf::MvJob o = {Ly.out.q, W.attn_q, nullptr, W.mixer, nullptr, 1.0f, Ly.out.type, OD, E};
+        cols(o, T, (int64_t) aq2, 0, E);
+        if (!gf::mv(&o, 1, s)) { err = "glm window: mimo2 output"; return false; }
+        for (int t = 0; t < T; ++t)
+            gf::rms_q8(R + (size_t) t * E, W.mixer + (size_t) t * E, Ly.ffn_norm, g.norm_eps, E, W.x + (size_t) t * E,
+                       (uint8_t*) W.xq + (size_t) t * W.xq_s, s);
+        if (!Ly.moe) {
+            gf::MvJob jd[2];
+            jd[0] = {Ly.ffn_gate.q, W.xq, W.x, W.dg, nullptr, 1.0f, Ly.ffn_gate.type, E, g.n_ff_dense};
+            jd[1] = {Ly.ffn_up.q, W.xq, W.x, W.du, nullptr, 1.0f, Ly.ffn_up.type, E, g.n_ff_dense};
+            for (auto& jj : jd) cols(jj, T, (int64_t) W.xq_s, E, g.n_ff_dense);
+            if (!gf::mv(jd, 2, s)) { err = "glm window: dense ffn"; return false; }
+            for (int t = 0; t < T; ++t)
+                gf::swiglu_q8(W.dg + (size_t) t * g.n_ff_dense, W.du + (size_t) t * g.n_ff_dense, g.swiglu_shexp,
+                              g.n_ff_dense, (uint8_t*) W.dhq + (size_t) t * W.dhq_s, s);
+            gf::MvJob dn = {Ly.ffn_down.q, W.dhq, nullptr, W.ffn, nullptr, 1.0f, Ly.ffn_down.type, g.n_ff_dense, E};
+            cols(dn, T, (int64_t) W.dhq_s, 0, E);
+            if (!gf::mv(&dn, 1, s)) { err = "glm window: dense ffn down"; return false; }
+        } else if (!fast_moe_window(il, 0, T, 0, 0, err)) {
+            return false;
+        }
+    }
+    // the last FFN's residual add (the head reads R; the normalised copy it also writes is not used)
+    for (int t = 0; t < T; ++t)
+        gf::rms_q8(R + (size_t) t * E, W.ffn + (size_t) t * E, F->L[(size_t) l1_ - 1].ffn_norm, g.norm_eps, E,
+                   W.x + (size_t) t * E, (uint8_t*) W.xq + (size_t) t * W.xq_s, s);
+    dflash_capture(l1_, R, T, p0, F->cap, F->cap_rows, s);   // (the final hidden states, when the drafter reads them)
+    W.out = 0;
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        err = std::string("glm window: ") + cudaGetErrorString(e);
+        return false;
+    }
+    return true;
+}
+
 bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
+    if (g_.mimo()) return fast_window_layers_mimo(p0, T, err);
     FastState* F = fast_;
     auto& W = F->win;
     const Glm5Geometry& g = g_;
@@ -999,8 +1081,11 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
             if (const float* img = image_row(p0 + t)) std::memcpy(row, img, (size_t) E * sizeof(float));
         }
         cudaMemcpyAsync(W.emb, W.emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, F->cs);
-        for (int t = 0; t < T; ++t)
-            gf::embed_streams(W.emb + (size_t) t * E, W.R[0] + (size_t) t * hcE, E, F->cs);
+        if (g.gqa())   // one residual stream: the embedding as it is
+            cudaMemcpyAsync(W.R[0], W.emb, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
+        else
+            for (int t = 0; t < T; ++t)
+                gf::embed_streams(W.emb + (size_t) t * E, W.R[0] + (size_t) t * hcE, E, F->cs);
     }
     if (!fast_window_layers(p0, T, err)) return false;
     // each later part: the rows cross over through the previous part's pinned buffer, ordered on the devices
@@ -1022,9 +1107,14 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
     FastState* FT = tail->fast_;
     auto& WT = FT->win;
     cudaSetDevice(tail->dev_);
-    for (int t = 0; t < T; ++t)
-        gf::head_prep(WT.R[WT.out] + (size_t) t * hcE, tail->w_.at("output_norm.weight"), g.norm_eps, E,
-                      WT.head_x + (size_t) t * E, (uint8_t*) WT.head_xq + (size_t) t * WT.xq_s, FT->cs);
+    for (int t = 0; t < T; ++t) {
+        if (g.gqa())   // (one residual stream: its rms norm, as the token path's head)
+            gf::rms_q8(WT.R[WT.out] + (size_t) t * E, nullptr, tail->w_.at("output_norm.weight"), g.norm_eps, E,
+                       WT.head_x + (size_t) t * E, (uint8_t*) WT.head_xq + (size_t) t * WT.xq_s, FT->cs);
+        else
+            gf::head_prep(WT.R[WT.out] + (size_t) t * hcE, tail->w_.at("output_norm.weight"), g.norm_eps, E,
+                          WT.head_x + (size_t) t * E, (uint8_t*) WT.head_xq + (size_t) t * WT.xq_s, FT->cs);
+    }
     const WSlot& ow = tail->ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, WT.head_xq, WT.head_x, WT.logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;

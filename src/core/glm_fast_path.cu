@@ -791,7 +791,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             return q(n);
         };
         Ly.recr = is_mtp ? false : g.is_recr(il);
-        Ly.moe = il >= g.dense_lead;
+        Ly.moe = il >= g.dense_lead && !(is_mtp && g.mimo());   // (mimo2's draft blocks have a dense FFN)
         Ly.mtp = is_mtp;
         Ly.gqa = g.gqa();
         if (Ly.gqa) {
@@ -801,7 +801,9 @@ bool Glm5Model::fast_setup(std::string& err) {
                 Ly.eh = q("nextn.eh_proj.weight");
                 Ly.enorm = f32("nextn.enorm.weight");
                 Ly.hnorm = f32("nextn.hnorm.weight");
-                Ly.shnorm = f32("nextn.shared_head_norm.weight");
+                // (mimo2: the layer's output norm is the draft's head norm - llama.cpp's fallback without a
+                // shared_head_norm)
+                Ly.shnorm = g.mimo() ? f32("layer_output_norm.weight") : f32("nextn.shared_head_norm.weight");
             }
             Ly.attn_norm = f32("attn_norm.weight");
             Ly.ffn_norm = f32("ffn_norm.weight");
@@ -1022,7 +1024,10 @@ bool Glm5Model::fast_setup(std::string& err) {
         // mimo2: the fused projection's row (q, the widest layer's k and v), the attention output, decode's split parts
         const size_t qkv = (size_t) g.n_head * g.head_dim + (size_t) g.n_kv * (g.head_dim + g.v_dim);
         const size_t of = (size_t) g.n_head * g.v_dim;
-        const size_t sf = mimo::attn_scratch_floats(g.n_head, 1, max_ctx_);
+        // (a verify window decodes up to kWinMax rows at once)
+        int min_kv = g.n_head;
+        for (int il = l0_; il < l1_; ++il) min_kv = std::min(min_kv, g.n_head_kv[(size_t) il]);
+        const size_t sf = mimo::attn_scratch_floats(g.n_head, kWinMax, max_ctx_, min_kv);
         if (cudaMalloc(&F->gq, (qkv + of + sf) * sizeof(float)) != cudaSuccess) {
             err = "glm fast: the attention buffers did not allocate";
             return false;
@@ -1043,7 +1048,8 @@ bool Glm5Model::fast_setup(std::string& err) {
         F->gscr = F->gv + kf;
     }
     if (mtp_il_ >= 0) {
-        if (cudaMalloc(&F->mtp_h, (size_t) g.n_embd * sizeof(float)) != cudaSuccess ||
+        if ((g.mimo() && cudaMalloc(&F->mtp_hin, (size_t) g.n_embd * sizeof(float)) != cudaSuccess) ||
+            cudaMalloc(&F->mtp_h, (size_t) g.n_embd * sizeof(float)) != cudaSuccess ||
             cudaMalloc(&F->mtp_catq, (size_t) 2 * g.n_embd / 32 * 36) != cudaSuccess ||
             cudaMalloc(&F->mtp_logits, (size_t) g.n_vocab * sizeof(float)) != cudaSuccess ||
             cudaMalloc(&F->mtp_tok, 64) != cudaSuccess ||
@@ -3543,6 +3549,7 @@ void Glm5Model::fast_destroy() {
     if (F->tok_h) cudaFreeHost(F->tok_h);
     if (F->scratch) cudaFree(F->scratch);
     if (F->mtp_h) cudaFree(F->mtp_h);
+    if (F->mtp_hin) cudaFree(F->mtp_hin);
     if (F->gq) cudaFree(F->gq);
     if (F->mtp_catq) cudaFree(F->mtp_catq);
     if (F->mtp_logits) cudaFree(F->mtp_logits);
@@ -5603,6 +5610,7 @@ bool Glm5Model::fast_layers_gqa(int64_t p, std::string& err) {
         const auto& Ly = F->L[(size_t) il];
         gf::rms_q8(R, il == l0_ ? nullptr : F->ffn, Ly.attn_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
         if (F->prof_on) F->mark("attn_norm");
+        dflash_capture(il, R, 1, p, F->cap, F->cap_rows, s);   // (a DFlash drafter's features: the layer's input)
         if (dumps) {
             if (il != l0_) fast_dump(s, "l_out-" + std::to_string(il - 1), R, g.n_embd);
             fast_dump(s, "attn_norm-" + std::to_string(il), F->x, g.n_embd);
@@ -5644,6 +5652,7 @@ bool Glm5Model::fast_layers_gqa(int64_t p, std::string& err) {
     }
     // the last FFN's residual add (the head reads R); the normalised copy it also writes is not used
     gf::rms_q8(R, F->ffn, F->L[(size_t) l1_ - 1].ffn_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
+    dflash_capture(l1_, R, 1, p, F->cap, F->cap_rows, s);   // (the final hidden state, when the drafter reads it)
     if (dumps) fast_dump(s, "l_out-" + std::to_string(l1_ - 1), R, g.n_embd);
     { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string("glm fast: ") + cudaGetErrorString(e); return false; } }
     return true;
@@ -5952,6 +5961,12 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     }
     last_tok_ = FT->tok_h[0];
     last->mtp_hx_pos_ = p;   // head_x: the trunk's hidden state of p (the MTP decode drafts from it)
+    if (last->g_.mimo() && last->fast_->mtp_hin != nullptr) {   // (mimo2: the raw residual - its draft block's input)
+        cudaSetDevice(last->dev_);
+        cudaMemcpyAsync(last->fast_->mtp_hin, last->state_, (size_t) g_.n_embd * sizeof(float), cudaMemcpyDeviceToDevice,
+                        last->fast_->cs);
+        cudaSetDevice(dev_);
+    }
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
         if (m->fast_ && m->fast_->prof_on) {
             cudaSetDevice(m->dev_);
@@ -6014,7 +6029,10 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
             cudaMemcpyAsync(F->emb, F->emb_h, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
         }
     }
-    gf::mtp_in(F->emb, F->head_x, Ly.enorm, Ly.hnorm, g.norm_eps, E, F->mtp_catq, s);
+    // (the hidden state: mimo2's block reads raw residuals - the trunk's (mtp_hin) for the first step, then its own
+    // output before the head norm (mtp_h); GLM / hy_v3 read head_x, the trunk's or the block's normed state)
+    const float* h_in = !g.mimo() ? F->head_x : step == 0 ? F->mtp_hin : F->mtp_h;
+    gf::mtp_in(F->emb, h_in, Ly.enorm, Ly.hnorm, g.norm_eps, E, F->mtp_catq, s);
     gf::MvJob eh = {Ly.eh.q, F->mtp_catq, nullptr, F->mtp_h, nullptr, 1.0f, Ly.eh.type, 2 * E, E};
     if (!gf::mv(&eh, 1, s)) {
         err = "glm mtp: eh_proj";
@@ -6022,10 +6040,20 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
     }
     gf::rms_q8(F->mtp_h, nullptr, Ly.attn_norm, g.norm_eps, E, F->x, F->xq, s);
     if (glmfast::submit_every() > 0) glmfast::submit_queued(s);   // (Windows HIP: the GPU starts while the rest queues)
-    if (!(Ly.gqa ? fast_gqa(il, p, err) : fast_dsa(il, p, err))) return false;
+    if (!(Ly.gqa ? (g.mimo() ? fast_mimo(il, p, err) : fast_gqa(il, p, err)) : fast_dsa(il, p, err))) return false;
     gf::rms_q8(F->mtp_h, F->mixer, Ly.ffn_norm, g.norm_eps, E, F->x, F->xq, s);
-    bool pf_pending = false;
-    if (!fast_moe(il, pf_pending, err)) return false;
+    if (Ly.moe) {
+        bool pf_pending = false;
+        if (!fast_moe(il, pf_pending, err)) return false;
+    } else {   // (mimo2's draft block: a dense FFN)
+        gf::MvJob j[2];
+        j[0] = {Ly.ffn_gate.q, F->xq, nullptr, F->dg, nullptr, 1.0f, Ly.ffn_gate.type, E, g.n_ff_dense};
+        j[1] = {Ly.ffn_up.q, F->xq, nullptr, F->du, nullptr, 1.0f, Ly.ffn_up.type, E, g.n_ff_dense};
+        if (!gf::mv(j, 2, s)) { err = "glm mtp: dense ffn"; return false; }
+        gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, g.n_ff_dense, F->dhq, s);
+        gf::MvJob dn = {Ly.ffn_down.q, F->dhq, nullptr, F->ffn, nullptr, 1.0f, Ly.ffn_down.type, g.n_ff_dense, E};
+        if (!gf::mv(&dn, 1, s)) { err = "glm mtp: dense ffn down"; return false; }
+    }
     gf::rms_q8(F->mtp_h, F->ffn, Ly.shnorm, g.norm_eps, E, F->head_x, F->head_xq, s);
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o[2];
@@ -6661,7 +6689,10 @@ std::vector<std::pair<int64_t, int64_t>> Glm5Model::running_runs() const {
     const Glm5Geometry& g = g_;
     std::vector<std::pair<int64_t, int64_t>> r;
     const int64_t run = (int64_t) g.d_inner() * g.kda_head_dim + (int64_t) 3 * g.d_inner() * (g.d_conv - 1);
-    for (int il = l0_; il < l1_; ++il) {
+    std::vector<int> ls;
+    for (int il = l0_; il < l1_; ++il) ls.push_back(il);
+    if (g.mimo() && mtp_il_ >= 0) ls.push_back(mtp_il_);   // (mimo2's draft block: a window ring as well)
+    for (const int il : ls) {
         if (g.is_recr(il)) r.push_back({kda_S_[(size_t) il], run});
         if (g.swa(il)) {
             const int64_t cap = mimo_kv_cap(g, il, max_ctx_), nkv = g.n_head_kv[(size_t) il];

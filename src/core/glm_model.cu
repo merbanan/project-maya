@@ -241,21 +241,28 @@ static const char* const kHyMtpRaw[] = {"attn_q.weight", "attn_k.weight", "attn_
 static const char* const kHyMtpF32[] = {"attn_norm.weight", "ffn_norm.weight", "attn_q_norm.weight",
                                         "attn_k_norm.weight", "ffn_gate_inp.weight", "exp_probs_b.bias",
                                         "nextn.enorm.weight", "nextn.hnorm.weight", "nextn.shared_head_norm.weight"};
+// mimo2's draft blocks: a window layer with a fused q/k/v, its sinks and a DENSE FFN, then the NextN tensors and the
+// layer's output norm (the draft's head norm - llama.cpp's mimo2 MTP falls back to it without a shared_head_norm)
+static const char* const kMiMtpRaw[] = {"attn_qkv.weight", "attn_output.weight", "ffn_gate.weight", "ffn_up.weight",
+                                        "ffn_down.weight", "nextn.eh_proj.weight"};
+static const char* const kMiMtpF32[] = {"attn_norm.weight", "ffn_norm.weight", "attn_sinks.weight", "nextn.enorm.weight",
+                                        "nextn.hnorm.weight", "layer_output_norm.weight"};
 struct MtpNames {
     std::vector<const char*> raw, b16, f32;
 };
-static MtpNames mtp_names(bool gqa) {
-    if (gqa) return {{std::begin(kHyMtpRaw), std::end(kHyMtpRaw)}, {}, {std::begin(kHyMtpF32), std::end(kHyMtpF32)}};
+static MtpNames mtp_names(int arch) {
+    if (arch == 2) return {{std::begin(kMiMtpRaw), std::end(kMiMtpRaw)}, {}, {std::begin(kMiMtpF32), std::end(kMiMtpF32)}};
+    if (arch == 1) return {{std::begin(kHyMtpRaw), std::end(kHyMtpRaw)}, {}, {std::begin(kHyMtpF32), std::end(kHyMtpF32)}};
     return {{std::begin(kMtpRaw), std::end(kMtpRaw)}, {std::begin(kMtpB16), std::end(kMtpB16)},
             {std::begin(kMtpF32), std::end(kMtpF32)}};
 }
 
 // ... and the VRAM they take
 static bool mtp_dense_vram(const std::function<const strata::TensorInfo*(const std::string&)>& find, int il,
-                           uint64_t& bytes, std::string& err, bool gqa = false) {
+                           uint64_t& bytes, std::string& err, int arch = 0) {
     const std::string P = "blk." + std::to_string(il) + ".";
     bytes = 0;
-    const MtpNames nm = mtp_names(gqa);
+    const MtpNames nm = mtp_names(arch);
     for (const char* n : nm.raw) {
         const strata::TensorInfo* t = find(P + n);
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
@@ -622,10 +629,11 @@ static bool mimo2_geometry(const strata::GgufFile& g, Glm5Geometry& out, std::st
         err = "mimo2: attention.head_count_kv / sliding_window_pattern missing or shorter than block_count";
         return false;
     }
-    out.n_head_kv.assign(kv.begin(), kv.begin() + out.n_layers);
-    out.is_swa.assign((size_t) out.n_layers, 0);
+    // (the NextN blocks' entries too: n_layers + nextn of them - the draft blocks are window layers)
+    out.n_head_kv.assign(kv.begin(), kv.begin() + block_count);
+    out.is_swa.assign((size_t) block_count, 0);
     out.n_kv = 0;
-    for (int il = 0; il < out.n_layers; ++il) {
+    for (int il = 0; il < block_count; ++il) {
         out.is_swa[(size_t) il] = pat[(size_t) il] != 0;
         out.n_kv = std::max(out.n_kv, kv[(size_t) il]);
         if (kv[(size_t) il] <= 0 || out.n_head % kv[(size_t) il] != 0 || out.n_head / kv[(size_t) il] > 16) {
@@ -1606,8 +1614,12 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         const strata::TensorInfo* tg = findm(P + "ffn_gate_exps.weight");
         const strata::TensorInfo* tu = findm(P + "ffn_up_exps.weight");
         const strata::TensorInfo* td = findm(P + "ffn_down_exps.weight");
-        if ((g.nextn > 0 || extra) && findm(P + "nextn.eh_proj.weight") != nullptr && tg && tu && td &&
-            mtp_dense_vram(findm, L, b, e2, g.gqa())) {
+        if (g.mimo() && (g.nextn > 0 || extra) && findm(P + "nextn.eh_proj.weight") != nullptr &&
+            mtp_dense_vram(findm, L, b, e2, g.arch)) {
+            mtp_dense = (double) b;   // (mimo2: a dense draft block - no experts, no expert slots)
+            mtp = true;
+        } else if ((g.nextn > 0 || extra) && findm(P + "nextn.eh_proj.weight") != nullptr && tg && tu && td &&
+            mtp_dense_vram(findm, L, b, e2, g.arch)) {
             blob[(size_t) L] = (tensor_bytes(tg) + tensor_bytes(tu) + tensor_bytes(td)) / g.n_expert;
             stride[(size_t) L] = (double) glmfast::expert_stride((size_t) blob[(size_t) L], (int) tg->type, (int) td->type);
             mtp_dense = (double) b;
@@ -3287,8 +3299,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // (the pipelined speculative decode is a two-part one: a longer split leaves the block unloaded; one GPU loads it
     // for the one-GPU MTP decode - glm_mtp.cu: by default on the Strix / Gorgon Halo APUs)
     const bool mtp_one = l0_ == 0 && mtp_decode_wanted(dev_, n_parts_);
-    // (mimo2: the draft blocks are not wired yet)
-    if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) && getenv("STRATA_GLM_NO_MTP") == nullptr && !g_.mimo() &&
+    if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) && getenv("STRATA_GLM_NO_MTP") == nullptr &&
         (l0_ > 0 || getenv("STRATA_GLM_MTP") != nullptr || mtp_one)) {   // any split: the speculative decode, 2+ parts
         if (!load_mtp(gfs, err)) return false;
         if (mtp_il_ >= 0) lt_ = l1_ + 1;
@@ -3398,7 +3409,10 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     mimo_v_.assign((size_t) g_.n_layers + 1, -1);
     if (g_.mimo()) {   // mimo2: FP16 records per layer - the context, or the window's ring - in this arena
         int64_t bytes = 0;
-        for (int il = l0_; il < l1_; ++il) {
+        std::vector<int> ls;
+        for (int il = l0_; il < l1_; ++il) ls.push_back(il);
+        if (mtp_il_ >= 0) ls.push_back(mtp_il_);   // (the draft block: a window layer of its own)
+        for (const int il : ls) {
             const int64_t cap = mimo_kv_cap(g_, il, max_ctx), nkv = g_.n_head_kv[(size_t) il];
             mimo_k_[(size_t) il] = floats;
             floats += (cap * nkv * g_.head_dim * 2 + 255) / 256 * 64;
@@ -3680,7 +3694,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         return true;   // a GGUF without the draft block
     }
     const auto x3 = [&](const std::string& n) { return exl3_ && xt.mats.count(n) != 0; };
-    const MtpNames nm = mtp_names(g_.gqa());
+    const MtpNames nm = mtp_names(g_.arch);
     const auto& raw_names = nm.raw;
     const auto& b16_names = nm.b16;
     const auto& f32_names = nm.f32;
@@ -3701,7 +3715,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
             if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
             bytes += ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
         }
-    } else if (!mtp_dense_vram([&](const std::string& n) { return find(n, si); }, il, bytes, err, g_.gqa())) {
+    } else if (!mtp_dense_vram([&](const std::string& n) { return find(n, si); }, il, bytes, err, g_.arch)) {
         return false;
     }
     if (cudaMalloc(&mtp_arena_, bytes) != cudaSuccess) {
@@ -3791,6 +3805,19 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         w_[P + n] = (const float*) (base + at);
         ws_map_[P + n] = strata::core::WSlot{(const float*) (base + at), 0, nullptr, 0, 0};
         at += ((uint64_t) host.size() * 4 + 255u) & ~(uint64_t) 255u;
+    }
+    if (g_.mimo()) {   // mimo2: a dense draft block - no routed experts
+        if (pack_emb_src_ == nullptr) {
+            int se = -1;
+            const strata::TensorInfo* te = find("token_embd.weight", se);
+            if (te == nullptr) { err = "mtp: token_embd not found"; return false; }
+            pack_emb_src_ = src_of(te, se);
+            pack_emb_type_ = (int) te->type;
+        }
+        mtp_il_ = il;
+        std::fprintf(stderr, "glm mtp: CUDA%d the NextN block (blk.%d) loaded: %.0f MB dense (mimo2: a dense FFN)\n", dev_,
+                     il, (double) bytes / 1048576.0);
+        return true;
     }
     // the routed experts: gate/up/down by absolute offset, like native_experts.txt rows
     NativeLayer nl;

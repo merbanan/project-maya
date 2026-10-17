@@ -35,7 +35,7 @@ void prep(float* qkv, int64_t ld, int T, int64_t p0, int n_head, int n_rot, floa
 /// floats for decode's split parts (T <= 16); null runs the prompt kernel, which needs none, for any T.
 void attn(const float* q, int64_t qld, int T, int64_t p0, int n_head, const Kv& kv, int window, const float* sinks,
           float scale, float out_scale, float* out, int64_t ldo, float* scratch, cudaStream_t s);
-size_t attn_scratch_floats(int n_head, int T, int64_t max_keys);
+size_t attn_scratch_floats(int n_head, int T, int64_t max_keys, int min_kv = 1);   // (min_kv: the fewest K/V heads)
 
 /// Positions [lo, hi) from one view into another (the sliding-window ring <-> a prompt chunk's staging copy).
 void copy(const Kv& src, const Kv& dst, int64_t lo, int64_t hi, cudaStream_t s);

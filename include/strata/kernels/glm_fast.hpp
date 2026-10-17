@@ -58,8 +58,8 @@ bool mv_supported(int type);
 /// nullptr (the default): no check.
 void set_skip(const int* flag);
 /// The lossy route options' defaults for a model (Glm5Geometry::arch): STRATA_GLM_ROUTE_AFFINITY 0.02 for GLM, the
-/// route tail swap STRATA_GLM_ROUTE_SWAP=2 for hy_v3, neither for mimo2 (each measured on its own model).  Before the
-/// first route; the variables override it.
+/// route tail swap STRATA_GLM_ROUTE_SWAP=2 for hy_v3 and mimo2 (each measured on its own model).  Before the first
+/// route; the variables override it.
 void route_defaults(int arch);
 /// One thread: *flag = (*host_from <= t) - token t of the window is past the first wrong draft (`host_from`: pinned,
 /// host-mapped, written by the host while the window runs).
