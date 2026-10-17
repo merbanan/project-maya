@@ -455,3 +455,21 @@ prompts 9-14 % and no decode.
   4096: 27K 31.4 / 31.6 -> 30.6 / 31.0 s (-2 %), 2K / 8K prompt unchanged, but decode after 8K 32.1 / 31.9 -> 29.7 /
   30.0 tok/s (-7 %: the larger activations take expert-pool VRAM, 2,000+ disk experts vs 1,350) - dropped.
 - Hy3 prompt disk reads: 28K reads ~1,430 experts but waits 0 ms on disk (hidden) - nothing to win.
+
+## MiMo-V2.6-Flash (mimo2) port (2026-10-17, branch mimo ebd9ed3)
+
+- MOPD BPW2.0 (AesSedai, 77.4 GB), one V100 32 GB: experts 26 GB VRAM + 48 GB pinned RAM, no disk.  Greedy agreement
+  with llama.cpp 24 / 24 (short prompt); 1.5K prompt: prompt path = token by token = 512-token chunks = llama.cpp with
+  the CPU lane off (the lane's rounding flips a 0.6-margin token - KL of the CPU lane still to measure).
+- Prefill (GPU stream time, 2 rounds): 2,462 tok 8.8 / 8.9 s (~280 tok/s), 9,113 tok 12.1 / 12.2 s (~750), 28,250 tok
+  26.8 / 26.8 s (~1,055).  28K: experts 52 %, mimo_attn 27 % (the 9 full-context layers' prompt attention), the
+  fused qkv / output GEMMs 13 %.  2.4K: "plan" 2.2 s (25 %) - to look at.
+- Decode: 46.6 tok/s (11-token prompt), 41.5 (1.9K), 32-37 after 9-28K prompts.  19.5K profile 27-28 ms a token:
+  attention 5.35 (~4 in the 9 full-context layers, far below bandwidth), Q6_K qkv 3.8 + output 2.8 (near
+  bandwidth), experts ~11.  A tensor-core decode kernel (Hy3's, K 192 / V 128) was slower: 7.90 vs 5.35 ms -
+  dropped.
+- Open: profile the full-context decode kernel; DFlash (ggml-org dflash Q8_0, target layers 1/12/24/36/48, block 8)
+  needs the hy3 + mimo work on top of glm-dflash (147 commits, its verify window); MTP file downloaded
+  (mtp-...-Q8_0, 3 layers); GLM DFlash2 on one V100 was 27.1 vs 25.9 tok/s, so expect a small gain.
+- llama.cpp #30042 (MLA latent re-read per head): not applicable - Maya's mla_split_kernel already reads it once per
+  16-head group.
