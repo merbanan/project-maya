@@ -432,7 +432,10 @@ prompts 9-14 % and no decode.
   convert.cu) + cuBLAS, the rest MMQ. Two rounds: 27K 39.7 / 39.9 -> 31.7 / 31.8 s (experts 20.4 -> 12.2 s), 8K
   623 / 621 -> 764 / 764 tok/s, 2K 549 / 548 -> 581 / 568; needle answered; KL vs MMQ 0.015 (MMQ vs itself 0),
   top-1 95.7 %, target log-prob +0.025. Better than the estimate: the 2K / 8K prompts gain too (MMQ is slower per
-  weight at few rows than the bench's 25 TOPS). Next: the same in Hy3 / DSv4 prompt experts; upstream PR.
+  weight at few rows than the bench's 25 TOPS).
+- Ported, two rounds each: DSv4 (dsv4 b2887bc, default on sm_70) 8K 11.31 / 11.36 -> 9.24 / 9.22 s, 28K 36.38 / 36.44
+  -> 26.41 / 26.39 s (-27 %), KL 0.0069 = its own run-to-run 0.0070. Hy3 (hy3 631bb90, OPT-IN) 8K -5 %, 28K 79.6 /
+  76.9 -> 69.1 / 69.1 s, but KL 0.058 (floor 0), top-1 88 %, target log-prob -0.073 - Hy3 loses in FP16.
 - Issue #130's 4x V100: the split pipelines chunks only when a prompt has more than one; auto = 8192 there, so <= 8K
   prompts run one GPU at a time (their 16K: 1 chunk 536 vs 2 chunks 745 tok/s). Chunk 4096 / 2048 should be
   ~1.4x at 16K and more below - untestable on one GPU; an auto chunk of prompt / (2 x GPUs) is the upstream idea.
