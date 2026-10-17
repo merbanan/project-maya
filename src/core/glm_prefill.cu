@@ -2530,11 +2530,15 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // Default 128 rows on sm_70 (Turing+ run MMQ on int8 tensor cores: 0 there); 0 = MMQ only.
         static const int blas_rows = [] {
             if (const char* v = getenv("STRATA_GLM_PREFILL_BLAS")) return std::max(0, std::atoi(v));
+#if defined(STRATA_USE_HIP)
+            return 0;   // (MMQ only: the FP16 path is measured on Volta)
+#else
             int dev = 0, major = 0, minor = 0;
             cudaGetDevice(&dev);
             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
             cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
             return major == 7 && minor == 0 ? 128 : 0;
+#endif
         }();
         const bool use_blas = blas_rows > 0 && !Ly.exl3 && mmq::to_f16_supported(Ly.gu_type) &&
                               mmq::to_f16_supported(Ly.d_type) && S->w16_elems >= (int64_t) 2 * nff * E + E;
