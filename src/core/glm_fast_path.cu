@@ -4873,7 +4873,9 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
     // STRATA_GLM_DEFER_CPU=1 (LOSSY, after lighttransport/Strata glm53f's expert deferral): a MoE layer's CPU-lane
     // experts are added after the NEXT layer's mixer instead of before its read - the CPU's work overlaps that layer's
     // attention; that attention misses them (the streams get them before its FFN-side read; the last layer waits)
-    static const bool defer_env = getenv("STRATA_GLM_DEFER_CPU") != nullptr && std::atoi(getenv("STRATA_GLM_DEFER_CPU")) != 0;
+    // (the default: decode +14-18 %, KL 0.045 against the undeferred run with the floor at 0.013, top-1 90.2 %;
+    // STRATA_GLM_DEFER_CPU=0: off)
+    static const bool defer_env = !(getenv("STRATA_GLM_DEFER_CPU") != nullptr && std::atoi(getenv("STRATA_GLM_DEFER_CPU")) == 0);
     const bool defer = defer_env && !graphs && !hop_in && F->cpu_plan != 0ull && !F->all_resident;
     if (defer && F->defer_post == nullptr && cudaMalloc(&F->defer_post, 8 * sizeof(float)) != cudaSuccess) {
         err = "glm fast: the deferred post weights did not allocate";

@@ -4661,8 +4661,10 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                 pf_rank > 0 ? pf_rank : k, std::max(0, std::min(near_n, std::min(16, n_expert - k))), win, scr_used,
                 g_skip, win_n, disk_skip_from, disk_skip_w};
     static const float affinity = [] {
+        // (0.02 by default: decode +8-10 %, VRAM hits 63-68 -> 68-73 %, KL against unbiased routing 0.017 with the run-
+        // to-run floor at 0.013, top-1 92.6 %; STRATA_GLM_ROUTE_AFFINITY=0: off)
         const char* v = getenv("STRATA_GLM_ROUTE_AFFINITY");
-        return v ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
+        return v ? std::max(0.0f, (float) std::atof(v)) : 0.02f;
     }();
     a.affinity = affinity;
     if (ahead_logits != nullptr && ahead_bias != nullptr && n_expert <= 512) {
