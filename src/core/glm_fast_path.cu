@@ -5954,7 +5954,14 @@ void Glm5Model::ckpt_pool_copy(int64_t pos, float* host, bool restore) {
     }
 }
 
+// STRATA_GLM_CKPT_STATS=1: each checkpoint's bytes and save / restore time on stderr
+static bool ckpt_stats() {
+    static const bool on = getenv("STRATA_GLM_CKPT_STATS") != nullptr;
+    return on;
+}
+
 bool Glm5Model::ckpt_save(int slot, std::string& err) {
+    const auto t0 = std::chrono::steady_clock::now();
     if (slot < 0) {
         err = "checkpoint: no slot";
         return false;
@@ -5998,11 +6005,16 @@ bool Glm5Model::ckpt_save(int slot, std::string& err) {
         }
         m->ckpt_pos_[(size_t) slot] = m->pos_;
     }
+    if (ckpt_stats())
+        std::fprintf(stderr, "glm checkpoints: saved slot %d at %lld, %.1f MB in %.1f ms\n", slot, (long long) pos_,
+                     ckpt_buf_[(size_t) slot].size() * 4.0 / 1e6,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     cudaSetDevice(dev_);
     return true;
 }
 
 bool Glm5Model::ckpt_restore(int slot, std::string& err) {
+    const auto t0 = std::chrono::steady_clock::now();
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
         if (m->fast_ == nullptr || slot < 0 || (int) m->ckpt_pos_.size() <= slot || m->ckpt_pos_[(size_t) slot] < 0 ||
             m->ckpt_pos_[(size_t) slot] != ckpt_pos_[(size_t) slot]) {
@@ -6033,6 +6045,10 @@ bool Glm5Model::ckpt_restore(int slot, std::string& err) {
     }
     // the drafter's positions from here on belong to the previous continuation (as snapshot_restore)
     if (cap_d_ != nullptr) cap_d_->reset(pos_);
+    if (ckpt_stats())
+        std::fprintf(stderr, "glm checkpoints: restored slot %d at %lld, %.1f MB in %.1f ms\n", slot, (long long) pos_,
+                     ckpt_buf_[(size_t) slot].size() * 4.0 / 1e6,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     cudaSetDevice(dev_);
     return true;
 }
