@@ -3523,7 +3523,9 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                 sh_gate, sh_up, sh_limit, n_ff_sh, (block_q8_1*) sh_hq, pred_logits, pred_bias, max_prefetch,
                 ahead_logits, {}, 0, skip_from, d.cpu_seq != nullptr ? cpu_plan : 0ull, promote_min,
                 pf_rank > 0 ? pf_rank : k, std::max(0, std::min(near_n, std::min(16, n_expert - k))), 0, 0.0f};
-    static const int swap = getenv("STRATA_GLM_ROUTE_SWAP") ? std::max(0, std::atoi(getenv("STRATA_GLM_ROUTE_SWAP"))) : 0;
+    // (2 by default on hy_v3: with the CPU-lane defer, decode 2K 42.4 -> 39.5, 30K 53.7 -> 51.1 ms a token; KL of both
+    // against the plain path 0.047, needles 3/3; STRATA_GLM_ROUTE_SWAP=0: off)
+    static const int swap = getenv("STRATA_GLM_ROUTE_SWAP") ? std::max(0, std::atoi(getenv("STRATA_GLM_ROUTE_SWAP"))) : 2;
     static const float swap_m = getenv("STRATA_GLM_ROUTE_SWAP_MARGIN") ? (float) std::atof(getenv("STRATA_GLM_ROUTE_SWAP_MARGIN")) : 0.02f;
     a.swap_ranks = std::min(swap, k);
     a.swap_margin = swap_m;
