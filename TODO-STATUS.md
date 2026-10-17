@@ -473,3 +473,11 @@ prompts 9-14 % and no decode.
   (mtp-...-Q8_0, 3 layers); GLM DFlash2 on one V100 was 27.1 vs 25.9 tok/s, so expect a small gain.
 - llama.cpp #30042 (MLA latent re-read per head): not applicable - Maya's mla_split_kernel already reads it once per
   16-head group.
+- mimo-dflash (734242e, fork/mimo-dflash): hy3 + mimo merged onto glm-dflash. Against each branch's own build: GLM
+  KL 0 (bit for bit), speed equal; Hy3 KL 0.058 (glm-dflash's kernels' rounding), prompts equal with the GQA models'
+  sub-batches auto; MiMo KL 0.025. Lossy route defaults per model (route_defaults): GLM affinity 0.02, Hy3 / MiMo
+  tail swap 2. MiMo verify window + MTP (blk.48, raw residual input) + plain DFlash (ggml-org drafter): greedy tokens
+  equal to plain decode (CPU lane and swap off), but slower on one V100 - 2K / 8K decode plain 36.5 / 40.9, MTP
+  20.6-30.3 / 22.1-39.6, DFlash 27.1 / 34.7 tok/s (a 2-4 row window ~3 tokens' time). Opt-in only.
+- MiMo quant choice: BPW2.0 is PPL +27 % / KLD 0.366 vs MXFP4 (AesSedai's table); BPW2.5 (96.7 GB, +10.5 %, 0.227)
+  is the suggested step up - ~15-20 GB of experts on the NVMe; to download and measure if wanted.
