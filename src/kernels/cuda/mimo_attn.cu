@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 namespace strata::kernels::mimo {
 namespace {
@@ -63,13 +64,15 @@ __global__ void __launch_bounds__(256) copy_kernel(Kv src, Kv dst, int64_t lo) {
     for (int i = threadIdx.x; i < src.n_kv * kDV / 8; i += blockDim.x) vd[i] = vs[i];
 }
 
-// ---- decode / few rows: block (K/V head, 128-key split, row), 4 warps of 32 keys, one key a lane.  The G query heads
-// of the K/V head score the lane's key from shared memory; the V rows are summed with the lanes over the 128 dims.
-// The split's (m, l, O) per query head go to part, merged with the sink by combine_kernel.
+// ---- decode / few rows: block (K/V head, a split of kpb keys, row), 4 warps taking 32-key groups in turn, one key a
+// lane.  The G query heads of the K/V head score the lane's key from shared memory; each warp keeps an online softmax
+// per head across its groups and sums the V rows with the lanes over the 128 dims.  The split's (m, l, O) per query
+// head go to part, merged with the sink by combine_kernel.  The splits are sized so that a layer is about two blocks
+// an SM (a 128-key split a block left a full-context layer at 19.5K positions with 612 blocks and a 153-part combine).
 constexpr int kSplit = 128, kDecW = 4, kMaxG = 16, kPart = kDV + 2;
 __global__ void __launch_bounds__(kDecW * 32) dec_kernel(const float* __restrict__ q, int64_t qld, int64_t p0,
                                                          int n_head, Kv kv, int window, float scale, int64_t base,
-                                                         int n_split, float* __restrict__ part) {
+                                                         int kpb, int n_split, float* __restrict__ part) {
     const int kvh = blockIdx.x, sp = blockIdx.y, t = blockIdx.z;
     const int G = n_head / kv.n_kv;
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
@@ -80,70 +83,84 @@ __global__ void __launch_bounds__(kDecW * 32) dec_kernel(const float* __restrict
     for (int i = threadIdx.x; i < G * kDK; i += blockDim.x)
         sq[i / kDK][i % kDK] = q[(size_t) t * qld + (size_t) (kvh * G + i / kDK) * kDK + i % kDK] * scale;
     __syncthreads();
-    const int64_t kp = base + (int64_t) sp * kSplit + w * 32 + lane;
-    const bool ok = kp >= lo && kp <= pos;
-    float s[kMaxG];
-#pragma unroll
-    for (int g = 0; g < kMaxG; ++g) s[g] = 0.0f;
-    if (ok) {
-        const uint4* kr = (const uint4*) k_row(kv, kp, kvh);
-        for (int c = 0; c < kDK / 8; ++c) {
-            const uint4 u = kr[c];
-            const __half2* hh = (const __half2*) &u;
-            float kf[8];
-#pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const float2 f = __half22float2(hh[e]);
-                kf[2 * e] = f.x;
-                kf[2 * e + 1] = f.y;
-            }
-#pragma unroll
-            for (int g = 0; g < kMaxG; ++g) {
-                if (g >= G) break;
-                float a = 0.0f;
-#pragma unroll
-                for (int e = 0; e < 8; ++e) a += sq[g][c * 8 + e] * kf[e];
-                s[g] += a;
-            }
-        }
-    }
-    float p[kMaxG];
+    const int64_t kb0 = base + (int64_t) sp * kpb, kb1 = min(kb0 + kpb, pos + 1);
+    float m[kMaxG], l[kMaxG], acc[kMaxG][4];
 #pragma unroll
     for (int g = 0; g < kMaxG; ++g) {
-        float mx = ok ? s[g] : -INFINITY;
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
-        p[g] = ok ? __expf(s[g] - mx) : 0.0f;
-        float sum = p[g];
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-        if (lane == 0 && g < G) {
-            sm[w][g] = mx;
-            sl[w][g] = sum;
-        }
+        m[g] = -INFINITY;
+        l[g] = 0.0f;
+        acc[g][0] = acc[g][1] = acc[g][2] = acc[g][3] = 0.0f;
     }
-    float acc[kMaxG][4];
+    for (int64_t g0 = kb0 + w * 32; g0 < kb1; g0 += kDecW * 32) {
+        if (g0 + 31 < lo) continue;   // (the group is below the window: uniform across the warp)
+        const int64_t kp = g0 + lane;
+        const bool ok = kp >= lo && kp < kb1;
+        float s[kMaxG];
 #pragma unroll
-    for (int g = 0; g < kMaxG; ++g) acc[g][0] = acc[g][1] = acc[g][2] = acc[g][3] = 0.0f;
-    const int64_t k0 = base + (int64_t) sp * kSplit + w * 32;
-    for (int j = 0; j < 32; ++j) {
-        const int64_t kj = k0 + j;
-        if (kj < lo || kj > pos) continue;   // (uniform across the warp)
-        const uint2 u = *(const uint2*) (v_row(kv, kj, kvh) + 4 * lane);
-        const float2 a = __half22float2(*(const __half2*) &u.x), b = __half22float2(*(const __half2*) &u.y);
+        for (int g = 0; g < kMaxG; ++g) s[g] = 0.0f;
+        if (ok) {
+            const uint4* kr = (const uint4*) k_row(kv, kp, kvh);
+            for (int c = 0; c < kDK / 8; ++c) {
+                const uint4 u = kr[c];
+                const __half2* hh = (const __half2*) &u;
+                float kf[8];
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const float2 f = __half22float2(hh[e]);
+                    kf[2 * e] = f.x;
+                    kf[2 * e + 1] = f.y;
+                }
+#pragma unroll
+                for (int g = 0; g < kMaxG; ++g) {
+                    if (g >= G) break;
+                    float a = 0.0f;
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) a += sq[g][c * 8 + e] * kf[e];
+                    s[g] += a;
+                }
+            }
+        }
+        float p[kMaxG];
 #pragma unroll
         for (int g = 0; g < kMaxG; ++g) {
             if (g >= G) break;
-            const float pj = __shfl_sync(0xffffffffu, p[g], j);
-            acc[g][0] += pj * a.x;
-            acc[g][1] += pj * a.y;
-            acc[g][2] += pj * b.x;
-            acc[g][3] += pj * b.y;
+            float mx = ok ? s[g] : -INFINITY;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float mn = fmaxf(m[g], mx);   // (mx is finite: the group has a key in range)
+            const float corr = m[g] == -INFINITY ? 0.0f : __expf(m[g] - mn);
+            p[g] = ok ? __expf(s[g] - mn) : 0.0f;
+            float sum = p[g];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            l[g] = l[g] * corr + sum;
+            m[g] = mn;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[g][e] *= corr;
+        }
+        for (int j = 0; j < 32; ++j) {
+            const int64_t kj = g0 + j;
+            if (kj < lo || kj >= kb1) continue;   // (uniform across the warp)
+            const uint2 u = *(const uint2*) (v_row(kv, kj, kvh) + 4 * lane);
+            const float2 a = __half22float2(*(const __half2*) &u.x), b = __half22float2(*(const __half2*) &u.y);
+#pragma unroll
+            for (int g = 0; g < kMaxG; ++g) {
+                if (g >= G) break;
+                const float pj = __shfl_sync(0xffffffffu, p[g], j);
+                acc[g][0] += pj * a.x;
+                acc[g][1] += pj * a.y;
+                acc[g][2] += pj * b.x;
+                acc[g][3] += pj * b.y;
+            }
         }
     }
 #pragma unroll
     for (int g = 0; g < kMaxG; ++g) {
         if (g >= G) break;
+        if (lane == 0) {
+            sm[w][g] = m[g];
+            sl[w][g] = l[g];
+        }
 #pragma unroll
         for (int e = 0; e < 4; ++e) so[w][g][4 * lane + e] = acc[g][e];
     }
@@ -168,7 +185,6 @@ __global__ void __launch_bounds__(kDecW * 32) dec_kernel(const float* __restrict
         }
     }
 }
-
 
 __global__ void __launch_bounds__(kDV) combine_kernel(const float* __restrict__ part, int n_split, int n_head,
                                                       const float* __restrict__ sinks, float out_scale,
@@ -371,9 +387,15 @@ void attn(const float* q, int64_t qld, int T, int64_t p0, int n_head, const Kv& 
 #endif
     if (T <= kDecRows && scratch != nullptr) {   // (no scratch: the prompt kernel, whatever T)
         const int64_t base = window > 0 ? std::max<int64_t>(0, p0 - window + 1) : 0;
-        const int n_split = (int) ((p0 + T - 1 - base) / kSplit + 1);
+        // splits: about 160 blocks a layer (two an SM on a V100), at least 128 keys each (STRATA_MIMO_DEC_KEYS=<n>:
+        // n keys a split)
+        static const int keys_env = getenv("STRATA_MIMO_DEC_KEYS") != nullptr ? std::atoi(getenv("STRATA_MIMO_DEC_KEYS")) : 0;
+        const int64_t keys = p0 + T - base;
+        int64_t kpb = std::max<int64_t>(kSplit, keys_env > 0 ? keys_env : (keys * kv.n_kv + 159) / 160);
+        kpb = (kpb + 31) / 32 * 32;
+        const int n_split = (int) ((keys + kpb - 1) / kpb);
         dec_kernel<<<dim3(kv.n_kv, n_split, T), kDecW * 32, 0, s>>>(q, qld, p0, n_head, kv, window, scale, base,
-                                                                   n_split, scratch);
+                                                                   (int) kpb, n_split, scratch);
         combine_kernel<<<dim3(n_head, T), kDV, 0, s>>>(scratch, n_split, n_head, sinks, out_scale, out, ldo);
         return;
     }
