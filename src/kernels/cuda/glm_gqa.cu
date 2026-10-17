@@ -1110,11 +1110,16 @@ __global__ void __launch_bounds__(1024) gqa_resolve_kernel(GqaStream st, GqaSelB
     }
     __syncthreads();
     const int ep = s_ep, ns = *b.nsel;
+    // (LRFU: a slot's score decays by half every kLrfuHalf resolves and gains 1 a use)
+    constexpr float kLrfuHalf = 8.0f;
     for (int i = t; i < ns; i += 1024) {
         const int p = b.sel[i], sl = st.ptab[p];
         if (sl >= 0) {
+            if (st.lrfu)
+                s_ref[sl] = __float_as_int(__int_as_float(s_ref[sl]) * exp2f(-(float) (ep - s_epoch[sl]) / kLrfuHalf) + 1.0f);
+            else
+                s_ref[sl] = 1;
             s_epoch[sl] = ep;
-            s_ref[sl] = 1;
         } else {
             b.miss[atomicAdd(&s_nm, 1)] = p;
         }
@@ -1124,6 +1129,15 @@ __global__ void __launch_bounds__(1024) gqa_resolve_kernel(GqaStream st, GqaSelB
         int hand = st.ctl[0], k = 0;
         for (; k < s_nm; ++k) {
             int sl = -1;
+            if (st.lrfu) {   // a free slot, else the lowest score decayed to now (never a slot this step uses)
+                float bv = INFINITY;
+                for (int c = 0; c < st.R; ++c) {
+                    if (s_epoch[c] == ep) continue;
+                    const float v = s_page[c] < 0 ? -1.0f
+                                                  : __int_as_float(s_ref[c]) * exp2f(-(float) (ep - s_epoch[c]) / kLrfuHalf);
+                    if (v < bv) { bv = v; sl = c; }
+                }
+            } else
             for (int step = 0; step < 4 * st.R; ++step) {
                 const int c = hand;
                 hand = hand + 1 == st.R ? 0 : hand + 1;
@@ -1142,10 +1156,11 @@ __global__ void __launch_bounds__(1024) gqa_resolve_kernel(GqaStream st, GqaSelB
             s_page[sl] = p;
             st.ptab[p] = sl;
             s_epoch[sl] = ep;
-            s_ref[sl] = 1;
+            s_ref[sl] = st.lrfu ? __float_as_int(1.0f) : 1;
             b.mslot[k] = sl;
         }
         st.ctl[0] = hand;
+        st.ctl[2] += k;   // (the pages read: STRATA_GLM_KV_STATS)
         *b.nmiss = k;
     }
     __syncthreads();

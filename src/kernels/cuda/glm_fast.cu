@@ -2146,6 +2146,8 @@ struct RouteArgs {
                                 // clears this; 0 keeps the old rule (a spare, if one is free)
     int pf_rank;                // STRATA_GLM_PREFETCH_RANK: prefetch only the prediction's first pf_rank ranks
     int near_n;                 // STRATA_GLM_ROUTE_LOG: the route's next near_n ranks after the top k (0: none)
+    int swap_ranks;             // STRATA_GLM_ROUTE_SWAP=<n>: the last n ranks may take a VRAM-resident runner-up
+    float swap_margin;          // STRATA_GLM_ROUTE_SWAP_MARGIN: within this much of the swapped one's selection score
 };
 
 __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_constant__ RouteArgs a) {
@@ -2183,6 +2185,32 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     if (tid == 0)
         for (int i = 0; i < a.k; ++i)
             if (s_ids[i] < 0 || s_ids[i] >= E) atomicMax(&bad, 1);
+    // STRATA_GLM_ROUTE_SWAP=<n> (changes the output): each of the last n ranks whose expert is not in VRAM takes the
+    // best VRAM-resident one of the next 8 ranks whose selection score is within swap_margin of its own - a PCIe or
+    // CPU-lane miss traded for a near tie; the weights follow the new set (renormalised below as any route's)
+    if (a.swap_ranks > 0) {
+        __shared__ int s_cand[8];
+        const int nc = min(8, E - a.k);
+        if (nc > 0) topk_argmax(s_sel, E, nc, s_cand, s_bv, s_bi);
+        if (tid == 0 && nc > 0) {
+            const size_t base = (size_t) a.layer * E;
+            for (int r = a.k - 1; r >= max(0, a.k - a.swap_ranks); --r) {
+                const int id = s_ids[r];
+                if (id < 0 || a.d.tab[base + id] != 0ull) continue;   // (resident already)
+                const float own = s_p[id] + (a.bias ? a.bias[id] : 0.0f);
+                for (int c = 0; c < nc; ++c) {
+                    const int e = s_cand[c];
+                    if (e < 0 || a.d.tab[base + e] == 0ull) continue;
+                    if (s_p[e] + (a.bias ? a.bias[e] : 0.0f) >= own - a.swap_margin) {
+                        s_ids[r] = e;
+                        s_cand[c] = -1;
+                        break;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
     // the NEAR MISSES (STRATA_GLM_ROUTE_LOG only, cache studies): ranks k+1 .. k+near_n by the same selection score -
     // the top k are -inf in s_sel now, so the selection simply goes on (s_sel is rewritten for the prediction below)
     __shared__ int s_near[16];
@@ -3494,7 +3522,11 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
     RouteArgs a{logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, layer, x, n_embd, d,
                 sh_gate, sh_up, sh_limit, n_ff_sh, (block_q8_1*) sh_hq, pred_logits, pred_bias, max_prefetch,
                 ahead_logits, {}, 0, skip_from, d.cpu_seq != nullptr ? cpu_plan : 0ull, promote_min,
-                pf_rank > 0 ? pf_rank : k, std::max(0, std::min(near_n, std::min(16, n_expert - k)))};
+                pf_rank > 0 ? pf_rank : k, std::max(0, std::min(near_n, std::min(16, n_expert - k))), 0, 0.0f};
+    static const int swap = getenv("STRATA_GLM_ROUTE_SWAP") ? std::max(0, std::atoi(getenv("STRATA_GLM_ROUTE_SWAP"))) : 0;
+    static const float swap_m = getenv("STRATA_GLM_ROUTE_SWAP_MARGIN") ? (float) std::atof(getenv("STRATA_GLM_ROUTE_SWAP_MARGIN")) : 0.02f;
+    a.swap_ranks = std::min(swap, k);
+    a.swap_margin = swap_m;
     if (ahead_logits != nullptr && ahead_bias != nullptr && n_expert <= 512) {
         a.n_ahead = std::min(n_ahead, kAhead);
         for (int i = 0; i < a.n_ahead; ++i) a.ahead_bias[i] = ahead_bias[i];

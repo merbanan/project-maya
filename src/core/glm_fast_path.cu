@@ -1599,6 +1599,47 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     const int threads = F->cpu_pool->active();
     const int T = threads * (kSplit > 0 ? kSplit : std::max(1, std::min(8, 48 / std::max(1, threads))));
     kc::native_quant_act(nf, x, F->cpu_act.data());
+    // STRATA_GLM_CPU_FUSED=1: one pass without the barrier between gate/up and down - the pieces in order gu(0), gu(1),
+    // dn(0), gu(2), dn(1), ... (a down one expert behind); the thread that ends an expert's last gate/up piece quantises
+    // its h and marks it ready, a down piece waits for its expert only.  The same arithmetic (the same result)
+    static const bool fused = getenv("STRATA_GLM_CPU_FUSED") != nullptr && std::atoi(getenv("STRATA_GLM_CPU_FUSED")) != 0;
+    if (fused && ne >= 2 && ne <= 64) {
+        const int pe = std::max(1, (T + ne - 1) / ne);   // pieces an expert (each of its gate/up and its down)
+        std::vector<int> order;   // task t: expert * 2 + (0 gate/up, 1 down), piece in its own list below
+        order.reserve((size_t) 4 * ne);
+        for (int i = 0; i < ne; ++i) {
+            order.push_back(2 * i);
+            if (i >= 1) order.push_back(2 * (i - 1) + 1);
+        }
+        order.push_back(2 * (ne - 1) + 1);
+        const int n_tasks = (int) order.size() * pe;
+        std::atomic<int> next{0};
+        std::vector<std::atomic<int>> gu_left((size_t) ne);
+        std::vector<std::atomic<int>> ready((size_t) ne);
+        for (int i = 0; i < ne; ++i) { gu_left[(size_t) i].store(pe); ready[(size_t) i].store(0); }
+        F->cpu_pool->run(threads, [&](int) {
+            const void* a[1] = {F->cpu_act.data()};
+            for (int t; (t = next.fetch_add(1, std::memory_order_relaxed)) < n_tasks;) {
+                const int kind = order[(size_t) (t / pe)], piece = t % pe, i = kind >> 1;
+                if ((kind & 1) == 0) {
+                    const int r0 = (int) ((int64_t) n_ff * piece / pe), r1 = (int) ((int64_t) n_ff * (piece + 1) / pe);
+                    float* o[1] = {F->cpu_ff.data() + (size_t) i * n_ff};
+                    if (r1 > r0) kc::native_gu_rows_split(nf, blob[i], blob[i] + Ly.gu_bytes, a, 1, o, r0, r1, g.swiglu_exp);
+                    if (gu_left[(size_t) i].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                        kc::native_quant_h(nf, F->cpu_ff.data() + (size_t) i * n_ff,
+                                           F->cpu_hq.data() + (size_t) i * kc::kNativeHBytes);
+                        ready[(size_t) i].store(1, std::memory_order_release);
+                    }
+                } else {
+                    while (ready[(size_t) i].load(std::memory_order_acquire) == 0) cpu_relax();
+                    const int r0 = (int) ((int64_t) n_embd * piece / pe), r1 = (int) ((int64_t) n_embd * (piece + 1) / pe);
+                    const void* h[1] = {F->cpu_hq.data() + (size_t) i * kc::kNativeHBytes};
+                    float* o[1] = {F->cpu_dn.data() + (size_t) i * n_embd};
+                    if (r1 > r0) kc::native_down_rows_split(nf, blob[i] + Ly.down_off, h, 1, o, r0, r1);
+                }
+            }
+        });
+    } else {
     const int gu_tot = ne * n_ff;
     F->cpu_pool->run(T, [&](int job) {
         const void* a[1] = {F->cpu_act.data()};
@@ -1623,6 +1664,7 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
             q += r1 - r0;
         }
     });
+    }
     for (int r = 0; r < n_embd; ++r) {
         float m = 0.0f;
         for (int i = 0; i < ne; ++i) m += w[i] * F->cpu_dn[(size_t) i * n_embd + r];
@@ -3817,8 +3859,11 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
                  Ly.sh_down.q != nullptr ? F->sh_out : nullptr, F->ffn, s);
     if (F->prof_on) F->mark("moe_down");
     }
-    // the CPU lane's experts last: the device's own down rows ran while the CPU worked
-    if (lane) {
+    // the CPU lane's experts last: the device's own down rows ran while the CPU worked (deferred: after the next
+    // layer's attention, fast_layers_gqa)
+    if (lane && F->defer_cpu_now) {
+        F->cpu_deferred = true;
+    } else if (lane) {
         gf::moe_cpu_wait(md, g.n_embd, F->ffn, s);
         if (F->prof_on) F->mark("moe_cpu_wait");
     }
@@ -3948,7 +3993,7 @@ bool Glm5Model::kv_stream_init(int64_t resident, std::string& err) {
     // the device side: per layer the slots, the tables, the summaries; then the selection buffers, the staging copy
     const auto al = [](size_t b) { return (b + 255) / 256 * 256; };
     const size_t summ_b = (size_t) max_pages * g.n_kv * 2 * g.head_dim * 2;
-    const size_t lay_dev = al((size_t) R * page_b) + al((size_t) max_pages * 4) + 3 * al((size_t) R * 4) + al(8) + al(summ_b);
+    const size_t lay_dev = al((size_t) R * page_b) + al((size_t) max_pages * 4) + 3 * al((size_t) R * 4) + al(12) + al(summ_b);
     const size_t sel_b = 4 * al((size_t) max_sel * 4) + al(8) + al((size_t) g.n_head * max_pages * 4) +
                          al((size_t) g.n_head * 4) + al((size_t) max_pages * 4);
     // (64: once a page - 93K, select 8192: decode 91.6 / 98.5 -> 79.6 / 79.6 ms a token, needles 3/3; 16: 85.3)
@@ -3973,7 +4018,9 @@ bool Glm5Model::kv_stream_init(int64_t resident, std::string& err) {
         st.spage = (int*) take((size_t) R * 4);
         st.sepoch = (int*) take((size_t) R * 4);
         st.sref = (int*) take((size_t) R * 4);
-        st.ctl = (int*) take(8);
+        st.ctl = (int*) take(12);
+        st.lrfu = getenv("STRATA_GLM_KV_EVICT") != nullptr && std::strcmp(getenv("STRATA_GLM_KV_EVICT"), "lrfu") == 0;
+        cudaMemset(st.ctl, 0, 12);
         st.summ = take(summ_b);
         st.R = R;
         st.max_pages = max_pages;
@@ -4005,6 +4052,15 @@ bool Glm5Model::kv_stream_init(int64_t resident, std::string& err) {
 
 void Glm5Model::kv_stream_free() {
     if (kvs_ == nullptr) return;
+    if (getenv("STRATA_GLM_KV_STATS") != nullptr && kvs_->dev != nullptr) {   // the pages read over the run, all layers
+        long long pages = 0;
+        for (int il : kvs_->layers) {
+            int c[3] = {0, 0, 0};
+            if (cudaMemcpy(c, kvs_->lay[(size_t) il].ctl, sizeof c, cudaMemcpyDeviceToHost) == cudaSuccess) pages += c[2];
+        }
+        std::fprintf(stderr, "glm kv stream: %lld pages read from host memory (%s)\n", pages,
+                     kvs_->lay[(size_t) kvs_->layers[0]].lrfu ? "lrfu" : "clock");
+    }
     if (kvs_->dev) cudaFree(kvs_->dev);
 #ifdef __linux__
     if (kvs_->host && kvs_->lend) {
@@ -4248,6 +4304,7 @@ bool Glm5Model::fast_layers_gqa(int64_t p, std::string& err) {
     static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
     bool pf_pending = false;
     float* R = state_;
+    F->cpu_deferred = false;   // (a deferral never crosses a token: the part's last layer waits)
     if (F->prof_on) F->mark("start");
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
@@ -4258,6 +4315,11 @@ bool Glm5Model::fast_layers_gqa(int64_t p, std::string& err) {
             fast_dump(s, "attn_norm-" + std::to_string(il), F->x, g.n_embd);
         }
         if (!fast_gqa(il, p, err)) return false;
+        if (F->cpu_deferred) {   // the previous layer's CPU-lane rows, after this attention (STRATA_GLM_DEFER_CPU)
+            gf::moe_cpu_wait(F->md, g.n_embd, F->mixer, s);
+            F->cpu_deferred = false;
+            if (F->prof_on) F->mark("moe_cpu_wait_late");
+        }
         gf::rms_q8(R, F->mixer, Ly.ffn_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
         if (F->prof_on) F->mark("ffn_norm");
         if (dumps) {
@@ -4274,8 +4336,14 @@ bool Glm5Model::fast_layers_gqa(int64_t p, std::string& err) {
                             g.n_embd};
             if (!gf::mv(&dn, 1, s)) { err = "glm fast: dense ffn down"; return false; }
             if (F->prof_on) F->mark("dense_ffn");
-        } else if (!fast_moe(il, pf_pending, err)) {
-            return false;
+        } else {
+            // STRATA_GLM_DEFER_CPU=1: this layer's CPU-lane rows are added after the next layer's attention, so the
+            // CPU computes them under it (the next attention reads a residual without them; the part's last layer waits)
+            static const bool defer = getenv("STRATA_GLM_DEFER_CPU") != nullptr && std::atoi(getenv("STRATA_GLM_DEFER_CPU")) != 0;
+            F->defer_cpu_now = defer && il + 1 < l1_;
+            const bool ok = fast_moe(il, pf_pending, err);
+            F->defer_cpu_now = false;
+            if (!ok) return false;
         }
         if (dumps) fast_dump(s, "ffn_out-" + std::to_string(il), F->ffn, g.n_embd);
     }

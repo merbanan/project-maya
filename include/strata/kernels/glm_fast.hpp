@@ -313,10 +313,11 @@ struct GqaStream {
     int* ptab = nullptr;        // [max_pages]: page -> slot, -1
     int* spage = nullptr;       // [R]: slot -> page, -1
     int* sepoch = nullptr;      // [R]: the last step that used the slot
-    int* sref = nullptr;        // [R]: CLOCK's reference bit
-    int* ctl = nullptr;         // [2]: the clock hand, the step counter
+    int* sref = nullptr;        // [R]: CLOCK's reference bit (LRFU: the slot's score, a float's bits)
+    int* ctl = nullptr;         // [3]: the clock hand, the step counter, the pages read so far (in a 256-byte block)
     void* summ = nullptr;       // [max_pages][n_kv][2][128] FP16: min, max
     int R = 0, max_pages = 0;
+    int lrfu = 0;               // STRATA_GLM_KV_EVICT=lrfu: the victim is the lowest decayed-frequency score, not CLOCK's
 };
 struct GqaSelBufs {             // one decode step's selection (shared by the layers, which run one after another)
     int* sel = nullptr;         // [max_sel] page ids
