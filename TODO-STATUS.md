@@ -489,6 +489,6 @@ prompts 9-14 % and no decode.
 | E1 | MiMo full-context prompt attention: 6.3 s of a 28K prompt at ~23 TFLOPS (rows_tc_kernel); restructure (the heads-inner grid order was slower: 6.82 vs 6.26 s) | open |
 | E2 | MiMo decode attention: ~4 ms a token in the 9 global layers at 19.5K, far under bandwidth - profile (ncu / nsys) | open |
 | E3 | MiMo K/V cache quantization (FP16 only; Hy3 has int8 / TQ modes) | open |
-| E4 | Re-port hy3's sampler92 kernel pair (ffc6335), dropped in the mimo-dflash merge | open |
-| E5 | Branch consolidation: mimo-dflash carries GLM + Hy3 + MiMo - replace glm-dflash as the fork's main line? (the user's call) | open |
-| E6 | DeepSeek-V4.1-Flash (vLLM #59857): scope a port | open |
+| E4 | Re-port hy3's sampler92 kernel pair (ffc6335), dropped in the mimo-dflash merge | CLOSED: nothing lost - ffc6335 only adds an A/B gate back to the old kernel (STRATA_GLM_SAMPLER92=0); the #92 kernel itself is glm-dflash's 2a30f64 |
+| E5 | Branch consolidation: mimo-dflash carries GLM + Hy3 + MiMo - replace glm-dflash as the fork's main line? (the user's call) | needs the user: (a) make mimo-dflash the fork's main line (GLM bit-for-bit = glm-dflash, Hy3 / MiMo measured) and retire hy3 / mimo / glm-dflash; (b) keep the per-model branches and only merge forward; (c) send model support upstream as separate PRs (Hy3, MiMo) |
+| E6 | DeepSeek-V4.1-Flash (vLLM #59857): scope a port | CLOSED, not feasible here: hidden 5120, 384 experts x 2304, 40 layers, compress ratios 2/1 (V4: 4/128), KV / indexer sharing (kv_source_layer_ids), Engram n-gram tables (2 layers x ~384M entries), DSpark drafter, vision - antirez's Q2 GGUF 366 GB, Q4 519 GB vs ~94 GB VRAM + RAM even with +32 GB |
