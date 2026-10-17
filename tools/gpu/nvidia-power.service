@@ -1,0 +1,15 @@
+# /etc/systemd/system/nvidia-power.service - the V100's standing setting at boot (persistence on, 175 W).
+# Install (root): sudo cp nvidia-power.service /etc/systemd/system/ && sudo systemctl daemon-reload &&
+#                 sudo systemctl enable --now nvidia-power.service
+[Unit]
+Description=NVIDIA GPU power limit (175 W) and persistence mode
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/nvidia-smi -pm 1
+ExecStart=/usr/bin/nvidia-smi -pl 175
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

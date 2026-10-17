@@ -391,6 +391,27 @@ clock; a locked clock below the power-limited level would.
 
 | # | Item | Effort |
 |---|---|---|
-| 1 | Resume the sweep: locked clocks 1290 / 1230 / 1155 MHz (at 250 W and at 175 W), the GLM 27K run at 1380, a final 250 W drift check; add Hy3 93K decode and a sustained 10-minute load (does 175 W avoid the 81 C SW thermal slowdown the long runs hit?) | S |
-| 2 | Pick the measurement setting: the highest locked clock that never power-caps or thermal-throttles (steady clock for A/B runs) - cool.sh option to lock it per run and -rgc after | S |
-| 3 | If 175 W (or a lock) stays: a systemd unit for `nvidia-smi -pm 1; -pl 175` at boot | S |
+Rest of the sweep (2026-10-17, powersweep2.sh):
+
+| Setting | 27B MTP4 decode | 27B 28K prompt / decode | GLM 27K prompt | SM clock under load (mean, sd, min) | max temp | power-capped |
+|---|---:|---:|---:|---|---:|---:|
+| 250 W, 1290 locked | 67.1 | 933 / 74.1 | 37.9 s | 1278, 23, 1200 | 72 C | 15 % |
+| 250 W, 1230 locked | 65.9 | 908 / 72.5 | 39.6 s | 1227, 9, 1185 | 77 C | 8 % |
+| 250 W, 1155 locked | 63.9 | 872 / 70.1 | 41.6 s | 1155, 0, 1155 | 75 C | 0 % |
+| 175 W, 1230 locked | 65.8 | 787 / 72.5 | 40.4 s | 1136, 120, 855 | 72 C | 33 % |
+| 175 W, 1155 locked | 63.9 | 786 / 70.1 | 41.9 s | 1097, 83, 885 | 71 C | 22 % |
+| 175 W, free | 68.0 | 786 / 75.3 | 40.0 s | 1159, 162, 847 | 72 C | 38 % |
+| 250 W, 1380 locked | 68.6 | 926 / 76.1 | 36.2 s | 1325, 69, 1162 | 78 C | 34 % |
+| 250 W, free (drift check) | 68.6 | 913 / 76.1 | 36.6 s | 1309, 75, 1177 | 78 C | 22 % |
+| sustained, 175 W free, GLM 27K x6 back to back | | | 39.9-40.1 s | 1250, 94, 975 | 71 C | 35 % |
+| sustained, 250 W free, GLM 27K x6 back to back | | | 36.6-36.9 s | 1353, 39, 1230 | 81 C | 16 % |
+
+No SW thermal slowdown in any run (the sustained 250 W run peaked at 81 C without it). Free clocks give the most speed
+at either limit; a lock steadies the clock only at 250 W (at 175 W the cap still pulls it to ~850 MHz); 175 W costs
+prompts 9-14 % and no decode.
+
+| # | Item | Effort |
+|---|---|---|
+| 1 | (done: the table above) Resume the sweep | S |
+| 2 | (done: tools/gpu/lockclk.sh on = 250 W + 1230 MHz locked (sd 9 MHz, decode -4 %), off = the standing 175 W / free / persistence) A steady clock for A/B measurements | S |
+| 3 | (unit written: tools/gpu/nvidia-power.service - installing it needs root: `sudo cp tools/gpu/nvidia-power.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now nvidia-power.service`) 175 W kept across a reboot | S |
