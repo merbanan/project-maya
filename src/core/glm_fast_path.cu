@@ -4337,9 +4337,11 @@ bool Glm5Model::fast_layers_gqa(int64_t p, std::string& err) {
             if (!gf::mv(&dn, 1, s)) { err = "glm fast: dense ffn down"; return false; }
             if (F->prof_on) F->mark("dense_ffn");
         } else {
-            // STRATA_GLM_DEFER_CPU=1: this layer's CPU-lane rows are added after the next layer's attention, so the
-            // CPU computes them under it (the next attention reads a residual without them; the part's last layer waits)
-            static const bool defer = getenv("STRATA_GLM_DEFER_CPU") != nullptr && std::atoi(getenv("STRATA_GLM_DEFER_CPU")) != 0;
+            // (the default; STRATA_GLM_DEFER_CPU=0: off) this layer's CPU-lane rows are added after the next layer's
+            // attention, so the CPU computes them under it (the next attention reads a residual without them; the part's
+            // last layer waits) - ctx 131072: 2K decode 50.9 / 49.8 -> 43.0 / 41.3 ms, 30K 63.9 -> 54.2; KL against the
+            // undeferred run 0.057 (top-1 89.8 %; the served tq6v3 cache's own KL is 0.074), needles 3/3
+            static const bool defer = !(getenv("STRATA_GLM_DEFER_CPU") != nullptr && std::atoi(getenv("STRATA_GLM_DEFER_CPU")) == 0);
             F->defer_cpu_now = defer && il + 1 < l1_;
             const bool ok = fast_moe(il, pf_pending, err);
             F->defer_cpu_now = false;

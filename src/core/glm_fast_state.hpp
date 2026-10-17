@@ -240,7 +240,7 @@ struct Glm5Model::FastState {
     std::vector<std::thread> ah_th;
     bool ah_quit = false;
     std::atomic<int> ah_inflight{0};
-    // STRATA_GLM_DEFER_CPU=1 (hy_v3's decode): a layer's CPU-lane rows join the residual after the next layer's attention
+    // STRATA_GLM_DEFER_CPU (hy_v3's decode, the default; =0 off): a layer's CPU-lane rows join the residual after the next layer's attention
     // (fast_layers_gqa sets defer_cpu_now around a fast_moe; cpu_deferred: a wait is owed, into the next mixer)
     bool defer_cpu_now = false, cpu_deferred = false;
     // per RAM class and slot, for kRLoad slots: tag << 2 | phase (0 queued, 1 reading, 2 landed) - a job reads only while
