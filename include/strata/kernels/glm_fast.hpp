@@ -457,7 +457,4 @@ size_t gqa_attn_scratch_floats(int n_head, int max_pos);
 bool gqa_attn_rows(const float* q, int qld, const GqaKv& kv, int p0, int T, int n_head, void* out16, int old,
                    cudaStream_t s);
 
-/// argmax over n floats -> *out (device int).  Ties: lowest index.
-void argmax(const float* x, int n, int* out, cudaStream_t s);
-
 }  // namespace strata::kernels::glmf

@@ -24,7 +24,7 @@ namespace {
 
 const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((ggml_type) type); }
 
-std::atomic<uint64_t> exact_rows{0}, ggml_rows{0};
+std::atomic<uint64_t> exact1_rows{0}, ggml1_rows{0};
 bool flag_one(const char* name) {
     const char* v = std::getenv(name);
     return v && v[0] == '1' && v[1] == '\0';
@@ -280,11 +280,11 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
     if (exact_one && nt == 1 && f.gu_type == 16 && r1 > r0) {
         iq2xxs256_gu_split_exact_one(gate_base, up_base, f.gu_row, (int) f.n_embd, act[0], ff[0],
                                     r0, r1, swiglu_limit);
-        if (diag) exact_rows.fetch_add((uint64_t) (r1 - r0), std::memory_order_relaxed);
+        if (diag) exact1_rows.fetch_add((uint64_t) (r1 - r0), std::memory_order_relaxed);
         return;
     }
     if (diag && r1 > r0 && nt > 0)
-        ggml_rows.fetch_add((uint64_t) (r1 - r0) * (uint64_t) nt, std::memory_order_relaxed);
+        ggml1_rows.fetch_add((uint64_t) (r1 - r0) * (uint64_t) nt, std::memory_order_relaxed);
     const int n = (int) f.n_embd;
     const bool clamp = swiglu_limit != std::numeric_limits<float>::infinity();
     if (r1 > r0) {
@@ -334,7 +334,7 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
 }
 
 NativeSplitCounts native_split_counts() noexcept {
-    return {exact_rows.load(std::memory_order_relaxed), ggml_rows.load(std::memory_order_relaxed)};
+    return {exact1_rows.load(std::memory_order_relaxed), ggml1_rows.load(std::memory_order_relaxed)};
 }
 
 void native_down_rows_split(const NativeFmt& f, const uint8_t* down_base, const void* const* hq,
