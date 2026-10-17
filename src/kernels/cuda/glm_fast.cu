@@ -2228,6 +2228,8 @@ struct RouteArgs {
     int near_n;                 // STRATA_GLM_ROUTE_LOG: the route's next near_n ranks after the top k (0: none)
     int score_fn;               // 0 sigmoid, 1 sqrt(softplus) (DeepSeek-V4)
     const int* hash_ids;        // the k experts given (DeepSeek-V4's hash layers), else nullptr: the top k
+    int swap_ranks;             // STRATA_GLM_ROUTE_SWAP=<n>: the last n ranks may take a VRAM-resident runner-up
+    float swap_margin;          // STRATA_GLM_ROUTE_SWAP_MARGIN: within this much of the swapped one's selection score
 };
 // a router logit's probability: sigmoid (GLM, Hy3) or sqrt(softplus) (DeepSeek-V4; softplus as ds4's)
 __device__ __forceinline__ float route_prob(float l, int fn) {
@@ -2278,6 +2280,32 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     if (tid == 0)
         for (int i = 0; i < a.k; ++i)
             if (s_ids[i] < 0 || s_ids[i] >= E) atomicMax(&bad, 1);
+    // STRATA_GLM_ROUTE_SWAP=<n> (changes the output; not the hash layers): each of the last n ranks whose expert is not
+    // in VRAM takes the best VRAM-resident one of the next 8 ranks whose selection score is within swap_margin of its
+    // own - a PCIe or CPU-lane miss traded for a near tie; the weights follow the new set
+    if (a.swap_ranks > 0 && a.hash_ids == nullptr) {
+        __shared__ int s_cand[8];
+        const int nc = min(8, E - a.k);
+        if (nc > 0) topk_argmax(s_sel, E, nc, s_cand, s_bv, s_bi);
+        if (tid == 0 && nc > 0) {
+            const size_t base = (size_t) a.layer * E;
+            for (int r = a.k - 1; r >= max(0, a.k - a.swap_ranks); --r) {
+                const int id = s_ids[r];
+                if (id < 0 || a.d.tab[base + id] != 0ull) continue;
+                const float own = s_p[id] + (a.bias ? a.bias[id] : 0.0f);
+                for (int c = 0; c < nc; ++c) {
+                    const int e = s_cand[c];
+                    if (e < 0 || a.d.tab[base + e] == 0ull) continue;
+                    if (s_p[e] + (a.bias ? a.bias[e] : 0.0f) >= own - a.swap_margin) {
+                        s_ids[r] = e;
+                        s_cand[c] = -1;
+                        break;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
     // the NEAR MISSES (STRATA_GLM_ROUTE_LOG only, cache studies): ranks k+1 .. k+near_n by the same selection score -
     // the top k are -inf in s_sel now, so the selection simply goes on (s_sel is rewritten for the prediction below)
     __shared__ int s_near[16];
@@ -3610,7 +3638,11 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                 sh_gate, sh_up, sh_limit, n_ff_sh, (block_q8_1*) sh_hq, pred_logits, pred_bias, max_prefetch,
                 ahead_logits, {}, 0, skip_from, d.cpu_seq != nullptr ? cpu_plan : 0ull, promote_min,
                 pf_rank > 0 ? pf_rank : k, std::max(0, std::min(near_n, std::min(16, n_expert - k))), score_fn,
-                hash_ids};
+                hash_ids, 0, 0.0f};
+    static const int swap = getenv("STRATA_GLM_ROUTE_SWAP") ? std::max(0, std::atoi(getenv("STRATA_GLM_ROUTE_SWAP"))) : 0;
+    static const float swap_m = getenv("STRATA_GLM_ROUTE_SWAP_MARGIN") ? (float) std::atof(getenv("STRATA_GLM_ROUTE_SWAP_MARGIN")) : 0.02f;
+    a.swap_ranks = std::min(swap, k);
+    a.swap_margin = swap_m;
     if (ahead_logits != nullptr && ahead_bias != nullptr && n_expert <= 512) {
         a.n_ahead = std::min(n_ahead, kAhead);
         for (int i = 0; i < a.n_ahead; ++i) a.ahead_bias[i] = ahead_bias[i];
@@ -3623,6 +3655,37 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
 void moe_wait(const MoeDev& d, int n_embd, cudaStream_t s) {
     moe_wait_kernel<<<1, 256, 0, s>>>(d, n_embd);
     launch_check("moe_wait");
+}
+
+// the deferred form (STRATA_GLM_DEFER_CPU): the answer of a layer whose FFN write already went out without it, added to
+// the streams it would have reached - R[j] += post[j] * part (the layer's FFN-side post weights)
+__global__ void moe_cpu_wait_streams_kernel(MoeDev d, int n_embd, const float* post, float* R, int hc) {
+    __shared__ unsigned int s_need;
+    __shared__ float s_post[8];
+    const int tid = threadIdx.x;
+    if (tid == 0) s_need = *d.cpu_seq;
+    if (tid < hc) s_post[tid] = post[tid];
+    __syncthreads();
+    if (s_need == 0) return;
+    const CpuAnswer* r = (const CpuAnswer*) d.cpu_ans;
+    if (tid == 0) {
+        const long long t0 = clock64();
+        while (r->seq != s_need) {
+            if (clock64() - t0 > (1ll << 36)) break;
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    for (int e = tid; e < n_embd; e += blockDim.x) {
+        const float v = ((volatile const CpuAnswer*) r)->part[e];
+        for (int j = 0; j < hc; ++j) R[(size_t) j * n_embd + e] += s_post[j] * v;
+    }
+}
+
+void moe_cpu_wait_streams(const MoeDev& d, int n_embd, const float* post, float* R, int hc, cudaStream_t s) {
+    if (d.cpu_seq == nullptr) return;
+    moe_cpu_wait_streams_kernel<<<1, 1024, 0, s>>>(d, n_embd, post, R, hc);
+    launch_check("moe_cpu_wait_streams");
 }
 
 void moe_cpu_wait(const MoeDev& d, int n_embd, float* out, cudaStream_t s) {
