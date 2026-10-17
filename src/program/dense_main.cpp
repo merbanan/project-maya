@@ -696,6 +696,14 @@ int main(int argc, char** argv) {
         static const bool adaptive = std::getenv("STRATA_DENSE_ADAPTIVE") ? std::atoi(std::getenv("STRATA_DENSE_ADAPTIVE")) != 0
                                                                           : cfg.n_expert > 0;
         int k_cur = K;
+        // STRATA_DENSE_KSEL=1: the draft count from measured throughput - per count k (1..K) a running mean of the tokens a
+        // round commits and the round's ms (next round's start - this one's); every count tried first, the stalest one
+        // again every 64 rounds, else the best tokens / ms (a smaller k only when >= 3 % better).  Lookup rounds not counted
+        static const bool ksel = std::getenv("STRATA_DENSE_KSEL") && std::atoi(std::getenv("STRATA_DENSE_KSEL")) != 0;
+        double ks_tok[17] = {}, ks_ms[17] = {};
+        long long ks_n[17] = {}, ks_last[17] = {}, ks_round = 0;
+        int ks_k = -1, ks_commit = 0;
+        Clock::time_point ks_t0 = Clock::now();
         if (!cancelled && budget > 0) {
             if (!sample_rows(model.logits(), 1, &anchor)) failed = true;
             else { budget_force(anchor); emit(anchor); }                         // (a stop token sets finish)
@@ -724,6 +732,36 @@ int main(int argc, char** argv) {
             Clock::time_point t_rp = Clock::now();
             int k = (int) std::min<long long>(K, std::min<long long>(budget - produced, model.max_context() - pos - 1));
             if (adaptive && !use_df) k = std::min(k, k_cur);   // (MTP: each draft is a step of its own)
+            if (ksel && K >= 1 && K <= 16) {
+                if (ks_k > 0) {   // the last round's tokens and time
+                    const double ms = std::chrono::duration<double, std::milli>(t_rp - ks_t0).count();
+                    const double a = ks_n[ks_k] == 0 ? 1.0 : 0.15;
+                    ks_tok[ks_k] += a * ((double) ks_commit - ks_tok[ks_k]);
+                    ks_ms[ks_k] += a * (ms - ks_ms[ks_k]);
+                    ++ks_n[ks_k];
+                    ks_last[ks_k] = ks_round;
+                }
+                ++ks_round;
+                int pick = -1;
+                for (int c = K; c >= 1 && pick < 0; --c)
+                    if (ks_n[c] < 3) pick = c;
+                if (pick < 0 && ks_round % 64 == 0) {
+                    pick = 1;
+                    for (int c = 2; c <= K; ++c)
+                        if (ks_last[c] < ks_last[pick]) pick = c;
+                }
+                if (pick < 0) {
+                    pick = K;
+                    double best = ks_tok[K] / std::max(1e-6, ks_ms[K]);
+                    for (int c = K - 1; c >= 1; --c) {
+                        const double r = ks_tok[c] / std::max(1e-6, ks_ms[c]);
+                        if (r > best * 1.03) { best = r; pick = c; }
+                    }
+                }
+                k = std::min(k, pick);
+                ks_k = k > 0 ? k : -1;
+                ks_t0 = t_rp;
+            }
             k = std::max(0, k);
             std::vector<int32_t> win = {anchor};
             const long long lookup_rounds_before = lookup_rounds;   // (a lookup round's drafts are not q's draws)
@@ -812,6 +850,10 @@ int main(int argc, char** argv) {
                 if (!sample_rows(model.logits(), W, picks)) { failed = true; break; }
                 while (acc + 1 < W && win[acc + 1] == picks[acc]) ++acc;
                 if (acc_hist && lookup_rounds_before == lookup_rounds && W - 1 <= 16) ++ah[W - 1][acc];
+            }
+            if (ksel) {   // (this round's commits; a lookup round's not counted)
+                ks_commit = acc + 1;
+                if (lookup_rounds_before != lookup_rounds) ks_k = -1;
             }
             if (adaptive && !use_df && W > 1) {   // NInfer-style: one more after a full round, back to what was kept + 1
                 if (acc == W - 1) k_cur = std::min(K, k_cur + 1);

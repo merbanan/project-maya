@@ -797,6 +797,53 @@ __global__ void argmax_kernel(const float* __restrict__ x, int64_t ld, int n, in
     }
 }
 
+// the greedy pick over a long row in two steps (STRATA_DENSE_ARGMAX_MB, the default): blocks of 256 threads each take
+// kAmChunk values of a row (16-byte loads when the row allows) -> (best, index) partials; then a warp a row reduces them.
+// Ties keep the lowest index, as argmax_kernel: the same token.
+constexpr int kAmChunk = 8192, kAmMaxParts = 64, kAmMaxRows = 16;
+__device__ __forceinline__ void am_take(float v, int i, float& best, int& bi) {
+    if (v > best || (v == best && i < bi)) { best = v; bi = i; }
+}
+__global__ void __launch_bounds__(256) argmax_part_kernel(const float* __restrict__ x, int64_t ld, int n,
+                                                          float* __restrict__ pv, int* __restrict__ pi, int parts) {
+    const float* xr = x + (size_t) blockIdx.y * ld;
+    const int lo = blockIdx.x * kAmChunk, hi = min(n, lo + kAmChunk);
+    float best = -INFINITY;
+    int bi = 0x7fffffff;
+    if ((((uintptr_t) (xr + lo)) & 15u) == 0 && ((hi - lo) & 3) == 0) {
+        const float4* x4 = (const float4*) (xr + lo);
+        for (int i = threadIdx.x; i < (hi - lo) / 4; i += 256) {
+            const float4 v = x4[i];
+            const int b = lo + 4 * i;
+            am_take(v.x, b, best, bi);
+            am_take(v.y, b + 1, best, bi);
+            am_take(v.z, b + 2, best, bi);
+            am_take(v.w, b + 3, best, bi);
+        }
+    } else {
+        for (int i = lo + threadIdx.x; i < hi; i += 256) am_take(xr[i], i, best, bi);
+    }
+    for (int o = 16; o > 0; o >>= 1) am_take(__shfl_xor_sync(0xffffffffu, best, o), __shfl_xor_sync(0xffffffffu, bi, o), best, bi);
+    __shared__ float sv[8];
+    __shared__ int si[8];
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    if (lane == 0) { sv[w] = best; si[w] = bi; }
+    __syncthreads();
+    if (w == 0) {
+        best = lane < 8 ? sv[lane] : -INFINITY;
+        bi = lane < 8 ? si[lane] : 0x7fffffff;
+        for (int o = 4; o > 0; o >>= 1) am_take(__shfl_xor_sync(0xffffffffu, best, o), __shfl_xor_sync(0xffffffffu, bi, o), best, bi);
+        if (lane == 0) { pv[blockIdx.y * parts + blockIdx.x] = best; pi[blockIdx.y * parts + blockIdx.x] = bi; }
+    }
+}
+__global__ void argmax_join_kernel(const float* __restrict__ pv, const int* __restrict__ pi, int parts, int32_t* __restrict__ out) {
+    float best = -INFINITY;
+    int bi = 0x7fffffff;
+    for (int i = threadIdx.x; i < parts; i += 32) am_take(pv[blockIdx.x * parts + i], pi[blockIdx.x * parts + i], best, bi);
+    for (int o = 16; o > 0; o >>= 1) am_take(__shfl_xor_sync(0xffffffffu, best, o), __shfl_xor_sync(0xffffffffu, bi, o), best, bi);
+    if (threadIdx.x == 0) out[blockIdx.x] = bi;
+}
+
 __global__ void add_kernel(float* __restrict__ y, const float* __restrict__ x, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] += x[i];
@@ -1016,6 +1063,24 @@ void q35_gemv_f32_cols(const float* W, const float* x, int ldx, float* y, int n_
 }
 
 void q35_argmax_rows(const float* x, int64_t ld, int n, int T, int32_t* out, void* stream) {
+    // (two steps over a long row - STRATA_DENSE_ARGMAX_MB=0: one block of 1024 a row)
+    static const bool mb = !(std::getenv("STRATA_DENSE_ARGMAX_MB") && std::atoi(std::getenv("STRATA_DENSE_ARGMAX_MB")) == 0);
+    static float* pv = nullptr;
+    static int* pi = nullptr;
+    const int parts = (n + kAmChunk - 1) / kAmChunk;
+    if (mb && parts >= 2 && parts <= kAmMaxParts && T <= kAmMaxRows) {
+        if (pv == nullptr && (cudaMalloc(&pv, (size_t) kAmMaxRows * kAmMaxParts * sizeof(float)) != cudaSuccess ||
+                              cudaMalloc(&pi, (size_t) kAmMaxRows * kAmMaxParts * sizeof(int)) != cudaSuccess)) {
+            cudaGetLastError();
+            pv = nullptr;
+        }
+        if (pv != nullptr) {
+            argmax_part_kernel<<<dim3(parts, T), 256, 0, (cudaStream_t) stream>>>(x, ld, n, pv, pi, parts);
+            argmax_join_kernel<<<T, 32, 0, (cudaStream_t) stream>>>(pv, pi, parts, out);
+            check("q35_argmax_rows");
+            return;
+        }
+    }
     argmax_kernel<<<T, 1024, 0, (cudaStream_t) stream>>>(x, ld, n, out);
     check("q35_argmax_rows");
 }
