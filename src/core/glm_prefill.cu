@@ -1888,7 +1888,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 mimo::attn(B.qkv, QKV, tn, pt, g.n_head, kv, win ? g.swa_window : 0, Ly.sinks,
                            1.0f / std::sqrt((float) g.head_dim), g.v_scale, B.out, OD, nullptr, s);
                 if (win) mimo::copy(kv, rec, std::max<int64_t>(kv.pos0, pt + tn - rec.cap), pt + tn, s);
-                S->mark("mimo_attn", s);
+                S->mark(win ? "mimo_attn_win" : "mimo_attn_full", s);
                 if (!skip_output) {
                     gb::f32_to_f16(B.out, B.out16, (int64_t) tn * OD, s);
                     hgemm_q(Ly.out, E, OD, B.out16, OD, mixer, E, tn, 0.0f);
