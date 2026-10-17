@@ -16,7 +16,7 @@
 // The DSA caches are append-only (latent column per token; a pool's key when its last member
 // lands), so a batched call is literally the same per-token steps as single-token calls - which
 // is what glm_model_test's batched-vs-streamed equivalence pins.
-#include "glm_kv_stream.hpp"
+#include "glm_gqa_stream.hpp"
 #include "glm_fast_state.hpp"
 
 #include "strata/kernels/glm_dsa.hpp"
@@ -742,7 +742,7 @@ Glm5Model::~Glm5Model() {
     if (w_arena_) cudaFree(w_arena_);
     if (mtp_arena_) cudaFree(mtp_arena_);
     if (state_) cudaFree(state_);
-    kv_stream_free();
+    gqa_kv_stream_free();
     if (sc_) cudaFree(sc_);
     if (d_pos_) cudaFree(d_pos_);
     if (pool_) cudaFree(pool_);
@@ -2874,7 +2874,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     state_bytes_ = (uint64_t) floats * sizeof(float);
     { cudaError_t e_ = cudaMalloc(&state_, state_bytes_); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
     if (fast_mode_ && !seq_alloc_arenas(err)) return false;   // STRATA_GLM_SEQS: before the expert pool takes the rest
-    if (kv_stream_res > 0 && !kv_stream_init(kv_stream_res, err)) return false;   // (before the pool, too)
+    if (kv_stream_res > 0 && !gqa_kv_stream_init(kv_stream_res, err)) return false;   // (before the pool, too)
 
     const int64_t ff_max = std::max<long long>({g_.n_ff_dense, (int64_t) g_.n_ff_exp * g_.n_shared});
     int64_t s = 0;

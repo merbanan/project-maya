@@ -16,7 +16,7 @@
 // rounding (FP16 activations instead of q8_1), as between llama.cpp's batched and one-token paths.  The prompt's
 // routing also feeds the expert tiers' LFU counts, so the decode that follows starts from this conversation's
 // experts.  STRATA_GLM_NO_PREFILL=1 keeps the token-at-a-time prompt (A/B).
-#include "glm_kv_stream.hpp"
+#include "glm_gqa_stream.hpp"
 #include "glm_fast_state.hpp"
 
 #include "strata/core/progress.hpp"
@@ -57,10 +57,10 @@
 namespace strata::core {
 
 // positions [a, b) of a layer's KV-stream records between the host records and the staging copy (either direction) -
-// with the records lent (KvStream::lend) in pieces of kGrow positions, each a registration of its own: one copy a piece
+// with the records lent (GqaKvStream::lend) in pieces of kGrow positions, each a registration of its own: one copy a piece
 static void kv_host_copy(uint8_t* dst, const uint8_t* src, int64_t a, int64_t b, size_t slb, cudaStream_t s) {
     for (int64_t x = a; x < b;) {
-        const int64_t y = std::min<int64_t>(b, (x / KvStream::kGrow + 1) * KvStream::kGrow);
+        const int64_t y = std::min<int64_t>(b, (x / GqaKvStream::kGrow + 1) * GqaKvStream::kGrow);
         cudaMemcpyAsync(dst + (size_t) x * slb, src + (size_t) x * slb, (size_t) (y - x) * slb, cudaMemcpyDefault, s);
         x = y;
     }

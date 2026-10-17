@@ -1,4 +1,4 @@
-// src/core/glm_kv_stream.hpp - hy_v3's KV streaming state on one part (Glm5Model::kvs_; STRATA_GLM_KV_STREAM).
+// src/core/glm_gqa_stream.hpp - hy_v3's KV streaming state on one part (Glm5Model::kvs_; STRATA_GLM_KV_STREAM).
 //
 // The whole K/V cache in pinned, device-mapped host memory - per streamed layer its records [max_ctx][slice] - and in
 // VRAM per layer a cache of R pages (glm_fast.hpp GqaStream: slots, page table, CLOCK state, page summaries), one
@@ -15,7 +15,7 @@
 
 namespace strata::core {
 
-struct KvStream {
+struct GqaKvStream {
     std::vector<strata::kernels::glmf::GqaStream> lay;   // by layer index (n_layers + 1: the draft block last)
     std::vector<int> layers;                             // the streamed layers (the draft block's first)
     strata::kernels::glmf::GqaSelBufs sel;

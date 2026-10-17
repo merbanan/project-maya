@@ -15,7 +15,7 @@
 // Victims come only from the requesting layer's own slot partition, so no kernel can be reading a
 // slot while it is overwritten: the device is parked in that layer's wait kernel, the layer's
 // resident experts are excluded, and every other layer's slots are untouched.
-#include "glm_kv_stream.hpp"
+#include "glm_gqa_stream.hpp"
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -3921,7 +3921,7 @@ bool Glm5Model::fast_gqa(int il, int64_t p, std::string& err) {
         const gf::GqaStream& st = kvs_->lay[(size_t) il];
         gf::gqa_stream_summarize(kv, st, (int) p, (int) p + 1, s);
         if (F->prof_on) F->mark("gqa_st_summ");
-        KvStream* K = kvs_;
+        GqaKvStream* K = kvs_;
         gf::GqaSelBufs b = K->sel;
         bool keep = false;
         if (K->lsel != nullptr) {   // (STRATA_GLM_KV_RESELECT: the layer's last selection while it still covers p)
@@ -3994,17 +3994,17 @@ gf::GqaKv Glm5Model::kv_view(int il) const {
                            kv_loff_[(size_t) il], g_.n_kv, max_ctx_, gqa_kvm_);
 }
 
-// ---- KV streaming (glm_kv_stream.hpp).  STRATA_GLM_KV_STREAM=<positions> cached a layer (load_pack: below the
+// ---- KV streaming (glm_gqa_stream.hpp).  STRATA_GLM_KV_STREAM=<positions> cached a layer (load_pack: below the
 // context); STRATA_GLM_KV_SELECT=<positions> (8192) a decode step attends to by score, STRATA_GLM_KV_RECENT=<positions>
 // (1024) the latest ones it always attends to (and the first page).
-bool Glm5Model::kv_stream_init(int64_t resident, std::string& err) {
+bool Glm5Model::gqa_kv_stream_init(int64_t resident, std::string& err) {
     const Glm5Geometry& g = g_;
     const auto envi = [](const char* k, int64_t d) {
         const char* v = getenv(k);
         return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : d;
     };
     const int P = gf::kGqaPage;
-    auto* K = new KvStream;
+    auto* K = new GqaKvStream;
     kvs_ = K;
     K->slice = gf::gqa_kv_rec_bytes(g.n_kv, gqa_kvm_);
     K->budget = (int) ((envi("STRATA_GLM_KV_SELECT", 8192) + P - 1) / P);
@@ -4028,7 +4028,7 @@ bool Glm5Model::kv_stream_init(int64_t resident, std::string& err) {
                   cudaDeviceGetAttribute(&ok, cudaDevAttrCanUseHostPointerForRegisteredMem, dev_) == cudaSuccess && ok;
         cudaGetLastError();
     }
-    if (K->lend) {   // reserved only: kv_stream_commit pins positions as the context grows
+    if (K->lend) {   // reserved only: gqa_kv_stream_commit pins positions as the context grows
         void* p = mmap(nullptr, K->host_bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (p == MAP_FAILED) {
             err = "glm kv stream: the records' address range did not reserve";
@@ -4036,7 +4036,7 @@ bool Glm5Model::kv_stream_init(int64_t resident, std::string& err) {
         }
         K->host = (uint8_t*) p;
         hdev = K->host;   // (registered memory: the device reads the host pointers)
-        if (!kv_stream_commit(std::min<int64_t>(max_ctx_, KvStream::kGrow), err)) return false;
+        if (!gqa_kv_stream_commit(std::min<int64_t>(max_ctx_, GqaKvStream::kGrow), err)) return false;
     } else
 #endif
     {
@@ -4111,7 +4111,7 @@ bool Glm5Model::kv_stream_init(int64_t resident, std::string& err) {
     return true;
 }
 
-void Glm5Model::kv_stream_free() {
+void Glm5Model::gqa_kv_stream_free() {
     if (kvs_ == nullptr) return;
     if (getenv("STRATA_GLM_KV_STATS") != nullptr && kvs_->dev != nullptr) {   // the pages read over the run, all layers
         long long pages = 0;
@@ -4127,7 +4127,7 @@ void Glm5Model::kv_stream_free() {
     if (kvs_->host && kvs_->lend) {
         const size_t NL = kvs_->layers.size(), sl = kvs_->slice;
         for (size_t i = 0; i < NL; ++i)
-            for (int64_t a = 0; a < kvs_->committed; a += KvStream::kGrow)
+            for (int64_t a = 0; a < kvs_->committed; a += GqaKvStream::kGrow)
                 cudaHostUnregister(kvs_->host + i * kvs_->lay_host + (size_t) a * sl);
         munmap(kvs_->host, kvs_->host_bytes);
         kvs_->host = nullptr;
@@ -4154,7 +4154,7 @@ gf::GqaKv Glm5Model::kv_stage_view(int il) const {
     return gf::gqa_kv_view(kvs_->stage, nullptr, max_ctx_, (int64_t) kvs_->slice, 0, g_.n_kv, max_ctx_, gqa_kvm_);
 }
 
-void Glm5Model::kv_stream_reload(int64_t n) {
+void Glm5Model::gqa_kv_stream_reload(int64_t n) {
     if (kvs_ == nullptr) return;
     cudaStream_t s = fast_ != nullptr ? fast_->cs : 0;
     kvs_->forget();
@@ -4184,11 +4184,11 @@ size_t Glm5Model::kv_room(int64_t pos_end) const {
 
 // (KV stream lending) every layer's records pinned up to position to (rounded to kGrow), each step's bytes first taken
 // from the RAM tier's tail (ram_retire) when the tier is chunked
-bool Glm5Model::kv_stream_commit(int64_t to, std::string& err) {
+bool Glm5Model::gqa_kv_stream_commit(int64_t to, std::string& err) {
 #ifdef __linux__
-    KvStream* K = kvs_;
+    GqaKvStream* K = kvs_;
     const int64_t max_pos = (int64_t) (K->lay_host / K->slice);
-    to = std::min<int64_t>(max_pos, (to + KvStream::kGrow - 1) / KvStream::kGrow * KvStream::kGrow);
+    to = std::min<int64_t>(max_pos, (to + GqaKvStream::kGrow - 1) / GqaKvStream::kGrow * GqaKvStream::kGrow);
     if (to <= K->committed) return true;
     const size_t NL = K->layers.size(), sl = K->slice;
     if (fast_ != nullptr) {   // (at load the tier is not there yet: sized from what is free after the first step)
@@ -4198,8 +4198,8 @@ bool Glm5Model::kv_stream_commit(int64_t to, std::string& err) {
         std::fprintf(stderr, "glm kv stream: CUDA%d records pinned to position %lld (%.2f GB more; %.2f GB from the RAM "
                              "tier)\n", dev_, (long long) to, (double) need / 1073741824.0, (double) got / 1073741824.0);
     }
-    for (int64_t a = K->committed; a < to; a += KvStream::kGrow) {
-        const int64_t b = std::min<int64_t>(to, a + KvStream::kGrow);
+    for (int64_t a = K->committed; a < to; a += GqaKvStream::kGrow) {
+        const int64_t b = std::min<int64_t>(to, a + GqaKvStream::kGrow);
         for (size_t i = 0; i < NL; ++i) {
             uint8_t* q = K->host + i * K->lay_host + (size_t) a * sl;
             const size_t len = (size_t) (b - a) * sl;
@@ -4315,7 +4315,7 @@ size_t Glm5Model::ram_retire(size_t want, std::string& err) {
 }
 
 bool Glm5Model::kv_ensure(int64_t pos_end, std::string& err) {
-    if (kvs_ != nullptr && kvs_->lend) return kv_stream_commit(pos_end, err);
+    if (kvs_ != nullptr && kvs_->lend) return gqa_kv_stream_commit(pos_end, err);
     if (kv_b_ == nullptr || pos_end <= kv_lent_) return true;
     const int64_t to = std::min<int64_t>(max_ctx_, (pos_end + 1023) / 1024 * 1024);
     uint64_t moved = 0, dropped = 0;
@@ -5359,7 +5359,7 @@ std::vector<std::pair<int64_t, int64_t>> Glm5Model::slot_gqa_runs(int64_t n) con
     }
     if (kvs_ != nullptr) {   // streamed: every layer's host records (an offset from state_ as well)
         // (lent records: a run per kGrow positions - each piece a registration of its own)
-        const int64_t step = kvs_->lend ? KvStream::kGrow : std::max<int64_t>(1, n);
+        const int64_t step = kvs_->lend ? GqaKvStream::kGrow : std::max<int64_t>(1, n);
         for (int il : kvs_->layers)
             for (int64_t a = 0; a < n; a += step) {
                 const int64_t b = std::min<int64_t>(n, a + step);
@@ -5538,7 +5538,7 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
             }
         }
         m->snap_pos_ = n;
-        m->kv_stream_reload(n);   // (streamed: the pages' summaries of the records read back, nothing cached)
+        m->gqa_kv_stream_reload(n);   // (streamed: the pages' summaries of the records read back, nothing cached)
     }
     cudaSetDevice(dev_);
     // the KDA states go from the snapshot into the live state, as snapshot_restore does (it also sets the position)
