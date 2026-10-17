@@ -428,6 +428,11 @@ prompts 9-14 % and no decode.
   (2K / 8K / 27K / 100K) -> 30.9 / 53.2 / 53.5 / 51.8 TFLOPS, + ~73 ms a layer to write the FP16 weights: 27K 278 ms a
   layer vs MMQ ~435 -> experts 18.7 -> ~12 s, the 27K prompt ~1.2x; nothing for short prompts (the weight write
   dominates). Not 2x.
+- BUILT (glm-dflash d7531c6, default on sm_70): experts with >= 128 rows a chunk dequantized to FP16 (llama.cpp
+  convert.cu) + cuBLAS, the rest MMQ. Two rounds: 27K 39.7 / 39.9 -> 31.7 / 31.8 s (experts 20.4 -> 12.2 s), 8K
+  623 / 621 -> 764 / 764 tok/s, 2K 549 / 548 -> 581 / 568; needle answered; KL vs MMQ 0.015 (MMQ vs itself 0),
+  top-1 95.7 %, target log-prob +0.025. Better than the estimate: the 2K / 8K prompts gain too (MMQ is slower per
+  weight at few rows than the bench's 25 TOPS). Next: the same in Hy3 / DSv4 prompt experts; upstream PR.
 - Issue #130's 4x V100: the split pipelines chunks only when a prompt has more than one; auto = 8192 there, so <= 8K
   prompts run one GPU at a time (their 16K: 1 chunk 536 vs 2 chunks 745 tok/s). Chunk 4096 / 2048 should be
   ~1.4x at 16K and more below - untestable on one GPU; an auto chunk of prompt / (2 x GPUs) is the upstream idea.
