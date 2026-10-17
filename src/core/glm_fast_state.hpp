@@ -279,6 +279,7 @@ struct Glm5Model::FastState {
         bool recr = false, moe = false, mtp = false, gqa = false;
         const float *q_norm = nullptr, *k_norm = nullptr;          // hy_v3: per-head q / k RMS norms (head_dim)
         const float* router32 = nullptr;                            // hy_v3: the router in F32 (as the GGUF stores it)
+        const float* sinks = nullptr;                               // mimo2: a window layer's attention sinks (n_head)
         WSlot eh;                                                   // the NextN block: eh_proj and its norms
         const float *enorm = nullptr, *hnorm = nullptr, *shnorm = nullptr;
         const uint16_t *hc_attn_fn = nullptr, *hc_ffn_fn = nullptr;

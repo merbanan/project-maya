@@ -21,6 +21,7 @@
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/mimo_attn.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <algorithm>
@@ -78,15 +79,26 @@ struct Glm5Geometry {
     // hy_v3 (Tencent Hy3): every layer is grouped-query attention (n_head query heads over n_kv K/V heads of
     // head_dim, per-head RMS norms on q and k, NeoX rope over the whole head) with plain pre-norm residuals - no
     // hyper-connections (hc = 1), no KDA, no DSA; the MoE side is GLM's (sigmoid router + bias, shared expert)
-    int arch = 0;                      // 0 glm5-next, 1 hy_v3
+    int arch = 0;                      // 0 glm5-next, 1 hy_v3, 2 mimo2
     int n_kv = 8, head_dim = 128;
     float rope_base = 10000.0f;
+    // mimo2 (Xiaomi MiMo-V2.x-Flash, llama.cpp's LLM_ARCH_MIMO2): GQA like hy_v3 but K heads of head_dim (192) and V
+    // heads of v_dim (128), NeoX rope over the first n_rot (64) dims, no q/k norms; most layers attend over a sliding
+    // window of swa_window positions (8 K/V heads, rope_base_swa, a per-head attention sink), every sixth over the whole
+    // context (4 K/V heads, rope_base); the attention output is scaled by v_scale; no shared expert.  n_head_kv holds
+    // each layer's K/V heads, is_swa its kind.
+    int v_dim = 128, n_rot = 128, swa_window = 0;
+    float rope_base_swa = 10000.0f, v_scale = 1.0f;
+    std::vector<char> is_swa;
     std::vector<int32_t> eog;          // the end-of-generation ids from the GGUF (empty: the driver's GLM set)
 
     int d_inner() const { return kda_head_dim * n_head; }
     int top_pools_max() const { return idx_top_k / idx_kpool; }
     int n_sel_max() const { return idx_top_k + (idx_select_tail ? idx_kpool - 1 : 0); }
-    bool gqa() const { return arch == 1; }
+    bool gqa() const { return arch == 1 || arch == 2; }   // a plain residual stream with grouped-query attention
+    bool mimo() const { return arch == 2; }
+    bool swa(int il) const { return mimo() && is_swa[(size_t) il] != 0; }
+    int kv_heads(int il) const { return mimo() ? n_head_kv[(size_t) il] : n_kv; }
     bool is_recr(int il) const { return !gqa() && n_head_kv[(size_t) il] == 0; }
     bool is_dsa(int il) const { return !gqa() && n_head_kv[(size_t) il] != 0; }
 
@@ -122,6 +134,11 @@ public:
     bool load_pack_split(const std::string& pack_dir, int64_t max_ctx, const std::vector<int>& bounds,
                          const std::vector<int>& devs, std::string& err);
     static constexpr int kMaxParts = 16;
+    /// mimo2: the positions a layer's K / V records hold - the whole context, or the sliding window's ring (+ 64
+    /// positions for rows decoded ahead)
+    static int64_t mimo_kv_cap(const Glm5Geometry& g, int il, int64_t max_ctx) {
+        return g.swa(il) ? std::min<int64_t>(max_ctx, (int64_t) g.swa_window + 64) : max_ctx;
+    }
     /// The fast decode path (src/core/glm_fast_path.cu) is the default for packs; STRATA_GLM_SLOW=1
     /// keeps the correctness-first per-op path (the reference the fast path is checked against).
     bool fast() const { return fast_ != nullptr; }
@@ -220,6 +237,7 @@ private:
     // per-layer state offsets, in floats into state_ (-1: the layer has no such state)
     std::vector<int64_t> kda_S_, kda_conv_, dsa_lat_, dsa_ik_, dsa_ig_, dsa_pool_;
     std::vector<int64_t> gqa_kv_;                 // hy_v3: per layer region a of the K / V records (floats into state_), -1 none
+    std::vector<int64_t> mimo_k_, mimo_v_;        // mimo2: per layer its FP16 K / V records (floats into state_), -1 none
     // hy_v3's position-major K / V records (glm_fast.hpp GqaKv): a record's bytes, each layer's offset inside it, the
     // first position of region b - the expert pool's lendable tail (xpool), lent to the cache as the context grows
     // (kv_ensure) and back when it shrinks (kv_trim) - its bytes, and the positions lent so far ([p0, kv_lent_))
@@ -417,6 +435,10 @@ public:
     void kv_trim(int64_t keep);                             // ... and handed back to the pool beyond keep
     // a layer's view of the K / V records
     strata::kernels::glmf::GqaKv kv_view(int il) const;
+    strata::kernels::mimo::Kv mimo_view(int il) const;   // mimo2: a layer's records (a ring for a window layer)
+    std::vector<std::pair<int64_t, int64_t>> running_runs() const;   // the snapshot's (state_ offset, floats) runs
+    int64_t running_floats() const;
+    bool fast_mimo(int il, int64_t p, std::string& err);  // mimo2: one attention mixer (x -> mixer)
     // the slots of the pool's lendable tail whose memory meets [lo, hi): lent (to the prompt path: kLent, to the cache:
     // kKvLent) - their experts moved over colder main-slot ones or parked in the RAM tier
     bool lend_range(const uint8_t* lo, const uint8_t* hi, char state, uint64_t& moved, uint64_t& dropped, std::string& err);

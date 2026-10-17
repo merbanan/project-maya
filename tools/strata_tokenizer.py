@@ -63,6 +63,19 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
+# The `qwen2` pre-tokenizer (MiMo-V2.x; llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_QWEN2): qwen35's pattern without the
+# `\p{M}` classes - a combining mark attaches to the following punctuation run, as in glm4.  Merges apply (no
+# ignore_merges); single digits.
+QWEN2_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 # The `glm4`/`glm5` pre-tokenizer, transcribed from llama-vocab.cpp L406-410 at the vendored pin
 # (LLAMA_VOCAB_PRE_TYPE_CHATGLM4).  Two differences from qwen35, both load-bearing:
 #   * the digit run is `\p{N}{1,3}` - a 4-digit number splits 3+1, not as one whole run;
@@ -99,14 +112,21 @@ HUNYUAN_DENSE_PATTERNS = (
 
 
 class Tokenizer:
+    def pattern(self) -> str:
+        """The single pre-tokenizer pattern of this scheme (hunyuan-dense applies its list in turn instead)."""
+        if self.ignore_merges:
+            return GLM_PATTERN
+        return QWEN2_PATTERN if self.pre == "qwen2" else QWEN35_PATTERN
+
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
                  pre: str = "qwen35", special_ids: dict[str, int] | None = None):
         self.tokens = tokens
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5", "hunyuan-dense"):
-            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, hunyuan-dense" % pre)
+        if pre not in ("qwen35", "qwen2", "glm4", "glm5", "hunyuan-dense"):
+            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, qwen2, glm4, glm5, hunyuan-dense"
+                             % pre)
         # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
         self.ignore_merges = pre in ("glm4", "glm5")
         self.token_types = token_types
@@ -126,7 +146,7 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN)
+        self._re = regex.compile(self.pattern())
         self._seq = [regex.compile(r) for r in HUNYUAN_DENSE_PATTERNS] if pre == "hunyuan-dense" else None
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
@@ -367,10 +387,11 @@ def extract(gguf_path, out_dir) -> dict:
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
         "ignore_merges": tk.ignore_merges,
-        "pre_pattern": GLM_PATTERN if tk.ignore_merges else QWEN35_PATTERN,
+        "pre_pattern": tk.pattern(),
         "pre_patterns": list(HUNYUAN_DENSE_PATTERNS) if tk.pre == "hunyuan-dense" else None,
         "pre_pattern_source": (".ref/llama.cpp src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4; "
                                "glm4/glm5 set ignore_merges)" if tk.ignore_merges else
+                               "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_QWEN2)" if tk.pre == "qwen2" else
                                ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")

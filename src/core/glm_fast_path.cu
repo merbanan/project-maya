@@ -63,6 +63,7 @@
 #endif
 
 namespace gf = strata::kernels::glmf;
+namespace mimo = strata::kernels::mimo;
 
 // Keeps the GPU out of its idle P-state for ns nanoseconds.  A consumer card at P8 drops its PCIe link (Gen1 on an
 // RTX 4070 Ti SUPER / 5070 Ti), and copies alone do not wake it, so a link timed at idle reads 3-8x slower than it
@@ -673,12 +674,19 @@ bool Glm5Model::fast_setup(std::string& err) {
             }
             Ly.attn_norm = f32("attn_norm.weight");
             Ly.ffn_norm = f32("ffn_norm.weight");
+            if (g.mimo()) {
+                // mimo2: the fused q/k/v projection (in Ly.q), no q/k norms; a window layer's attention sinks
+                Ly.q = q("attn_qkv.weight");
+                Ly.out = q("attn_output.weight");
+                if (w_.count(P + "attn_sinks.weight") != 0) Ly.sinks = f32("attn_sinks.weight");
+            } else {
             Ly.q = q("attn_q.weight");
             Ly.k = q("attn_k.weight");
             Ly.v = q("attn_v.weight");
             Ly.out = q("attn_output.weight");
             Ly.q_norm = f32("attn_q_norm.weight");
             Ly.k_norm = f32("attn_k_norm.weight");
+            }
         } else if (is_mtp) {
             // no hyper-connections: eh_proj in, plain residuals, the shared head's norm out
             Ly.eh = q("nextn.eh_proj.weight");
@@ -736,9 +744,11 @@ bool Glm5Model::fast_setup(std::string& err) {
             // (llama.cpp's hy_v3 GGUFs name the selection bias exp_probs_b, ds4's and GLM's exp_probs_b.bias)
             Ly.router_bias = w_.count(P + "exp_probs_b.bias") == 0 && w_.count(P + "exp_probs_b") != 0
                                  ? f32("exp_probs_b") : f32("exp_probs_b.bias");
-            Ly.sh_gate = q("ffn_gate_shexp.weight");
-            Ly.sh_up = q("ffn_up_shexp.weight");
-            Ly.sh_down = q("ffn_down_shexp.weight");
+            if (g.n_shared > 0) {   // (mimo2 has none)
+                Ly.sh_gate = q("ffn_gate_shexp.weight");
+                Ly.sh_up = q("ffn_up_shexp.weight");
+                Ly.sh_down = q("ffn_down_shexp.weight");
+            }
             const auto& nl = pack_layers_[(size_t) il];
             if (nl.layer < 0) {
                 missing += P + "native experts ";
@@ -855,7 +865,19 @@ bool Glm5Model::fast_setup(std::string& err) {
         err = "glm fast: the activation arena overflowed its estimate";
         return false;
     }
-    if (g.gqa()) {
+    if (g.mimo()) {
+        // mimo2: the fused projection's row (q, the widest layer's k and v), the attention output, decode's split parts
+        const size_t qkv = (size_t) g.n_head * g.head_dim + (size_t) g.n_kv * (g.head_dim + g.v_dim);
+        const size_t of = (size_t) g.n_head * g.v_dim;
+        const size_t sf = mimo::attn_scratch_floats(g.n_head, 1, max_ctx_);
+        if (cudaMalloc(&F->gq, (qkv + of + sf) * sizeof(float)) != cudaSuccess) {
+            err = "glm fast: the attention buffers did not allocate";
+            return false;
+        }
+        F->gk = F->gq + qkv;   // (the attention output)
+        F->gv = nullptr;
+        F->gscr = F->gk + of;
+    } else if (g.gqa()) {
         const size_t qf = (size_t) g.n_head * g.head_dim, kf = (size_t) g.n_kv * g.head_dim;
         const int max_keys = (int) std::max<int64_t>(max_ctx_, kvs_ != nullptr ? (int64_t) kvs_->sel.max_sel * gf::kGqaPage : 0);
         const size_t sf = gf::gqa_attn_scratch_floats(g.n_head, max_keys);
@@ -3737,15 +3759,17 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     const auto& Ly = F->L[(size_t) il];
     const int FFs = g.n_ff_exp * g.n_shared;
     gf::MvJob j[gf::kMaxMvJobs];
-    int nj = 3;
+    int nj = 1;
     // a router job: BF16 (GLM's packs) or F32 (hy_v3's, as its GGUF stores it)
     const auto rjob = [&](const FastState::Layer& La, float* y) -> gf::MvJob {
         if (La.router32 != nullptr) return {La.router32, nullptr, F->x, y, nullptr, 1.0f, gf::kTypeF32, g.n_embd, g.n_expert};
         return {La.router, nullptr, F->x, y, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.n_expert};
     };
     j[0] = rjob(Ly, F->rlog);
-    j[1] = {Ly.sh_gate.q, F->xq, nullptr, F->sh_g, nullptr, 1.0f, Ly.sh_gate.type, g.n_embd, FFs};
-    j[2] = {Ly.sh_up.q, F->xq, nullptr, F->sh_u, nullptr, 1.0f, Ly.sh_up.type, g.n_embd, FFs};
+    if (FFs > 0) {   // (mimo2 has no shared expert)
+        j[nj++] = {Ly.sh_gate.q, F->xq, nullptr, F->sh_g, nullptr, 1.0f, Ly.sh_gate.type, g.n_embd, FFs};
+        j[nj++] = {Ly.sh_up.q, F->xq, nullptr, F->sh_u, nullptr, 1.0f, Ly.sh_up.type, g.n_embd, FFs};
+    }
     // the next layer's router on THIS layer's FFN input: its experts, one layer early
     // (only with prefetch on: the prediction costs a router GEMV and a second top-k per layer)
     const bool pred = F->max_pf > 0 && il + 1 < l1_ && F->L[(size_t) il + 1].moe;
@@ -3922,6 +3946,43 @@ bool Glm5Model::fast_gqa(int il, int64_t p, std::string& err) {
     gf::MvJob o = {Ly.out.q, F->attn_q, nullptr, F->mixer, nullptr, 1.0f, Ly.out.type, QD, g.n_embd};
     if (!gf::mv(&o, 1, s)) { err = "glm fast: gqa output"; return false; }
     if (F->prof_on) F->mark("gqa_out_mv");
+    return true;
+}
+
+// ---- mimo2's attention: the fused projection, rope + the records, attention over the window or the context (with
+// the window layers' sinks), the output projection scaled by value_scale
+mimo::Kv Glm5Model::mimo_view(int il) const {
+    mimo::Kv v;
+    v.k = (void*) (state_ + mimo_k_[(size_t) il]);
+    v.v = (void*) (state_ + mimo_v_[(size_t) il]);
+    v.n_kv = g_.n_head_kv[(size_t) il];
+    v.cap = (int) mimo_kv_cap(g_, il, max_ctx_);
+    v.ring = g_.swa(il);
+    v.pos0 = 0;
+    return v;
+}
+
+bool Glm5Model::fast_mimo(int il, int64_t p, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const auto& Ly = F->L[(size_t) il];
+    const int nkv = g.n_head_kv[(size_t) il];
+    const int QKV = g.n_head * g.head_dim + nkv * (g.head_dim + g.v_dim), OD = g.n_head * g.v_dim;
+    gf::MvJob j = {Ly.q.q, F->xq, F->x, F->gq, nullptr, 1.0f, Ly.q.type, g.n_embd, QKV};
+    if (!gf::mv(&j, 1, s)) { err = "glm fast: mimo2 q/k/v projection"; return false; }
+    if (F->prof_on) F->mark("mimo_qkv_mv");
+    const mimo::Kv kv = mimo_view(il);
+    const bool w = g.swa(il);
+    mimo::prep(F->gq, QKV, 1, p, g.n_head, g.n_rot, w ? g.rope_base_swa : g.rope_base, kv, s);
+    if (F->prof_on) F->mark("mimo_prep");
+    mimo::attn(F->gq, QKV, 1, p, g.n_head, kv, w ? g.swa_window : 0, Ly.sinks, 1.0f / std::sqrt((float) g.head_dim),
+               g.v_scale, F->gk, OD, F->gscr, s);
+    if (F->prof_on) F->mark("mimo_attn");
+    gf::quantize_q8_1(F->gk, F->attn_q, OD, s);
+    gf::MvJob o = {Ly.out.q, F->attn_q, nullptr, F->mixer, nullptr, 1.0f, Ly.out.type, OD, g.n_embd};
+    if (!gf::mv(&o, 1, s)) { err = "glm fast: mimo2 output"; return false; }
+    if (F->prof_on) F->mark("mimo_out_mv");
     return true;
 }
 
@@ -4314,7 +4375,7 @@ bool Glm5Model::fast_layers_gqa(int64_t p, std::string& err) {
             if (il != l0_) fast_dump(s, "l_out-" + std::to_string(il - 1), R, g.n_embd);
             fast_dump(s, "attn_norm-" + std::to_string(il), F->x, g.n_embd);
         }
-        if (!fast_gqa(il, p, err)) return false;
+        if (!(g.mimo() ? fast_mimo(il, p, err) : fast_gqa(il, p, err))) return false;
         if (F->cpu_deferred) {   // the previous layer's CPU-lane rows, after this attention (STRATA_GLM_DEFER_CPU)
             gf::moe_cpu_wait(F->md, g.n_embd, F->mixer, s);
             F->cpu_deferred = false;
@@ -5152,6 +5213,28 @@ std::vector<int> Glm5Model::dsa_layers() const {
     return r;
 }
 
+// The RUNNING state a snapshot copies, as (state_ offset, floats) runs: each KDA layer's recurrent state + conv
+// history, and mimo2's window layers' K / V rings (a ring is overwritten by later positions, so rewinding needs it)
+std::vector<std::pair<int64_t, int64_t>> Glm5Model::running_runs() const {
+    const Glm5Geometry& g = g_;
+    std::vector<std::pair<int64_t, int64_t>> r;
+    const int64_t run = (int64_t) g.d_inner() * g.kda_head_dim + (int64_t) 3 * g.d_inner() * (g.d_conv - 1);
+    for (int il = l0_; il < l1_; ++il) {
+        if (g.is_recr(il)) r.push_back({kda_S_[(size_t) il], run});
+        if (g.swa(il)) {
+            const int64_t cap = mimo_kv_cap(g, il, max_ctx_), nkv = g.n_head_kv[(size_t) il];
+            r.push_back({mimo_k_[(size_t) il], cap * nkv * g.head_dim / 2});
+            r.push_back({mimo_v_[(size_t) il], cap * nkv * g.v_dim / 2});
+        }
+    }
+    return r;
+}
+int64_t Glm5Model::running_floats() const {
+    int64_t n = 0;
+    for (const auto& r : running_runs()) n += r.second;
+    return n;
+}
+
 // the open pool's ik / ig rows at snap_pos_ (pool start .. + kpool - 2: contiguous in the ring, which is a multiple
 // of kpool) <-> snap_pool_; on fast_->cs
 void Glm5Model::snap_pool_copy(bool restore) {
@@ -5179,23 +5262,21 @@ void Glm5Model::snap_pool_copy(bool restore) {
 bool Glm5Model::snapshot_save() {
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr) return false;
-        const Glm5Geometry& g = m->g_;
-        const size_t run = (size_t) g.d_inner() * g.kda_head_dim + (size_t) 3 * g.d_inner() * (g.d_conv - 1);
-        int n_rec = 0;
-        for (int il = m->l0_; il < m->l1_; ++il) n_rec += g.is_recr(il);
+        const auto runs = m->running_runs();
+        const int64_t sf = m->running_floats();
         cudaSetDevice(m->dev_);
-        if (m->snap_ == nullptr && n_rec > 0 &&
-            cudaMalloc(&m->snap_, (size_t) n_rec * run * sizeof(float)) != cudaSuccess) {
+        if (m->snap_ == nullptr && sf > 0 && cudaMalloc(&m->snap_, (size_t) sf * sizeof(float)) != cudaSuccess) {
             cudaGetLastError();
             m->snap_ = nullptr;
             cudaSetDevice(dev_);
             return false;
         }
-        int k = 0;
-        for (int il = m->l0_; il < m->l1_; ++il)
-            if (g.is_recr(il))
-                cudaMemcpyAsync(m->snap_ + (size_t) k++ * run, m->state_ + m->kda_S_[(size_t) il], run * sizeof(float),
-                                cudaMemcpyDeviceToDevice, m->fast_->cs);
+        int64_t at = 0;
+        for (const auto& r : runs) {
+            cudaMemcpyAsync(m->snap_ + at, m->state_ + r.first, (size_t) r.second * sizeof(float),
+                            cudaMemcpyDeviceToDevice, m->fast_->cs);
+            at += r.second;
+        }
         m->snap_pos_ = pos_;
         m->snap_pool_copy(false);
         cudaStreamSynchronize(m->fast_->cs);
@@ -5212,14 +5293,13 @@ bool Glm5Model::snapshot_restore() {
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
         if (m->fast_ == nullptr || m->snap_pos_ < 0) return false;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
-        const Glm5Geometry& g = m->g_;
-        const size_t run = (size_t) g.d_inner() * g.kda_head_dim + (size_t) 3 * g.d_inner() * (g.d_conv - 1);
         cudaSetDevice(m->dev_);
-        int k = 0;
-        for (int il = m->l0_; il < m->l1_; ++il)
-            if (g.is_recr(il))
-                cudaMemcpyAsync(m->state_ + m->kda_S_[(size_t) il], m->snap_ + (size_t) k++ * run, run * sizeof(float),
-                                cudaMemcpyDeviceToDevice, m->fast_->cs);
+        int64_t at = 0;
+        for (const auto& r : m->running_runs()) {
+            cudaMemcpyAsync(m->state_ + r.first, m->snap_ + at, (size_t) r.second * sizeof(float),
+                            cudaMemcpyDeviceToDevice, m->fast_->cs);
+            at += r.second;
+        }
         m->snap_pool_copy(true);
         cudaStreamSynchronize(m->fast_->cs);
         m->pos_ = m->snap_pos_;
@@ -5268,6 +5348,15 @@ std::vector<std::pair<int64_t, int64_t>> Glm5Model::slot_gqa_runs(int64_t n) con
     // as well: the save and the load add it to state_)
     std::vector<std::pair<int64_t, int64_t>> r;
     if (!g_.gqa()) return r;
+    if (g_.mimo()) {   // mimo2: the full-context layers' K and V rows of [0, n) (the window rings are in the snapshot)
+        for (int il = l0_; il < l1_; ++il)
+            if (!g_.swa(il)) {
+                const int64_t nkv = g_.n_head_kv[(size_t) il];
+                r.push_back({mimo_k_[(size_t) il], n * nkv * g_.head_dim / 2});
+                r.push_back({mimo_v_[(size_t) il], n * nkv * g_.v_dim / 2});
+            }
+        return r;
+    }
     if (kvs_ != nullptr) {   // streamed: every layer's host records (an offset from state_ as well)
         // (lent records: a run per kGrow positions - each piece a registration of its own)
         const int64_t step = kvs_->lend ? KvStream::kGrow : std::max<int64_t>(1, n);
@@ -5310,8 +5399,8 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
     for (Glm5Model* m : halves) {
         const Glm5Geometry& g = m->g_;
         const int64_t run = (int64_t) g.d_inner() * g.kda_head_dim + (int64_t) 3 * g.d_inner() * (g.d_conv - 1);
-        int32_t n_rec = 0;
-        for (int il = m->l0_; il < m->l1_; ++il) n_rec += g.is_recr(il);
+        const int32_t n_rec = (int32_t) m->running_runs().size();   // (the snapshot's runs: KDA layers, mimo2 rings)
+        const int64_t sf = m->running_floats();
         auto runs = slot_dsa_runs(g, m->fast_mode_, m->lat_q8_, m->l0_, m->l1_, m->mtp_il_, m->dsa_lat_, m->dsa_ik_,
                                   m->dsa_ig_, m->dsa_pool_, n);
         const auto gruns = m->slot_gqa_runs(n);   // hy_v3's K / V rows
@@ -5325,7 +5414,7 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
         cudaStreamSynchronize(m->fast_->cs);
         t_sync += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tq).count();
         std::vector<std::pair<const float*, int64_t>> src;
-        if (n_rec > 0) src.push_back({m->snap_, (int64_t) n_rec * run});
+        if (sf > 0) src.push_back({m->snap_, sf});
         const int64_t pool_rows = (int64_t) m->dsa_layers().size() * 2 * (g.idx_kpool - 1) * g.idx_key;
         if (pool_rows > 0) src.push_back({m->snap_pool_, pool_rows});
         for (const auto& r : runs) src.push_back({m->state_ + r.first, r.second});
@@ -5386,8 +5475,8 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
         }
         const Glm5Geometry& g = m->g_;
         const int64_t run = (int64_t) g.d_inner() * g.kda_head_dim + (int64_t) 3 * g.d_inner() * (g.d_conv - 1);
-        int32_t n_rec = 0;
-        for (int il = m->l0_; il < m->l1_; ++il) n_rec += g.is_recr(il);
+        const int32_t n_rec = (int32_t) m->running_runs().size();   // (the snapshot's runs: KDA layers, mimo2 rings)
+        const int64_t sf = m->running_floats();
         auto runs = slot_dsa_runs(g, m->fast_mode_, m->lat_q8_, m->l0_, m->l1_, m->mtp_il_, m->dsa_lat_, m->dsa_ik_,
                                   m->dsa_ig_, m->dsa_pool_, n);
         const auto gruns = m->slot_gqa_runs(n);   // hy_v3's K / V rows
@@ -5412,8 +5501,7 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
             return false;
         }
         cudaStreamSynchronize(m->fast_->cs);
-        if (m->snap_ == nullptr && n_rec > 0 &&
-            cudaMalloc(&m->snap_, (size_t) n_rec * run * sizeof(float)) != cudaSuccess) {
+        if (m->snap_ == nullptr && sf > 0 && cudaMalloc(&m->snap_, (size_t) sf * sizeof(float)) != cudaSuccess) {
             cudaGetLastError();
             m->snap_ = nullptr;
             cudaSetDevice(dev_);
@@ -5421,7 +5509,7 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
             return false;
         }
         std::vector<std::pair<float*, int64_t>> dst;
-        if (n_rec > 0) dst.push_back({m->snap_, (int64_t) n_rec * run});
+        if (sf > 0) dst.push_back({m->snap_, sf});
         const int64_t pool_rows = (int64_t) m->dsa_layers().size() * 2 * (g.idx_kpool - 1) * g.idx_key;
         if (pool_rows > 0) {
             if (m->snap_pool_ == nullptr && cudaMalloc(&m->snap_pool_, (size_t) pool_rows * sizeof(float)) != cudaSuccess) {
