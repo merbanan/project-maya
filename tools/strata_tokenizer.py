@@ -63,6 +63,19 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
+# The `qwen2` pre-tokenizer (MiMo-V2.x; llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_QWEN2): qwen35's pattern without the
+# `\p{M}` classes - a combining mark attaches to the following punctuation run, as in glm4.  Merges apply (no
+# ignore_merges); single digits.
+QWEN2_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 # The `glm4`/`glm5` pre-tokenizer, transcribed from llama-vocab.cpp L406-410 at the vendored pin
 # (LLAMA_VOCAB_PRE_TYPE_CHATGLM4).  Two differences from qwen35, both load-bearing:
 #   * the digit run is `\p{N}{1,3}` - a 4-digit number splits 3+1, not as one whole run;
@@ -83,16 +96,37 @@ GLM_PATTERN = (
     r"|\s+"
 )
 
+# The `hunyuan-dense` pre-tokenizer (Tencent Hy3, llama.cpp LLAMA_VOCAB_PRE_TYPE_HUNYUAN_DENSE, shared with
+# deepseek3-llm): THREE patterns applied in turn, each splitting the pieces the previous one left - its matches AND
+# the gaps between them stay pieces (llama.cpp's unicode_regex_split).  No ignore_merges: every piece goes through BPE.
+HUNYUAN_DENSE_PATTERNS = (
+    r"\p{N}{1,3}",
+    r"[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+",
+    r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+"
+    r"|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
+    r"| ?[\p{P}\p{S}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+",
+)
+
 
 class Tokenizer:
+    def pattern(self) -> str:
+        """The single pre-tokenizer pattern of this scheme (hunyuan-dense applies its list in turn instead)."""
+        if self.ignore_merges:
+            return GLM_PATTERN
+        return QWEN2_PATTERN if self.pre == "qwen2" else QWEN35_PATTERN
+
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
                  pre: str = "qwen35", special_ids: dict[str, int] | None = None):
         self.tokens = tokens
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5"):
-            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5" % pre)
+        if pre not in ("qwen35", "qwen2", "glm4", "glm5", "hunyuan-dense"):
+            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, qwen2, glm4, glm5, hunyuan-dense"
+                             % pre)
         # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
         self.ignore_merges = pre in ("glm4", "glm5")
         self.token_types = token_types
@@ -112,7 +146,8 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN)
+        self._re = regex.compile(self.pattern())
+        self._seq = [regex.compile(r) for r in HUNYUAN_DENSE_PATTERNS] if pre == "hunyuan-dense" else None
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -203,7 +238,7 @@ class Tokenizer:
         if len(memo) > 300_000:
             memo.clear()
         out: list[int] = []
-        for piece in self._re.findall(text):
+        for piece in self._pieces(text):
             hit = memo.get(piece)
             if hit is not None:
                 out.extend(hit)
@@ -221,12 +256,38 @@ class Tokenizer:
                 for tok in self._bpe(mapped):
                     i = self.ids.get(tok)
                     if i is None:
-                        raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
+                        if self._seq is None:
+                            raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
+                        # llama.cpp's BPE (llm_tokenizer_bpe_session::tokenize): a symbol outside the vocabulary
+                        # becomes its single-byte tokens, and a byte without one is DROPPED (Hy3's vocabulary has
+                        # no token for '\r')
+                        got.extend(self.ids[c] for c in tok if c in self.ids)
+                        continue
                     got.append(i)
                 ids = tuple(got)
             memo[piece] = ids
             out.extend(ids)
         return out
+
+    def _pieces(self, text: str) -> list[str]:
+        """The pre-tokenizer's pieces: one pattern's matches, or (hunyuan-dense) the pattern sequence's splits."""
+        if self._seq is None:
+            return self._re.findall(text)
+        pieces = [text]
+        for r in self._seq:
+            nxt = []
+            for p in pieces:
+                pos = 0
+                for m in r.finditer(p):
+                    if m.start() > pos:
+                        nxt.append(p[pos:m.start()])
+                    if m.end() > m.start():
+                        nxt.append(m.group(0))
+                    pos = m.end()
+                if pos < len(p):
+                    nxt.append(p[pos:])
+            pieces = nxt
+        return pieces
 
     def _encode_segment(self, text: str) -> list[int]:
         """_encode_plain, remembering long segments (the text between two special tokens: a message, a tool result):
@@ -308,6 +369,11 @@ class Tokenizer:
             for ch in self.tokens[i]:
                 v = UNICODE_TO_BYTE.get(ch)
                 if v is None:
+                    # a special token is stored as its text, not in the byte alphabet (Hy3's
+                    # <｜hy_eos:opensource｜> has full-width bars): it decodes to that text, as in llama.cpp
+                    if i in self.special_tokens.values():
+                        raw = bytearray(self.tokens[i].encode("utf-8"))
+                        break
                     raise KeyError("token %d contains a character outside the byte alphabet: %r" % (i, ch))
                 raw.append(v)
             b = cache[i] = bytes(raw)
@@ -333,9 +399,11 @@ def extract(gguf_path, out_dir) -> dict:
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
         "ignore_merges": tk.ignore_merges,
-        "pre_pattern": GLM_PATTERN if tk.ignore_merges else QWEN35_PATTERN,
+        "pre_pattern": tk.pattern(),
+        "pre_patterns": list(HUNYUAN_DENSE_PATTERNS) if tk.pre == "hunyuan-dense" else None,
         "pre_pattern_source": (".ref/llama.cpp src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4; "
                                "glm4/glm5 set ignore_merges)" if tk.ignore_merges else
+                               "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_QWEN2)" if tk.pre == "qwen2" else
                                ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")

@@ -73,6 +73,9 @@ int main(int argc, char** argv) {
 
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 0;                       // the CPU backend IS the point: it is the second oracle
+    // a GGUF that declares NextN/MTP layers (hy_v3, glm5-next) loads only with them: without, llama.cpp counts its
+    // skipped draft tensors as missing ("wrong number of tensors")
+    mp.load_mtp = true;
     llama_model* model = llama_model_load_from_file(argv[1], mp);
     if (!model) {
         std::fprintf(stderr, "llm_logits_dump: model load failed\n");

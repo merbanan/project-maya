@@ -12,6 +12,8 @@
 namespace strata::kernels {
 
 bool dequant_bf16_supported(int ggml_type) noexcept;
+/// Whether dequant_f16 serves this type (dequant_bf16's types and the i-quants: IQ1_M, IQ2_XXS/XS/S, IQ3_XXS/S).
+bool dequant_f16_supported(int ggml_type) noexcept;
 
 /// `rows` rows of `cols` values starting at block row `row0` (so a caller can dequantize a slice of a tensor).
 void dequant_bf16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,

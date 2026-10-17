@@ -57,6 +57,10 @@ bool mv_supported(int type);
 /// while it is non-zero - a pipelined window's tokens after a wrong draft (skip_gate sets it from the host's word);
 /// nullptr (the default): no check.
 void set_skip(const int* flag);
+/// The lossy route options' defaults for a model (Glm5Geometry::arch): STRATA_GLM_ROUTE_AFFINITY 0.02 for GLM, the
+/// route tail swap STRATA_GLM_ROUTE_SWAP=2 for hy_v3, neither for mimo2 (each measured on its own model).  Before the
+/// first route; the variables override it.
+void route_defaults(int arch);
 /// One thread: *flag = (*host_from <= t) - token t of the window is past the first wrong draft (`host_from`: pinned,
 /// host-mapped, written by the host while the window runs).
 void skip_gate(const volatile int* host_from, int t, int* flag, cudaStream_t s);
@@ -315,15 +319,25 @@ void moe_prefetch(const MoeDev& d, size_t blob_bytes, cudaStream_t s);
 /// Waits (on the device) for the host's response when the last route had misses, then applies it.
 void moe_wait(const MoeDev& d, int n_embd, cudaStream_t s);
 /// Copies every planned expert with a fetch source from the RAM tier (host-mapped) into its VRAM slot.
-void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s);
+/// blocks > 0: that many thread blocks (a fetch on a side stream beside the expert kernels needs only a few to keep the
+/// PCIe link busy); 0: one a multiprocessor.
+void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s, int blocks = 0);
+/// FETCH OVERLAP: the route's plan split in two (device, 8 entries each) - res = the planned experts already in VRAM
+/// (no fetch source), fet = the ones the fetch kernel pulls over PCIe.  A MoeDev whose plan_ptr is res (fet) makes
+/// moe_gate_up / moe_down run only those, so the resident experts compute while the fetch is still on the link.
+void moe_split_plan(const MoeDev& d, int k, unsigned long long* res, unsigned long long* fet, cudaStream_t s);
 /// The routed gate/up rows of the planned (resident) experts, the clamped swiglu, the q8_1 of h; and (sh_down and
 /// sh_out given) the shared expert's down rows over its h in sh_hq into sh_out, by extra blocks of the same launch.
 void moe_gate_up(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, float limit, const void* xq, void* hq,
                  const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s);
 /// out[r] = (sum_i w_i * down_i(r) . h_i over the resident experts) [+ cpu_part[r]] + sh_out[r] (when given).
 /// down_off = the byte offset of the down rows inside an expert blob ([gate | up | down]).
+/// part_mode (FETCH OVERLAP, part_buf = 8 x n_embd floats): 1 = only store each plan entry's down row values in
+/// part_buf (0 for an entry this launch does not compute) and write nothing to out; 2 = compute this launch's
+/// entries, take the others' values from part_buf, then the combine as with 0 - the same per-entry values summed in
+/// the same plan order, so two launches give bit for bit what one launch gives.  0: the one launch.
 void moe_down(int d_type, const MoeDev& d, int k, int n_embd, int n_ff, size_t down_off, const void* hq,
-              const float* sh_out, float* out, cudaStream_t s);
+              const float* sh_out, float* out, cudaStream_t s, float* part_buf = nullptr, int part_mode = 0);
 /// moe_gate_up then moe_down for d.mt_T tokens in two launches (a verify window's tokens, each with its own plan and
 /// rows at d's mt_ strides): every token's arithmetic is its moe_gate_up / moe_down's, the blocks of all the tokens for
 /// a chunk of rows issued together - an expert two tokens route reads its rows once from DRAM.  AMD builds only (the
@@ -357,5 +371,93 @@ void embed_tok(const void* table, int type, int n_rows, const int* tok, int n_em
 /// argmax over n floats -> *out (device int).  Ties: lowest index.  map: an index i >= map_from is written as
 /// map[i - map_from] (a draft head's gathered rows -> their token ids).
 void argmax(const float* x, int n, int* out, cudaStream_t s, const int* map = nullptr, int map_from = 0);
+// ---------------------------------------------------------------- hy_v3's grouped-query attention (glm_gqa.cu)
+// head_dim 128.  The cache is POSITION-MAJOR: a position's record holds every layer's K rows then V rows (n_kv each).
+// The mode: 0 FP16 (256 bytes a row); 1 INT8 codes + an FP16 scale per 32 values (136 bytes); 2 K8V4 - INT8 K and 4-bit
+// V (two codes a byte + a scale per 32: 72 bytes), the V rows Walsh-Hadamard rotated (glm_gqa.cu); 3..5 TurboQuant -
+// TQ4 (4-bit K and V), TQ6V4 (6-bit K, 4-bit V), TQ4V3 (4-bit K, 3-bit V), TQ6V3 (6-bit K, 3-bit V): rotated rows,
+// Lloyd-Max levels, a scale a
+// row (68 / 100 / 52 bytes for 4 / 6 / 3 bits).  Positions below p0 live in region a (record pos at a + pos * rec), the
+// rest in region b, downward (at b - (pos - p0) * rec).
+constexpr int kGqaFp16 = 0, kGqaInt8 = 1, kGqaK8V4 = 2, kGqaTq4 = 3, kGqaTq6V4 = 4, kGqaTq4V3 = 5, kGqaTq6V3 = 6;
+struct GqaKv {
+    void* a = nullptr;
+    void* b = nullptr;
+    long long p0 = 0, rec = 0;            // region a's positions; a record's bytes
+    int k_off = 0;                        // this layer's K rows in a record (its V rows follow them)
+    int kk = 0, vk = 0, n_kv = 8, max_ctx = 0;   // K's and V's row formats (glm_gqa.cu kF16 .. kT6)
+    // KV streaming (GqaStream): the rows of a cached page are in slots (page table ptab, -1: not cached); with sel set
+    // the decode attention reads only the pages sel names (*nsel of them, at most max_sel) - all cached by then
+    const int* ptab = nullptr;
+    const uint8_t* slots = nullptr;
+    const int* sel = nullptr;
+    const int* nsel = nullptr;
+    int max_sel = 0;
+};
+
+// ---- KV streaming: the whole cache in pinned host memory (a layer's records [max_ctx][slice], device-mapped), in VRAM
+// a cache of R pages of kGqaPage positions (slots, page table, CLOCK replacement - all on the device) and every page's
+// summary (the per-dimension min and max of its K rows, FP16).  A decode step scores every page against q (Quest: the
+// bound sum_d max(q_d min_d, q_d max_d) per query head, relative to the head's best page, the max over the heads),
+// keeps the best budget pages + the first page + the recent ones, loads the missing ones from host memory and attends
+// to those pages only.
+constexpr int kGqaPage = 64;
+struct GqaStream {
+    uint8_t* host = nullptr;    // [max_ctx][slice] (device pointer of pinned, mapped memory)
+    uint8_t* slots = nullptr;   // [R][kGqaPage][slice]
+    int* ptab = nullptr;        // [max_pages]: page -> slot, -1
+    int* spage = nullptr;       // [R]: slot -> page, -1
+    int* sepoch = nullptr;      // [R]: the last step that used the slot
+    int* sref = nullptr;        // [R]: CLOCK's reference bit (LRFU: the slot's score, a float's bits)
+    int* ctl = nullptr;         // [3]: the clock hand, the step counter, the pages read so far (in a 256-byte block)
+    void* summ = nullptr;       // [max_pages][n_kv][2][128] FP16: min, max
+    int R = 0, max_pages = 0;
+    int lrfu = 0;               // STRATA_GLM_KV_EVICT=lrfu: the victim is the lowest decayed-frequency score, not CLOCK's
+};
+struct GqaSelBufs {             // one decode step's selection (shared by the layers, which run one after another)
+    int* sel = nullptr;         // [max_sel] page ids
+    int* nsel = nullptr;
+    int* miss = nullptr;        // [max_sel] the pages to load, and their slots
+    int* mslot = nullptr;
+    int* nmiss = nullptr;
+    float* ub = nullptr;        // [n_head][max_pages]
+    unsigned int* hm = nullptr; // [n_head]: each head's best bound (order-preserving keys), reset per selection
+    float* sc = nullptr;        // [max_pages]: the pages' scores
+    int max_sel = 0;
+};
+/// the summaries of the pages holding positions [pos_lo, pos_hi) from the K rows of src (a plain view: host memory or
+/// a staging copy; a page's rows from its start to pos_hi)
+void gqa_stream_summarize(const GqaKv& src, const GqaStream& st, int pos_lo, int pos_hi, cudaStream_t s);
+/// the pages a decode step at n_pos positions attends to: budget_pages by score + the first sink_pages + the last
+/// recent_pages (every page when they cover them all) -> b.sel / b.nsel
+void gqa_stream_select(const float* q, int n_head, int n_kv, const GqaStream& st, int n_pos, int budget_pages,
+                       int sink_pages, int recent_pages, const GqaSelBufs& b, cudaStream_t s);
+/// every selected page cached (missing ones over PCIe into CLOCK's victims, never a slot this step uses)
+void gqa_stream_resolve(const GqaStream& st, int slice, const GqaSelBufs& b, cudaStream_t s);
+/// pages [page_lo, page_hi) no longer cached (their rows were rewritten in host memory)
+void gqa_stream_invalidate(const GqaStream& st, int page_lo, int page_hi, cudaStream_t s);
+/// nothing cached
+void gqa_stream_reset(const GqaStream& st, cudaStream_t s);
+/// a mode's name (STRATA_GLM_KV: fp16 int8 k8v4 tq4 tq6v4 tq4v3 tq6v3), and the mode of a name (-1: none)
+const char* gqa_kv_mode_name(int mode);
+int gqa_kv_mode_parse(const char* s);
+/// One layer's part of a record (its K and V rows), and the view of a layer: a / b the regions' record 0, p0 the first
+/// position of region b, rec the record's bytes (every layer), layer_off this layer's offset inside a record.
+size_t gqa_kv_rec_bytes(int n_kv, int mode);
+GqaKv gqa_kv_view(void* a, void* b, int64_t p0, int64_t rec, int64_t layer_off, int n_kv, int64_t max_ctx, int mode);
+/// T rows (q qld floats apart, k / v kld apart) at positions p0 .. p0 + T - 1: q (n_head x 128, in place) and k (n_kv x
+/// 128) take their per-head RMS norm (q_norm / k_norm) and NeoX rope; the rotated k and the raw v go into the cache.
+void gqa_prep(float* q, const float* k, const float* v, int T, int qld, int kld, const float* q_norm,
+              const float* k_norm, float eps, int p0, float rope_base, int n_head, const GqaKv& kv, cudaStream_t s);
+/// One token: softmax(q . K[0..n_pos) / sqrt(128)) . V per query head (head h reads K/V head h / (n_head / n_kv)),
+/// written as the q8_1 of the n_head x 128 output.  scratch: gqa_attn_scratch_floats(n_head, n_pos or more) floats.
+bool gqa_attn(const float* q, const GqaKv& kv, int n_pos, int n_head, float* scratch, void* out_q8_1, cudaStream_t s);
+size_t gqa_attn_scratch_floats(int n_head, int max_pos);
+/// A prompt chunk: row t (position p0 + t) attends to the cache [0, p0 + t]; FP16 output rows `old` halves apart.
+bool gqa_attn_rows(const float* q, int qld, const GqaKv& kv, int p0, int T, int n_head, void* out16, int old,
+                   cudaStream_t s);
+
+/// argmax over n floats -> *out (device int).  Ties: lowest index.
+void argmax(const float* x, int n, int* out, cudaStream_t s);
 
 }  // namespace strata::kernels::glmf

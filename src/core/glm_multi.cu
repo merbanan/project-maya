@@ -42,6 +42,7 @@ void Glm5Model::seq_bind(int s) {
     std::swap(o.dsa_ig, dsa_ig_);
     std::swap(o.dsa_pool, dsa_pool_);
     o.kv = kv_;   // (KV streaming: the bound sequence's stream lives in kv_, its SeqCtx holds none)
+    std::swap(o.gqa_kv, gqa_kv_);
     SeqCtx& n = seq_[(size_t) s];
     state_ = n.state;
     pos_ = n.pos;
@@ -65,6 +66,7 @@ void Glm5Model::seq_bind(int s) {
     std::swap(n.dsa_pool, dsa_pool_);
     kv_ = n.kv;
     n.kv = nullptr;
+    std::swap(n.gqa_kv, gqa_kv_);
     cur_seq_ = s;
 }
 
@@ -86,6 +88,7 @@ uint64_t Glm5Model::seq_layout(int64_t ctx, SeqCtx& c) const {
                                        : (int64_t) g.kv_lora * lat_rows / 2;
     for (auto* v : {&c.kda_S, &c.kda_conv, &c.dsa_lat, &c.dsa_ik, &c.dsa_ig, &c.dsa_pool})
         v->assign((size_t) g.n_layers + 1, 0);
+    c.gqa_kv.assign((size_t) g.n_layers + 1, -1);
     c.ik_ring = (int) std::min<int64_t>(ctx, 8192 + 64);
     const auto dsa = [&](int il) {
         c.dsa_lat[(size_t) il] = floats;
@@ -97,9 +100,17 @@ uint64_t Glm5Model::seq_layout(int64_t ctx, SeqCtx& c) const {
         c.dsa_pool[(size_t) il] = floats;
         floats += (int64_t) g.idx_key * max_pools;
     };
-    if (mtp_il_ >= 0) dsa(mtp_il_);
+    if (g.gqa()) {
+        // hy_v3: the K / V records of the whole context (load_pack's layout with p0 = ctx: several sequences lend none)
+        for (auto& v : c.gqa_kv) v = floats;
+        if (mtp_il_ < 0) c.gqa_kv[(size_t) g.n_layers] = -1;
+        floats += (ctx * kv_rec_ + 255) / 256 * 64;
+    } else if (mtp_il_ >= 0) {
+        dsa(mtp_il_);
+    }
     for (int il = l0_; il < l1_; ++il) {
-        if (g.is_recr(il)) {
+        if (g.gqa()) {
+        } else if (g.is_recr(il)) {
             c.kda_S[(size_t) il] = floats;
             floats += (int64_t) g.d_inner() * g.kda_head_dim;
             c.kda_conv[(size_t) il] = floats;
@@ -127,7 +138,7 @@ bool Glm5Model::seq_alloc_arenas(std::string& err) {
     // the first sequence's layout recomputed must be the one load_pack made, or the others' would be wrong
     SeqCtx check;
     if (seq_layout(max_ctx_, check) != state_bytes_ || check.dsa_pool != dsa_pool_ || check.kda_conv != kda_conv_ ||
-        check.dsa_lat != dsa_lat_ || check.ik_ring != ik_ring_) {
+        check.dsa_lat != dsa_lat_ || check.ik_ring != ik_ring_ || check.gqa_kv != gqa_kv_) {
         err = "glm multi: the state layout does not match load_pack's (this build cannot run STRATA_GLM_SEQS)";
         return false;
     }
@@ -235,7 +246,10 @@ bool Glm5Model::multi_issue(int s, int32_t token, const strata::kernels::Sampler
     if (const float* img = image_row(p)) std::memcpy(c.emb_h, img, (size_t) g.n_embd * sizeof(float));
     cudaSetDevice(dev_);
     cudaMemcpyAsync(F->emb, c.emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
-    gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
+    if (g.gqa())   // one residual stream
+        cudaMemcpyAsync(state_, F->emb, (size_t) g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
+    else
+        gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
     if (!fast_layers(p, false, err)) return false;
     Glm5Model* tail = this;
     const size_t hop = (size_t) g.hc * g.n_embd * sizeof(float);
@@ -254,8 +268,12 @@ bool Glm5Model::multi_issue(int s, int32_t token, const strata::kernels::Sampler
     FastState* FT = tail->fast_;
     SeqCtx& ct = tail->seq_[(size_t) s];
     cudaSetDevice(tail->dev_);
-    gf::head_prep(tail->state_, tail->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FT->head_x, FT->head_xq,
-                  FT->cs);
+    if (g.gqa())
+        gf::rms_q8(tail->state_, nullptr, tail->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FT->head_x,
+                   FT->head_xq, FT->cs);
+    else
+        gf::head_prep(tail->state_, tail->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FT->head_x, FT->head_xq,
+                      FT->cs);
     const WSlot& ow = tail->ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, FT->head_xq, FT->head_x, tail->sc_ + tail->sc_logits, nullptr, 1.0f, ow.type, g.n_embd,
                    g.n_vocab};

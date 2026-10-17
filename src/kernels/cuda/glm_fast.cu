@@ -1156,6 +1156,9 @@ struct MvBatch {
 
 // set_skip: the calling thread's flag for mv / moe_gate_up / moe_down (a pipelined window's enqueue threads)
 thread_local const int* g_skip = nullptr;
+// the lossy route options' defaults for the loaded model (route_defaults)
+float g_route_affinity = 0.0f;
+int g_route_swap = 0;
 
 __global__ void skip_gate_kernel(const volatile int* host_from, int t, int* flag) {
     *flag = *host_from <= t ? 1 : 0;
@@ -2926,6 +2929,8 @@ struct RouteArgs {
                                 // weights is below this (0: none)
     float affinity;             // STRATA_GLM_ROUTE_AFFINITY: added to a VRAM-resident expert's selection score (its
                                 // weight stays its own probability) - LOSSY, it changes which experts run (0: off)
+    int swap_ranks;             // STRATA_GLM_ROUTE_SWAP=<n>: the last n ranks may take a VRAM-resident runner-up
+    float swap_margin;          // STRATA_GLM_ROUTE_SWAP_MARGIN: within this much of the swapped one's selection score
 };
 
 __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_constant__ RouteArgs a) {
@@ -2968,6 +2973,32 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     if (tid == 0)
         for (int i = 0; i < a.k; ++i)
             if (s_ids[i] < 0 || s_ids[i] >= E) atomicMax(&bad, 1);
+    // STRATA_GLM_ROUTE_SWAP=<n> (changes the output): each of the last n ranks whose expert is not in VRAM takes the
+    // best VRAM-resident one of the next 8 ranks whose selection score is within swap_margin of its own - a PCIe or
+    // CPU-lane miss traded for a near tie; the weights follow the new set (renormalised below as any route's)
+    if (a.swap_ranks > 0) {
+        __shared__ int s_cand[8];
+        const int nc = min(8, E - a.k);
+        if (nc > 0) topk_argmax(s_sel, E, nc, s_cand, s_bv, s_bi);
+        if (tid == 0 && nc > 0) {
+            const size_t base = (size_t) a.layer * E;
+            for (int r = a.k - 1; r >= max(0, a.k - a.swap_ranks); --r) {
+                const int id = s_ids[r];
+                if (id < 0 || a.d.tab[base + id] != 0ull) continue;   // (resident already)
+                const float own = s_p[id] + (a.bias ? a.bias[id] : 0.0f);
+                for (int c = 0; c < nc; ++c) {
+                    const int e = s_cand[c];
+                    if (e < 0 || a.d.tab[base + e] == 0ull) continue;
+                    if (s_p[e] + (a.bias ? a.bias[e] : 0.0f) >= own - a.swap_margin) {
+                        s_ids[r] = e;
+                        s_cand[c] = -1;
+                        break;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
     // the NEAR MISSES (STRATA_GLM_ROUTE_LOG only, cache studies): ranks k+1 .. k+near_n by the same selection score -
     // the top k are -inf in s_sel now, so the selection simply goes on (s_sel is rewritten for the prediction below)
     __shared__ int s_near[16];
@@ -3065,6 +3096,22 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     __shared__ unsigned long long s_pp[8], s_cs[8];
     __shared__ int s_npf, s_pfid[8];
     __shared__ unsigned long long s_pfptr[8];
+    // the route's table entries, counts and this layer's spares, read by many threads at once (thread 0's walk below
+    // read them one dependent load after another); it writes every change through to the tables as before
+    __shared__ unsigned long long s_tv[8], s_rv[8], s_sp[kSpares];
+    __shared__ unsigned int s_cnt[8];
+    {
+        const bool counting = a.cpu_plan != 0ull && skip_from > 0;
+        if (tid < a.k) {
+            const size_t key = (size_t) a.layer * E + s_ids[tid];
+            s_tv[tid] = a.d.tab[key];
+            s_rv[tid] = a.d.tab[a.d.n_keys + key];
+            s_cnt[tid] = a.d.dcnt == nullptr ? 0u : counting ? ++a.d.dcnt[key] : a.d.dcnt[key];
+        } else if (tid >= 32 && tid < 32 + kSpares) {
+            s_sp[tid - 32] = a.d.tab[2 * (size_t) a.d.n_keys + (size_t) a.layer * kSpares + (tid - 32)];
+        }
+    }
+    __syncthreads();
     if (tid == 0) {
         double sum = 0.0;
         for (int i = 0; i < a.k; ++i) sum += (double) s_p[s_ids[i]];
@@ -3081,9 +3128,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             int f_ram = 0, ri[8];
             unsigned int rcnt[8];
             for (int i = 0; i < a.k; ++i) {
-                const size_t key = (size_t) a.layer * E + s_ids[i];
-                const unsigned int c = a.d.dcnt != nullptr ? ++a.d.dcnt[key] : 0u;
-                if (i < skip_from && a.d.tab[key] == 0ull && rtab[key] != 0ull) {
+                const unsigned int c = s_cnt[i];
+                if (i < skip_from && s_tv[i] == 0ull && s_rv[i] != 0ull) {
                     ri[f_ram] = i;
                     rcnt[f_ram++] = c;
                 }
@@ -3100,14 +3146,14 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             const float w = (float) ((double) s_p[s_ids[i]] * inv * a.w_scale);
             s_w[i] = w;
             const size_t key = (size_t) a.layer * E + s_ids[i];
-            unsigned long long ptr = a.d.tab[key];
+            unsigned long long ptr = s_tv[i];
             unsigned long long src = 0ull;
             s_pp[i] = 0ull;
             s_cs[i] = 0ull;
             if (ptr == 0ull && i >= skip_from) {
                 // left out: the expert kernels skip a null plan entry (a draft only has to be a good guess)
             } else if (ptr == 0ull) {
-                src = rtab[key];
+                src = s_rv[i];
                 if (src != 0ull && ((host_set >> i) & 1u)) {
                     // to the host: a null plan entry (the expert kernels skip it), no spare, no fetch
                     cpu |= 1u << i;
@@ -3121,10 +3167,11 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
                     // not in VRAM: land it in a spare slot of this layer (it becomes resident: the table says so
                     // from here on) or, with none left, in this entry's scratch slot.  promote_min > 1: keep it
                     // only when its aged route count clears the bar - one-offs take scratch and do not churn the tier
-                    const unsigned int rc = a.d.dcnt != nullptr ? a.d.dcnt[key] : 0u;
-                    while (next_spare < kSpares && spares[next_spare] == 0ull) ++next_spare;
+                    const unsigned int rc = s_cnt[i];
+                    while (next_spare < kSpares && s_sp[next_spare] == 0ull) ++next_spare;
                     if (next_spare < kSpares && (a.promote_min <= 1 || rc >= (unsigned int) a.promote_min)) {
-                        ptr = spares[next_spare];
+                        ptr = s_sp[next_spare];
+                        s_sp[next_spare] = 0ull;
                         spares[next_spare] = 0ull;
                         a.d.tab[key] = ptr;
                         promo |= 1u << i;
@@ -3463,7 +3510,8 @@ template<int TD>
 #endif
 __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_embd, int n_ff, size_t down_off,
                                                        const block_q8_1* __restrict__ hq,
-                                                       const float* __restrict__ sh_out, float* __restrict__ out) {
+                                                       const float* __restrict__ sh_out, float* __restrict__ out,
+                                                       float* __restrict__ part_buf = nullptr, int part_mode = 0) {
     if (d.skip != nullptr && *d.skip) return;
 #if !defined(STRATA_USE_HIP)
     constexpr int NR = DOWN_ROWS;
@@ -3528,6 +3576,16 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
             for (int j = 0; j < NR; ++j) s_part[warp][j] = s[j];
     }
     __syncthreads();
+    // FETCH OVERLAP (moe_down's part_mode): the resident entries' values wait in part_buf for the fetched ones
+    if (part_mode != 0 && (int) threadIdx.x < 8 * NR) {
+        const int i = (int) threadIdx.x / NR, j = (int) threadIdx.x % NR;
+        if (part_mode == 1)
+            part_buf[(size_t) i * n_embd + r0 + j] = s_part[i][j];
+        else if (s_ptr[i] == 0ull)
+            s_part[i][j] = part_buf[(size_t) i * n_embd + r0 + j];
+    }
+    if (part_mode == 1) return;
+    if (part_mode != 0) __syncthreads();
     if (threadIdx.x < NR) {
         const int j = threadIdx.x, r = r0 + j;
         float m = 0.0f;
@@ -4660,13 +4718,20 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                 ahead_logits, {}, 0, skip_from, d.cpu_seq != nullptr ? cpu_plan : 0ull, promote_min,
                 pf_rank > 0 ? pf_rank : k, std::max(0, std::min(near_n, std::min(16, n_expert - k))), win, scr_used,
                 g_skip, win_n, disk_skip_from, disk_skip_w};
+    // The two LOSSY route options take their defaults from the model (route_defaults, set at load - each was measured
+    // on its own model): STRATA_GLM_ROUTE_AFFINITY (GLM 0.02: decode +8-10 %, VRAM hits 63-68 -> 68-73 %, KL against
+    // unbiased routing 0.017 with the run-to-run floor at 0.013, top-1 92.6 %) and STRATA_GLM_ROUTE_SWAP (hy_v3 2: with
+    // the CPU-lane defer, decode 2K 42.4 -> 39.5, 30K 53.7 -> 51.1 ms a token; KL of both against the plain path 0.047,
+    // needles 3/3).  =0: off.
     static const float affinity = [] {
-        // (0.02 by default: decode +8-10 %, VRAM hits 63-68 -> 68-73 %, KL against unbiased routing 0.017 with the run-
-        // to-run floor at 0.013, top-1 92.6 %; STRATA_GLM_ROUTE_AFFINITY=0: off)
         const char* v = getenv("STRATA_GLM_ROUTE_AFFINITY");
-        return v ? std::max(0.0f, (float) std::atof(v)) : 0.02f;
+        return v ? std::max(0.0f, (float) std::atof(v)) : g_route_affinity;
     }();
     a.affinity = affinity;
+    static const int swap = getenv("STRATA_GLM_ROUTE_SWAP") ? std::max(0, std::atoi(getenv("STRATA_GLM_ROUTE_SWAP"))) : g_route_swap;
+    static const float swap_m = getenv("STRATA_GLM_ROUTE_SWAP_MARGIN") ? (float) std::atof(getenv("STRATA_GLM_ROUTE_SWAP_MARGIN")) : 0.02f;
+    a.swap_ranks = std::min(swap, k);
+    a.swap_margin = swap_m;
     if (ahead_logits != nullptr && ahead_bias != nullptr && n_expert <= 512) {
         a.n_ahead = std::min(n_ahead, kAhead);
         for (int i = 0; i < a.n_ahead; ++i) a.ahead_bias[i] = ahead_bias[i];
@@ -4711,7 +4776,7 @@ void moe_prefetch(const MoeDev& d, size_t blob_bytes, cudaStream_t s) {
     launch_check("moe_prefetch");
 }
 
-void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s) {
+void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s, int blocks) {
     static int sms = 0;
     if (sms == 0) {
         int dev = 0;
@@ -4719,8 +4784,22 @@ void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s) {
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
         if (sms <= 0) sms = 80;
     }
-    moe_fetch_kernel<<<sms, 256, 0, s>>>(d, k, (blob_bytes + 15) / 16);
+    moe_fetch_kernel<<<blocks > 0 ? blocks : sms, 256, 0, s>>>(d, k, (blob_bytes + 15) / 16);
     launch_check("moe_fetch");
+}
+
+__global__ void moe_split_plan_kernel(MoeDev d, int k, unsigned long long* res, unsigned long long* fet) {
+    const int i = threadIdx.x;
+    if (i >= 8) return;
+    const unsigned long long p = i < k ? d.plan_ptr[i] : 0ull;
+    const bool fetched = i < k && d.fetch_src[i] != 0ull;
+    res[i] = fetched ? 0ull : p;
+    fet[i] = fetched ? p : 0ull;
+}
+
+void moe_split_plan(const MoeDev& d, int k, unsigned long long* res, unsigned long long* fet, cudaStream_t s) {
+    moe_split_plan_kernel<<<1, 32, 0, s>>>(d, k, res, fet);
+    launch_check("moe_split_plan");
 }
 
 #if defined(STRATA_USE_HIP)
@@ -4775,9 +4854,9 @@ void launch_expert_gu(const MoeDev& d, int k, int n_embd, int n_ff, float limit,
 }
 template<int T, int NR, bool GLOBAL = false, bool LUT = true, bool DIRECT = false, bool WIDE = false>
 void launch_expert_down(const MoeDev& d, int k, int n_embd, int n_ff, size_t off, const void* hq,
-               const float* sh, float* out, cudaStream_t s) {
+               const float* sh, float* out, cudaStream_t s, float* part_buf = nullptr, int part_mode = 0) {
     moe_down_kernel<T, NR, LUT, GLOBAL, DIRECT, WIDE><<<n_embd / NR, 256, 0, s>>>(d, k, n_embd, n_ff, off,
-        (const block_q8_1*) hq, sh, out);
+        (const block_q8_1*) hq, sh, out, part_buf, part_mode);
 }
 } // namespace
 #endif
@@ -4893,16 +4972,19 @@ bool rows_experts(int gu_type, int d_type, const uint8_t* base, size_t stride, s
 }
 
 void moe_down(int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, size_t down_off, const void* hq,
-              const float* sh_out, float* out, cudaStream_t s) {
+              const float* sh_out, float* out, cudaStream_t s, float* part_buf, int part_mode) {
     MoeDev d = d_in;
     d.skip = g_skip;
+    if (part_buf == nullptr) part_mode = 0;
 #if defined(STRATA_USE_HIP)
     // IQ3_XXS down regresses on gfx1151; let it use the original dispatch below.
     if ((d_type == 22 || d_type == 18) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(d_type == 22)) {
         // Two rows lower the register budget; IQ2_S prefers global grid reads,
         // while the smaller IQ3_XXS grid is faster in LDS on gfx1100.
-        if (d_type == 22) launch_expert_down<22, 2, true, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s);
-        else launch_expert_down<18, 2, false, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s);
+        if (d_type == 22) launch_expert_down<22, 2, true, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s,
+                                                                       part_buf, part_mode);
+        else launch_expert_down<18, 2, false, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s,
+                                                          part_buf, part_mode);
         launch_check("moe_down RDNA3");
         return;
     }
@@ -4911,7 +4993,8 @@ void moe_down(int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, size_
     const auto* H = (const block_q8_1*) hq;
     switch (d_type) {
 #define GLMF_DN(T) \
-        case T: moe_down_kernel<T><<<blocks, 256, 0, s>>>(d, k, n_embd, n_ff, down_off, H, sh_out, out); break;
+        case T: moe_down_kernel<T><<<blocks, 256, 0, s>>>(d, k, n_embd, n_ff, down_off, H, sh_out, out, part_buf, \
+                                                          part_mode); break;
         GLMF_DN(16) GLMF_DN(18) GLMF_DN(19) GLMF_DN(23) GLMF_DN(10) GLMF_DN(11) GLMF_DN(17) GLMF_DN(22) GLMF_DN(21) GLMF_DN(29)
         GLMF_DN(12) GLMF_DN(13) GLMF_DN(14)
 #undef GLMF_DN
@@ -5165,6 +5248,10 @@ void rms_q8(float* h, const float* add, const float* w, float eps, int n, float*
 }
 
 void set_skip(const int* flag) { g_skip = flag; }
+void route_defaults(int arch) {
+    g_route_affinity = arch == 0 ? 0.02f : 0.0f;   // (GLM's measured default; hy_v3 / mimo2 not measured with it)
+    g_route_swap = arch == 1 ? 2 : 0;              // (hy_v3's measured default)
+}
 
 void skip_gate(const volatile int* host_from, int t, int* flag, cudaStream_t s) {
     skip_gate_kernel<<<1, 1, 0, s>>>(host_from, t, flag);

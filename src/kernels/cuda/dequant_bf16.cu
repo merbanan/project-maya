@@ -306,6 +306,8 @@ namespace {
 bool iq_only(int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 29; }
 }  // namespace
 
+bool dequant_f16_supported(int ggml_type) noexcept { return dequant_bf16_supported(ggml_type) || iq_only(ggml_type); }
+
 void dequant_bf16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
                   void* stream) {
     launch<uint16_t>(ggml_type, blocks, row0, rows, cols, out, stream);

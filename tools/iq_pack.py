@@ -96,10 +96,28 @@ GLM5NEXT_NATIVE_OK = (
     # dequantizes them into the F32 arena at load (2x ~1.2 GB quantized)
     "token_embd.weight", "output.weight",
 )
-ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next")   # unsloth spells it without the hyphen
+# hy_v3 (Tencent Hy3): plain GQA attention and GLM-style MoE.  Its F32 tensors (norms, the F32 router and its
+# selection bias) are packed as F32 - the engine reads the router in F32 for this architecture - and only these
+# quantized tensors may be served natively (fail-closed like glm5-next).
+HYV3_NATIVE_OK = (
+    "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+    "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+    "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+    "token_embd.weight", "output.weight",
+)
+# mimo2 (Xiaomi MiMo-V2.x-Flash): hy_v3's packing (F32 norms, router, selection bias and attention sinks as F32) with
+# a fused q/k/v projection
+MIMO2_NATIVE_OK = (
+    "attn_qkv.weight", "attn_output.weight",
+    "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+    "token_embd.weight", "output.weight",
+)
+ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "hy_v3", "mimo2")   # unsloth spells glm5next without the hyphen
 
 
 def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
+    if arch in ("hy_v3", "mimo2"):
+        return False
     if arch in ("glm5-next", "glm5next"):
         # glm5-next has no PLE and no output_hc; its F32 router stays F32 (the runner reads it
         # as F32 by config), so ONLY the listed projections take the BF16 path.
@@ -235,7 +253,11 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                     converted.append({"name": t.name, "source_type": t.type_name, "bytes": len(raw)})
                 else:
                     kind = {"BF16": "4", "F16": "5", "F32": "2"}[t.type_name]
-                if not convert and arch == "qwen4exp" and t.type_name == "F32" and t.name.endswith(ROUTERS):
+                # (hy_v3: llama.cpp writes the BF16 checkpoint's router as F32 - the same exact values in half the
+                # bytes, read every token; a router with other values stays F32, which the engine also takes)
+                exact16 = arch in ("hy_v3", "mimo2") and t.type_name == "F32" and t.name.endswith(ROUTERS) and \
+                    not np.count_nonzero(np.frombuffer(raw, dtype=np.uint32) & 0xFFFF)
+                if not convert and (arch == "qwen4exp" or exact16) and t.type_name == "F32" and t.name.endswith(ROUTERS):
                     u = np.frombuffer(raw, dtype=np.uint32)
                     if np.count_nonzero(u & 0xFFFF):
                         print("router %s is F32 with values that are not BF16; the engine's router is BF16" % t.name)
@@ -248,6 +270,14 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                 pad = (-len(raw)) % ALIGN
                 fo.write(b"\0" * pad)
                 at += len(raw) + pad
+            elif arch == "hy_v3" and not name.endswith(HYV3_NATIVE_OK):
+                print("%s is %s: not in the hy_v3 native set (HYV3_NATIVE_OK); refusing to pack it silently"
+                      % (t.name, t.type_name))
+                return 1
+            elif arch == "mimo2" and not name.endswith(MIMO2_NATIVE_OK):
+                print("%s is %s: not in the mimo2 native set (MIMO2_NATIVE_OK); refusing to pack it silently"
+                      % (t.name, t.type_name))
+                return 1
             elif arch in ("glm5-next", "glm5next") and not name.endswith(GLM5NEXT_NATIVE_OK):
                 print("%s is %s: not on the BF16 upgrade list nor the glm5-next native set "
                       "(GLM5NEXT_NATIVE_OK); refusing to pack it silently" % (t.name, t.type_name))
@@ -358,7 +388,13 @@ def main() -> int:
     if arch not in ARCHITECTURES:
         print("general.architecture is %r; the packer knows %s" % (arch, " and ".join(ARCHITECTURES)))
         return 1
-    if arch in ("glm5-next", "glm5next"):
+    if arch == "hy_v3":
+        prefix = "hy_v3."
+        print("hy_v3: packing for the Glm5Model runner's hy_v3 path (GQA attention, quantized dense served natively)")
+    elif arch == "mimo2":
+        prefix = "mimo2."
+        print("mimo2: packing for the Glm5Model runner's mimo2 path (SWA / global GQA, quantized dense served natively)")
+    elif arch in ("glm5-next", "glm5next"):
         # two spellings in the wild: llama.cpp's canonical "glm5-next" (llama-arch.cpp L156) and
         # unsloth's "glm5next" - the KV PREFIX follows the same spelling, so it is read per file
         prefix = "glm5-next." if arch == "glm5-next" else "glm5next."
@@ -366,7 +402,7 @@ def main() -> int:
               "gate remains closed until the pack wiring lands - docs/GLM5-FLASH.md §9)" % arch)
     block_count = None
     trunk = None
-    if arch in ("glm5-next", "glm5next"):
+    if arch in ("glm5-next", "glm5next", "hy_v3", "mimo2"):
         bc = g.metadata.get(prefix + "block_count")
         if bc is None:
             print("%s: %sblock_count is missing; cannot tell the trunk from the NextN block" % (arch, prefix))
@@ -415,7 +451,12 @@ def main() -> int:
     else:
         n_layers = 1 + max(int(n.split(".")[1]) for n in T if n.startswith("blk.") and n.endswith("_exps.weight"))
     # the MoE layers only: the leading dense blocks ship no router and no experts
-    if arch in ("glm5-next", "glm5next"):
+    if arch in ("hy_v3", "mimo2"):
+        # no leading_dense_block_count key: the dense blocks are the layers before the first router
+        lead = 0
+        while "blk.%d.ffn_gate_inp.weight" % lead not in T:
+            lead += 1
+    elif arch in ("glm5-next", "glm5next"):
         lead = int(g.metadata.get(prefix + "leading_dense_block_count", 0) or 0)
     else:
         lead = int(g.metadata.get("qwen4exp.leading_dense_block_count", 0) or 0)

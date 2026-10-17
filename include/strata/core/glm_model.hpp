@@ -23,6 +23,7 @@
 #include "strata/core/glm_dflash.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/exl3.hpp"
+#include "strata/kernels/mimo_attn.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <algorithm>
@@ -41,9 +42,12 @@
 namespace strata::kernels::glmf {
 struct MoeRequest;
 struct CpuAnswer;
+struct GqaKv;   // (kernels/glm_fast.hpp)
+const char* gqa_kv_mode_name(int mode);
 }  // namespace strata::kernels::glmf
 
 namespace strata::core {
+struct GqaKvStream;   // (src/core/glm_gqa_stream.hpp: hy_v3's KV streaming)
 
 namespace glmfast {
 class Workers;
@@ -81,11 +85,31 @@ struct Glm5Geometry {
     float w_scale = 1.0f;
     int norm_w = 1;
     float swiglu_exp = 10.0f, swiglu_shexp = 10.0f;
+    // hy_v3 (Tencent Hy3): every layer is grouped-query attention (n_head query heads over n_kv K/V heads of
+    // head_dim, per-head RMS norms on q and k, NeoX rope over the whole head) with plain pre-norm residuals - no
+    // hyper-connections (hc = 1), no KDA, no DSA; the MoE side is GLM's (sigmoid router + bias, shared expert)
+    int arch = 0;                      // 0 glm5-next, 1 hy_v3, 2 mimo2
+    int n_kv = 8, head_dim = 128;
+    float rope_base = 10000.0f;
+    // mimo2 (Xiaomi MiMo-V2.x-Flash, llama.cpp's LLM_ARCH_MIMO2): GQA like hy_v3 but K heads of head_dim (192) and V
+    // heads of v_dim (128), NeoX rope over the first n_rot (64) dims, no q/k norms; most layers attend over a sliding
+    // window of swa_window positions (8 K/V heads, rope_base_swa, a per-head attention sink), every sixth over the whole
+    // context (4 K/V heads, rope_base); the attention output is scaled by v_scale; no shared expert.  n_head_kv holds
+    // each layer's K/V heads, is_swa its kind.
+    int v_dim = 128, n_rot = 128, swa_window = 0;
+    float rope_base_swa = 10000.0f, v_scale = 1.0f;
+    std::vector<char> is_swa;
+    std::vector<int32_t> eog;          // the end-of-generation ids from the GGUF (empty: the driver's GLM set)
 
     int d_inner() const { return kda_head_dim * n_head; }
     int top_pools_max() const { return idx_top_k / idx_kpool; }
     int n_sel_max() const { return idx_top_k + (idx_select_tail ? idx_kpool - 1 : 0); }
-    bool is_recr(int il) const { return n_head_kv[(size_t) il] == 0; }
+    bool gqa() const { return arch == 1 || arch == 2; }   // a plain residual stream with grouped-query attention
+    bool mimo() const { return arch == 2; }
+    bool swa(int il) const { return mimo() && is_swa[(size_t) il] != 0; }
+    int kv_heads(int il) const { return mimo() ? n_head_kv[(size_t) il] : n_kv; }
+    bool is_recr(int il) const { return !gqa() && n_head_kv[(size_t) il] == 0; }
+    bool is_dsa(int il) const { return !gqa() && n_head_kv[(size_t) il] != 0; }
 
     static bool from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
 };
@@ -120,6 +144,11 @@ public:
     bool load_pack_split(const std::string& pack_dir, int64_t max_ctx, const std::vector<int>& bounds,
                          const std::vector<int>& devs, std::string& err);
     static constexpr int kMaxParts = 16;
+    /// mimo2: the positions a layer's K / V records hold - the whole context, or the sliding window's ring (+ 64
+    /// positions for rows decoded ahead)
+    static int64_t mimo_kv_cap(const Glm5Geometry& g, int il, int64_t max_ctx) {
+        return g.swa(il) ? std::min<int64_t>(max_ctx, (int64_t) g.swa_window + 64) : max_ctx;
+    }
     /// The fast decode path (src/core/glm_fast_path.cu) is the default for packs; STRATA_GLM_SLOW=1
     /// keeps the correctness-first per-op path (the reference the fast path is checked against).
     bool fast() const { return fast_ != nullptr; }
@@ -194,6 +223,7 @@ public:
     /// while others ran continues where it was.  The bytes written, or 0 + err.
     uint64_t slot_save(const std::string& path, std::string& err);
     bool slot_load(const std::string& path, int64_t n_pos, std::string& err);
+    std::vector<std::pair<int64_t, int64_t>> slot_gqa_runs(int64_t n) const;   // hy_v3: the K / V rows of n positions
     /// Runs the engine's sampler on the last forward's logits and returns the picked token id
     /// (-1 + err on failure).  Handles the device bookkeeping: with a split the logits (and the
     /// sampler buffer) live on the tail half's device, where peer reads are not available.
@@ -250,6 +280,16 @@ private:
 
     // per-layer state offsets, in floats into state_ (-1: the layer has no such state)
     std::vector<int64_t> kda_S_, kda_conv_, dsa_lat_, dsa_ik_, dsa_ig_, dsa_pool_;
+    std::vector<int64_t> gqa_kv_;                 // hy_v3: per layer region a of the K / V records (floats into state_), -1 none
+    std::vector<int64_t> mimo_k_, mimo_v_;        // mimo2: per layer its FP16 K / V records (floats into state_), -1 none
+    // hy_v3's position-major K / V records (glm_fast.hpp GqaKv): a record's bytes, each layer's offset inside it, the
+    // first position of region b - the expert pool's lendable tail (xpool), lent to the cache as the context grows
+    // (kv_ensure) and back when it shrinks (kv_trim) - its bytes, and the positions lent so far ([p0, kv_lent_))
+    int64_t kv_rec_ = 0, kv_p0_ = 0, kv_lent_ = 0;
+    std::vector<int64_t> kv_loff_;
+    uint8_t* kv_b_ = nullptr;
+    size_t kv_b_bytes_ = 0;
+    int gqa_kvm_ = 0;                             // ... its mode (glm_fast.hpp kGqa*: FP16 .. TQ6V3)
 
 public:
     // ---- per-weight serving slots (strata::core::WSlot below): F32 pointers for the
@@ -456,6 +496,31 @@ public:
     bool fast_token(int32_t token, std::string& err);
     bool fast_layers(int64_t p, bool hop_in, std::string& err);
     bool fast_dsa(int il, int64_t p, std::string& err);     // one DSA mixer (x -> mixer)
+    bool fast_gqa(int il, int64_t p, std::string& err);     // hy_v3: one attention mixer (xq -> mixer)
+    // hy_v3, STRATA_GLM_KV_STREAM=<positions>: the whole cache in host memory, that many positions a layer cached in
+    // VRAM, a decode step attending to the best pages (glm_gqa_stream.hpp)
+    GqaKvStream* kvs_ = nullptr;
+    bool gqa_kv_stream_init(int64_t resident, std::string& err);
+    void gqa_kv_stream_free();
+    strata::kernels::glmf::GqaKv kv_host_view(int il) const;    // a streamed layer: its host records (+ the cache)
+    strata::kernels::glmf::GqaKv kv_stage_view(int il) const;   // ... its staging copy (the prompt path)
+    void gqa_kv_stream_reload(int64_t n);                           // nothing cached, the summaries of [0, n) again
+    bool kv_ensure(int64_t pos_end, std::string& err);      // hy_v3: region b lent to the cache up to pos_end
+    bool gqa_kv_stream_commit(int64_t to, std::string& err);   // (KV stream lending: pin the records' positions up to to)
+    size_t ram_retire(size_t want, std::string& err);      // (KV stream lending: the RAM tier's tail chunks given back)
+    const uint8_t* kv_lo(int64_t pos_end) const;            // ... the lowest byte of positions [p0, pos_end) there
+    size_t kv_room(int64_t pos_end) const;                  // ... the tail's bytes below them (the prompt path's)
+    void kv_trim(int64_t keep);                             // ... and handed back to the pool beyond keep
+    // a layer's view of the K / V records
+    strata::kernels::glmf::GqaKv kv_view(int il) const;
+    strata::kernels::mimo::Kv mimo_view(int il) const;   // mimo2: a layer's records (a ring for a window layer)
+    std::vector<std::pair<int64_t, int64_t>> running_runs() const;   // the snapshot's (state_ offset, floats) runs
+    int64_t running_floats() const;
+    bool fast_mimo(int il, int64_t p, std::string& err);  // mimo2: one attention mixer (x -> mixer)
+    // the slots of the pool's lendable tail whose memory meets [lo, hi): lent (to the prompt path: kLent, to the cache:
+    // kKvLent) - their experts moved over colder main-slot ones or parked in the RAM tier
+    bool lend_range(const uint8_t* lo, const uint8_t* hi, char state, uint64_t& moved, uint64_t& dropped, std::string& err);
+    bool fast_layers_gqa(int64_t p, std::string& err);      // hy_v3: this part's layers
     bool fast_moe(int il, bool& pf_pending, std::string& err, bool cpu_wait = true);   // one MoE FFN (x -> ffn)
     bool moe_defer_wait_ = false;                            // (fast_moe's cpu_wait = false: the caller waits)
     // ... its routed experts, once the router and the shared expert's gate / up have run: the token path's own
@@ -546,7 +611,11 @@ public:
     /// returns the block's greedy proposal for p + 2 (-1: no draft block).  Fills the block's caches at p.
     int mtp_draft(int32_t next_tok, std::string& err);
     bool has_mtp() const;
-    bool kv_int8() const { return lat_q8_; }   // the latent cache in INT8 (STRATA_GLM_KV_INT8=1)
+    bool kv_int8() const { return lat_q8_ || gqa_kvm_; }   // the KV / latent cache in INT8 (STRATA_GLM_KV_INT8=1)
+    /// the cache's name for the driver's INFO line: fp16, int8 or k8v4 (hy_v3's K8V4)
+    const char* kv_name() const {
+        return g_.gqa() ? strata::kernels::glmf::gqa_kv_mode_name(gqa_kvm_) : kv_int8() ? "int8" : "fp16";
+    }
     /// KV streaming: the positions of each DSA layer kept in VRAM (0: all of them - not streamed); and what
     /// STRATA_GLM_KV_RESIDENT gives for a context: rounded up to whole pools and to glmf::kKvResidentMin, 0 when unset
     /// or when the context fits in that many anyway
@@ -653,7 +722,7 @@ public:
         int64_t max_ctx = 0;
         uint64_t bytes = 0;
         int ik_ring = 0;
-        std::vector<int64_t> kda_S, kda_conv, dsa_lat, dsa_ik, dsa_ig, dsa_pool;
+        std::vector<int64_t> kda_S, kda_conv, dsa_lat, dsa_ik, dsa_ig, dsa_pool, gqa_kv;
         float *snap = nullptr, *snap_pool = nullptr, *kda_bak = nullptr;
         int last_tok = -1;
         std::vector<int64_t> img_pos;

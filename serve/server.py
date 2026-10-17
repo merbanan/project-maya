@@ -1322,14 +1322,14 @@ class Service:
         # GLM ends an assistant turn with the next role's token (<|user|> / <|observation|>): the engine stops on it,
         # and it must not reach the answer's text either
         self.stop_ids = set(_special_ids(IM_END) + _special_ids("<|endoftext|>") + _special_ids("<|user|>") +
-                            _special_ids("<|observation|>"))
+                            _special_ids("<|observation|>") + _special_ids("<｜hy_eos:opensource｜>"))
         # ... and a model that spells a role marker out of ordinary pieces ('<|', 'user', '|>') has ended its turn just
         # the same: the text stops there.  Only markers that are special tokens in this vocabulary count.
         self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>") if _special_ids(s)]
         # the thinking budget (run config `thinking_budget`, tokens; 0 = none): a reasoning block that reaches it is
         # closed with the template's </think> and the answer follows - GLM at High can plan for 14k+ tokens
         self.think_budget = 0
-        end = _special_ids("</think>")
+        end = _special_ids("</think:opensource>" if getattr(template, "hy3", False) else "</think>")
         self.think_end_id = end[0] if end else None
         # the special literals that stay text inside a message (frontend.mark_literals): every one the vocabulary has
         self.literals = literal_tags(getattr(tokenizer, "special_tokens", None))
@@ -1717,7 +1717,10 @@ class Service:
         if force is not None and tools:
             # GLM's form opens with the tool's name, Qwen's with <function=NAME>
             glm_calls = "<arg_key>" in self.template.source
-            prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
+            if getattr(self.template, "hy3", False):   # Hy3: <tool_calls> then <tool_call>NAME<tool_sep>
+                prefill = "<tool_calls:opensource>\n<tool_call:opensource>" + (f"{force}<tool_sep:opensource>" if force else "")
+            else:
+                prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
         given["_prefill"] = prefill
         ids = self.render_ids(messages, tools, kwargs, prefill)
         self.embeddings.path = None
@@ -1770,7 +1773,12 @@ class Service:
                 raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
                                  f"({self.engine.max_context}); requests are never truncated")
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
-        return ids, kwargs.get("enable_thinking", True) is not False, max_new
+        thinking = kwargs.get("enable_thinking", True) is not False
+        if getattr(self.template, "hy3", False):
+            # Hy3: thinking is on exactly when the prompt leaves the think block open (its template closes it for
+            # no_think, its default - also when the client names no level)
+            thinking = prompt.endswith("<think:opensource>")
+        return ids, thinking, max_new
 
     def count_tokens(self, req: dict) -> dict:
         """POST /api/tokens: how many tokens this chat request's prompt takes - the same template, thinking level,
@@ -1935,7 +1943,8 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True,
+                              tags=getattr(self.template, "tags", None))
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
         pre_events = parser.feed(prefill) if prefill else []
         detok, n, finish = Detokenizer(self.tok), 0, "length"

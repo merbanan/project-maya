@@ -241,6 +241,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/cuda/glm_fast.cu
+                          src/kernels/cuda/glm_gqa.cu
+                          src/kernels/cuda/mimo_attn.cu
                           src/kernels/cuda/glm_batch.cu
                           src/kernels/cuda/exl3.cu
                           src/kernels/cuda/exl3_legacy.cu
@@ -845,6 +847,9 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(native_rows_exact_test src/kernels/cpu/native_rows_exact_test.cpp)
     target_link_libraries(native_rows_exact_test PRIVATE strata_kernels_cpu)
     add_test(NAME native_rows_exact_test COMMAND native_rows_exact_test)
+    # Explicit real-pack gate; pass pack, output dump and expected exact-path activation.
+    add_executable(glm_cpu_exact1_test tests/glm_cpu_exact1_test.cpp)
+    target_link_libraries(glm_cpu_exact1_test PRIVATE strata_kernels_cpu)
   endif()
   if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP))
     # the dense GEMV for several conversations at once (mv_nt) against the one-conversation GEMV, bit for bit; the

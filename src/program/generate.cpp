@@ -25,6 +25,9 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#ifdef STRATA_NATIVE_EXPERTS
+#include "strata/kernels/cpu/native_expert.hpp"
+#endif
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
@@ -987,6 +990,20 @@ static int glm_pack_generate(const Options& o) {
         std::signal(SIGTERM, SIG_IGN);
         std::signal(SIGINT, SIG_IGN);
         std::signal(SIGPIPE, SIG_IGN);
+#if defined(__linux__)
+        // a server that dies while the engine still starts (it installs its SIGTERM handler, which ends the engine
+        // with QUIT, only once the engine is up) took ~40 s to free the GPU: the engine loaded and warmed its tiers
+        // before it read its input and saw the server gone.  A watchdog ends it once its parent process is gone (the
+        // parent changes: reparented).  Not PR_SET_PDEATHSIG: that follows the parent THREAD, and the server restarts a
+        // dead engine from a request's thread, which ends.
+        const pid_t parent = getppid();
+        std::thread([parent] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                if (getppid() != parent) std::_Exit(1);
+            }
+        }).detach();
+#endif
     }
 #endif
     strata::core::Glm5Model model;
@@ -1018,7 +1035,7 @@ static int glm_pack_generate(const Options& o) {
         std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld engine_kind=glm-fast "
                     "experts=%d vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d dflash=%d vision_lend=%zu "
                     "cpu_threads=%d pcie_share=%.2f logit_bias=1\n",
-                    (long long) o.max_context, model.kv_int8() ? "int8" : "fp16", (long long) model.kv_resident(),
+                    (long long) o.max_context, model.kv_name(), (long long) model.kv_resident(),
                     (long long) st.pool_slots,
                     (long long) (st.pool_gb * 1024.0), model.geometry().n_expert * (model.geometry().n_layers - model.geometry().dense_lead),
                     (long long) st.pool_slots, st.pool_gb, (long long) st.ram_slots, st.ram_gb, model.has_mtp() ? 1 : 0,
@@ -1032,7 +1049,9 @@ static int glm_pack_generate(const Options& o) {
     sp.temperature = o.temperature;
     sp.seed = o.seed;
 
-    const std::vector<int64_t> glm_eos = {154820, 154827, 154829};
+    // GLM's stop set, or the model's own end-of-generation ids when its GGUF names them (hy_v3)
+    std::vector<int64_t> glm_eos = {154820, 154827, 154829};
+    if (!model.geometry().eog.empty()) glm_eos.assign(model.geometry().eog.begin(), model.geometry().eog.end());
     const std::vector<int64_t>& eos = o.eos_given ? o.eos_ids : glm_eos;
     // STRATA_GLM_KL_DUMP=<file>,<n> (a test of the K/V cache formats): --tokens-file's tokens teacher-forced - all but
     // the last n through the prompt path, those n one at a time through the decode - and the logits after each of the
@@ -1771,6 +1790,9 @@ static int glm_pack_generate(const Options& o) {
         if (stop_req.load()) finish = "cancel";
         const auto t1 = std::chrono::steady_clock::now();
         const auto st1 = model.fast_stats();
+#ifdef STRATA_NATIVE_EXPERTS
+        const auto cpu_split1 = strata::kernels::cpu::native_split_counts();
+#endif
         int64_t produced = 0;
         // one emitted token: the T line, the live tier counters every 8 tokens, the stop conditions (false: stop)
         // LOOP GUARD: a heavily quantized model can fall into repeating a short pattern ("0 0 0 ...") until the
@@ -1949,6 +1971,15 @@ static int glm_pack_generate(const Options& o) {
         const double decode_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
         // the decode phase's expert-tier counters (the fast path; zeros on the reference path)
         const auto st2 = model.fast_stats();
+#ifdef STRATA_NATIVE_EXPERTS
+        if (env_num("STRATA_GLM_CPU_EXACT1_DIAG", 0) == 1) {
+            const auto cpu_split2 = strata::kernels::cpu::native_split_counts();
+            std::fprintf(stderr, "glm cpu exact1: decode tokens=%lld exact_rows=%llu ggml_rows=%llu\n",
+                         (long long) produced,
+                         (unsigned long long) (cpu_split2.exact_rows - cpu_split1.exact_rows),
+                         (unsigned long long) (cpu_split2.ggml_rows - cpu_split1.ggml_rows));
+        }
+#endif
         const uint64_t d_hits = st2.hits - st1.hits, d_miss = st2.misses - st1.misses;
         std::printf("DONE %lld %lld %.1f %.1f %s %llu %llu %zu %llu %llu\n", (long long) produced,
                     (long long) prompt.size(), prompt_ms, decode_ms, finish,
@@ -3414,6 +3445,10 @@ int main(int argc, char** argv) {
         if (o.kv_resident > 0 && std::getenv("STRATA_GLM_KV_RESIDENT") == nullptr)
             set_env("STRATA_GLM_KV_RESIDENT", std::to_string(o.kv_resident).c_str());
         if (o.kv_streaming == "off") set_env("STRATA_GLM_KV_RESIDENT", "0");   // (off whatever the environment says)
+        // (hy_v3's K / V cache reads STRATA_GLM_KV: fp16 / int8 / k8v4 / tq4 / tq6v4 / tq4v3 / tq6v3)
+        if ((o.kv == "k8v4" || o.kv == "int8" || o.kv == "tq4" || o.kv == "tq6v4" || o.kv == "tq4v3" || o.kv == "tq6v3") &&
+            std::getenv("STRATA_GLM_KV") == nullptr)
+            set_env("STRATA_GLM_KV", o.kv.c_str());
         if (o.pack != "pack/full") {
             std::fprintf(stderr, "maya generate: note: --glm-pack supersedes --pack (%s ignored)\n", o.pack.c_str());
         }

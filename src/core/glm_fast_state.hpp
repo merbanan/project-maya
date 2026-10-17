@@ -254,6 +254,14 @@ namespace gf = strata::kernels::glmf;
 struct Glm5Model::FastState {
     bool unified_memory = false;   // set only for integrated HIP devices on Linux; CUDA and Windows keep the discrete policy
     cudaStream_t cs = nullptr, copy = nullptr, ps = nullptr;   // ps: the prefetch side stream
+    // FETCH OVERLAP (STRATA_GLM_FETCH_OVERLAP): the route's PCIe fetch on its own stream while the resident experts
+    // compute on cs; the plan split (res | fet, 8 + 8 device entries), the resident down values (8 x n_embd floats)
+    cudaStream_t fs = nullptr;
+    cudaEvent_t ev_fsplit = nullptr, ev_fetch = nullptr;
+    unsigned long long* plan_split = nullptr;
+    float* down_part = nullptr;
+    bool fetch_overlap = false;
+    int fetch_blocks = 0;
     cudaEvent_t ev_hop = nullptr, ev_done = nullptr, ev_pred = nullptr, ev_pf = nullptr, ev_pf_prev = nullptr;
     int max_pf = 0;   // STRATA_GLM_PREFETCH_N: measured a net LOSS on Mercury (the window between routes is shorter than one fetch)
     std::atomic<uint64_t> prefetches{0};
@@ -276,6 +284,8 @@ struct Glm5Model::FastState {
     int* cells = nullptr;
     int* slot_cells = nullptr;   // KV streaming: the selection in VRAM slot rows (glm_kv_resolve), what the attention reads
     void *qr_q = nullptr, *attn_q = nullptr;
+    // hy_v3's attention: q (n_head x 128), k and v (n_kv x 128), the attention scratch (splits + output)
+    float *gq = nullptr, *gk = nullptr, *gv = nullptr, *gscr = nullptr;
     float *rlog = nullptr, *plog = nullptr, *sh_g = nullptr, *sh_u = nullptr;
     float* sh_out = nullptr;   // the shared expert's down (n_embd), computed alongside the routed gate/up
     // prediction quality (the next layer's router on this layer's FFN input)
@@ -298,6 +308,9 @@ struct Glm5Model::FastState {
     std::vector<std::thread> ah_th;
     bool ah_quit = false;
     std::atomic<int> ah_inflight{0};
+    // STRATA_GLM_DEFER_CPU (hy_v3's decode, the default; =0 off): a layer's CPU-lane rows join the residual after the next layer's attention
+    // (fast_layers_gqa sets defer_cpu_now around a fast_moe; cpu_deferred: a wait is owed, into the next mixer)
+    bool defer_cpu_now = false, cpu_deferred = false;
     // per RAM class and slot, for kRLoad slots: tag << 2 | phase (0 queued, 1 reading, 2 landed) - a job reads only while
     // the tag it carries is current (a slot freed and reused under it gets a new tag)
     std::vector<std::unique_ptr<std::atomic<uint64_t>[]>> rload;
@@ -355,7 +368,10 @@ struct Glm5Model::FastState {
     int* tok_h = nullptr;       // pinned
     // per layer: the resolved weights
     struct Layer {
-        bool recr = false, moe = false, mtp = false;
+        bool recr = false, moe = false, mtp = false, gqa = false;
+        const float *q_norm = nullptr, *k_norm = nullptr;          // hy_v3: per-head q / k RMS norms (head_dim)
+        const float* router32 = nullptr;                            // hy_v3: the router in F32 (as the GGUF stores it)
+        const float* sinks = nullptr;                               // mimo2: a window layer's attention sinks (n_head)
         WSlot eh;                                                   // the NextN block: eh_proj and its norms
         const float *enorm = nullptr, *hnorm = nullptr, *shnorm = nullptr;
         const uint16_t *hc_attn_fn = nullptr, *hc_ffn_fn = nullptr;
@@ -385,7 +401,7 @@ struct Glm5Model::FastState {
     //      device, which may fill it during a token and mark it resident itself) or DRAINING (its old expert
     //      is being demoted to the RAM tier by a D2H; it becomes free when that copy lands).
     // kLanding: a background promotion's copy is on its way into the slot (fast_boundary step 5)
-    enum : char { kFree = 0, kResident = 1, kSpare = 2, kDraining = 3, kLent = 4, kLanding = 5 };
+    enum : char { kFree = 0, kResident = 1, kSpare = 2, kDraining = 3, kLent = 4, kLanding = 5, kKvLent = 6 };   // (kKvLent: hy_v3's K / V cache)
     // A layer's slots [0, n_main) are at base, [n_main, n) at xbase: every layer's tail lies in ONE region (xpool),
     // which the prompt path borrows for its buffers while a prompt runs (those slots are kLent then) - and an
     // on-demand vision encoder while it encodes (the region is freed; xbase is null until it comes back).
@@ -458,6 +474,9 @@ struct Glm5Model::FastState {
         uint8_t* base = nullptr;
         int n = 0;
         bool registered = false;   // numa_pinned's (mmap + cudaHostRegister), not cudaHostAlloc's
+        // (STRATA_GLM_KV_STREAM_LEND: registered in pieces of `chunk` bytes, [0, mapped) still mapped - the KV stream's
+        // records take the tail's chunks as the context grows, ram_retire)
+        size_t chunk = 0, mapped = 0;
         std::vector<int> key;   // slot -> il * n_expert + e, -1 none
         std::vector<uint64_t> tick;   // the route clock when a route last used it (or it arrived): eviction's recency
         std::vector<char> st;   // kRFree / kRHold / kRRelease (promoted: free at the boundary) /
