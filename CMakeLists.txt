@@ -809,7 +809,7 @@ if(STRATA_NATIVE_EXPERTS)
       set(_strata_gg ${strata_llamacpp_SOURCE_DIR}/ggml)
     endif()
     set(_strata_mmq ${_strata_gg}/src/ggml-cuda)
-    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
+    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu ${_strata_mmq}/convert.cu)
     foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k)   # q8_0: the drafter's matrices (E-9); iq1_s, k-quants: GLM experts (docs/QUANT-PLAN.md)
       target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
     endforeach()
@@ -839,7 +839,8 @@ if(STRATA_NATIVE_EXPERTS)
     set(_strata_mmq_sources
       src/prefill/moe_mmq.cu
       src/prefill/ggml_cuda_host.cu
-      "${_strata_mmq}/quantize.cu")
+      "${_strata_mmq}/quantize.cu"
+      "${_strata_mmq}/convert.cu")
     foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
     endforeach()
