@@ -402,13 +402,16 @@ __device__ __forceinline__ uint4 deq_v4(uint32_t u, __half s1) {
 
 // grid (row tiles, n_kv, splits), AW warps of 16 rows; see the header.  gated: the output gate applied here (FP16
 // cache); K8V4 leaves it to unrotate_gate_kernel (the output is still rotated)
-template <int AR_, int AK_, int AW_>
+template <int AR_, int AK_, int AW_, bool DIRECT_ = false>
 constexpr size_t attn_smem() {
-    return (size_t) AR_ * LDQ * 2 + 2 * (size_t) AK_ * LDQ * 2 + (size_t) AW_ * 16 * (AK_ + 4) * 4 +
+    return (size_t) AR_ * LDQ * 2 + (DIRECT_ ? 0 : 2 * (size_t) AK_ * LDQ * 2) + (size_t) AW_ * 16 * (AK_ + 4) * 4 +
            (size_t) AW_ * 16 * (AK_ + 8) * 2;
 }
 // (the tile shape is a parameter: the 64-row default for prompts, 32-row tiles of 2 warps for verify windows)
-template <int MODE, int AR_ = 64, int AK_ = 32, int AW_ = 4>
+// DIRECT_ (an FP16 cache, opt-in): the K / V fragments read in place from the cache (L1) instead of staged
+// in shared memory - 48 instead of 82 KB a block, two blocks an SM; the cache is zeroed with 32 spare cells, so a
+// tile's keys past the last one are finite (masked to P = 0)
+template <int MODE, int AR_ = 64, int AK_ = 32, int AW_ = 4, bool DIRECT_ = false>
 __global__ void __launch_bounds__(AW_ * 32) attn_tc_kernel(const float* __restrict__ q, Q35Kv kv, int p0, int T, int n_head,
                                                           int G, int max_ctx, int split_len, float scale,
                                                           const float* __restrict__ q_full, int ldq,
@@ -419,9 +422,10 @@ __global__ void __launch_bounds__(AW_ * 32) attn_tc_kernel(const float* __restri
     static_assert(AR == AW * 16, "a warp's 16 rows");
     extern __shared__ __align__(32) unsigned char smem[];
     __half* sQ = (__half*) smem;
+    constexpr bool DIRECT = DIRECT_ && MODE == 0;
     __half* sK = sQ + AR * LDQ;
     __half* sV = sK + AK * LDQ;
-    float* sS = (float*) (sV + AK * LDQ);
+    float* sS = (float*) (DIRECT ? sK : sV + AK * LDQ);
     __half* sP = (__half*) (sS + AW * 16 * LDS);
     const int kvh = blockIdx.y, split = blockIdx.z, n_split = gridDim.z;
     const int rows = T * G, r0 = blockIdx.x * AR;
@@ -478,9 +482,13 @@ __global__ void __launch_bounds__(AW_ * 32) attn_tc_kernel(const float* __restri
             }
         }
     };
-    if (ks < ke) fetch(ks);
+    if (!DIRECT && ks < ke) fetch(ks);
     for (int k0 = ks; k0 < ke; k0 += AK) {
         __syncthreads();
+        // (DIRECT: the tile's K / V rows in the cache, ld = AD)
+        const __half* gK = (const __half*) kv.k + ((size_t) kvh * max_ctx + k0) * AD;
+        const __half* gV = (const __half*) kv.v + ((size_t) kvh * max_ctx + k0) * AD;
+        if (!DIRECT)
 #pragma unroll
         for (int j = 0; j < PF; ++j) {
             const int i = tid + j * AW * 32, r = i / (AD / 8), d = (i % (AD / 8)) * 8;
@@ -493,7 +501,7 @@ __global__ void __launch_bounds__(AW_ * 32) attn_tc_kernel(const float* __restri
             *(uint4*) (sV + r * LDQ + d) = vv4;
         }
         __syncthreads();
-        if (k0 + AK < ke) fetch(k0 + AK);
+        if (!DIRECT && k0 + AK < ke) fetch(k0 + AK);
         if (!w_on || k0 > wlast) continue;
         // S (16 x AK) = Q_w . K^T
         wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[AK / 16];
@@ -506,7 +514,8 @@ __global__ void __launch_bounds__(AW_ * 32) attn_tc_kernel(const float* __restri
 #pragma unroll
             for (int n = 0; n < AK / 16; ++n) {
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
-                wmma::load_matrix_sync(fb, sK + (n * 16) * LDQ + kk * 16, LDQ);
+                if (DIRECT) wmma::load_matrix_sync(fb, gK + (n * 16) * AD + kk * 16, AD);
+                else wmma::load_matrix_sync(fb, sK + (n * 16) * LDQ + kk * 16, LDQ);
                 wmma::mma_sync(acc[n], fq, fb, acc[n]);
             }
         }
@@ -557,7 +566,8 @@ __global__ void __launch_bounds__(AW_ * 32) attn_tc_kernel(const float* __restri
 #pragma unroll
             for (int n = 0; n < AD / 16; ++n) {
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> fv;
-                wmma::load_matrix_sync(fv, sV + (kk * 16) * LDQ + n * 16, LDQ);
+                if (DIRECT) wmma::load_matrix_sync(fv, gV + (kk * 16) * AD + n * 16, AD);
+                else wmma::load_matrix_sync(fv, sV + (kk * 16) * LDQ + n * 16, LDQ);
                 wmma::mma_sync(fo[n], fp, fv, fo[n]);
             }
         }
@@ -977,6 +987,10 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
     // tok/s - the default for 2-4 tokens (-2); 0: the 64-row tile)
     if (var < 0) var = std::getenv("STRATA_DENSE_ATTN_VAR") ? std::atoi(std::getenv("STRATA_DENSE_ATTN_VAR")) : -2;
     const int vsel = g_attn_var >= 0 ? g_attn_var : var;
+    // STRATA_DENSE_ATTN_DIRECT=1: the 64-row tile on an FP16 cache reads its K / V fragments in place (2 blocks a SM) -
+    // slower (27B 28K prompt, two cooled rounds: 807 / 788 -> 755 / 748 tok/s; strided fragment loads from L1 lose to the
+    // staged tile), so off
+    static const bool direct = std::getenv("STRATA_DENSE_ATTN_DIRECT") && std::atoi(std::getenv("STRATA_DENSE_ATTN_DIRECT")) != 0;
     const int v = vsel == -2 ? (T >= 2 && T <= 4 ? 2 : 0) : (T >= 2 && T <= 8) ? vsel : 0;
     const int AR_v = v ? 32 : AR, AK_v = v == 2 ? 16 : AK, AW_v = v ? 2 : AW;
     const int tiles = (rows + AR_v - 1) / AR_v;
@@ -1037,6 +1051,9 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
     } else if (v == 2) {
         if (kv.mode == 0) go(attn_tc_kernel<0, 32, 16, 2>, attn_smem<32, 16, 2>(), 64);
         else go(attn_tc_kernel<1, 32, 16, 2>, attn_smem<32, 16, 2>(), 64);
+    } else if (kv.mode == 0 && direct) {
+        attn_tc_kernel<0, AR, AK, AW, true><<<grid, AW * 32, attn_smem<AR, AK, AW, true>(), (cudaStream_t) stream>>>(
+            q, kv, p0, T, n_head, G, max_ctx, split_len, sc, q_full, ldq, out, part_o, part_ml);
     } else if (kv.mode == 0) {
         attn_tc_kernel<0><<<grid, AW * 32, kAttnSmem, (cudaStream_t) stream>>>(
             q, kv, p0, T, n_head, G, max_ctx, split_len, sc, q_full, ldq, out, part_o, part_ml);

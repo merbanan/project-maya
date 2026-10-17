@@ -743,8 +743,12 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             L.kv.max_ctx = (int) max_context;
             const uint64_t cells = (uint64_t) HK * (uint64_t) max_context;
             if (I.kv_mode == 0) {
-                if (!I.alloc(&L.kv.k, cells * D * 2, err, "K cache") || !I.alloc(&L.kv.v, cells * D * 2, err, "V cache"))
+                // (+ 32 cells, all zero: the prompt attention reads whole 32-key tiles of K / V in place - the cells past
+                // a tile's last key must be finite, and the last head's tile may reach past its region)
+                if (!I.alloc(&L.kv.k, (cells + 32) * D * 2, err, "K cache") || !I.alloc(&L.kv.v, (cells + 32) * D * 2, err, "V cache"))
                     return false;
+                cudaMemset(L.kv.k, 0, (cells + 32) * D * 2);
+                cudaMemset(L.kv.v, 0, (cells + 32) * D * 2);
             } else if (!I.alloc(&L.kv.k, cells * D, err, "K cache") || !I.alloc(&L.kv.v, cells * D / 2, err, "V cache") ||
                        !I.alloc(&L.kv.ks, cells * (D / 32) * 2, err, "K scales") ||
                        !I.alloc(&L.kv.vs, cells * (D / 32) * 2, err, "V scales")) {
