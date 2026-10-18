@@ -493,6 +493,17 @@ prompts 9-14 % and no decode.
 | E5 | Branch consolidation: mimo-dflash carries GLM + Hy3 + MiMo - replace glm-dflash as the fork's main line? (the user's call) | CLOSED (the user, 2026-10-18): keep the per-model branches as they are (glm-dflash, hy3, mimo, mimo-dflash) - no consolidation |
 | E6 | DeepSeek-V4.1-Flash (vLLM #59857): scope a port | CLOSED, not feasible here: hidden 5120, 384 experts x 2304, 40 layers, compress ratios 2/1 (V4: 4/128), KV / indexer sharing (kv_source_layer_ids), Engram n-gram tables (2 layers x ~384M entries), DSpark drafter, vision - antirez's Q2 GGUF 366 GB, Q4 519 GB vs ~94 GB VRAM + RAM even with +32 GB |
 
+### MiMo BPW2.5 without more RAM (the user, 2026-10-18: "run without the extra ram and deep dive into memory use")
+
+BPW2.5's experts are 84.3 GiB (BPW2.0 66.3); one V100 holds 3,666 in VRAM (25.7 GB), the rest must be pinned RAM.
+
+| # | Item | Status |
+|---|---|---|
+| M1 | Where the RAM goes (8K prompt, steady state): pinned tier 58.7 GiB of 62.0; the engine's heap 0.35 GB, mapped GGUF pages 1.4 GB (reclaimable), the prompt path's pinned buffers ~1.35 GB (a 512 MB chunk embedding + a 0.84 GB disk landing ring), kernel ~1.7 GB. Dense weights Q8_0 (4.3 GB VRAM), the embedding already on the host | DONE - nothing large to remove without lossy requantization |
+| M2 | The RAM headroom (STRATA_GLM_RAM_HEADROOM_GB, default 6): 6 / 3 / 1.5 GB -> 11,023 / 11,455 / 11,667 of 12,032 experts held; 8K decode 24.6 / 27.7 / 29.9 tok/s (disk 5.7 / 3.1 / 1.9 reads a token), 28K 23.1 / 25.4 / 25.5; the least free RAM 4.5 / 1.4 / 0.14 GB. 3 GB is safe on this headless server (1.5 GB is not) - the default stays 6 (desktops) | DONE: STRATA_GLM_RAM_HEADROOM_GB=3 for this box |
+| M3 | Disk read-ahead (STRATA_GLM_AHEAD 1-3): disk reads 2.8 -> ~1.6 a token but the waits stay ~3 (a read-ahead expert is still a miss until the next boundary); 8K 26.6-27.3 vs 28.9 tok/s off, 28K 24.5-25.4 vs 24.4 | DONE: no gain, stays off |
+| M4 | A hybrid pack (tools/hybrid_pack.py + the loader's "# extra shards:" header): BPW2.5 with N layers' experts from BPW2.0 (-416 MiB a layer) so every expert fits VRAM + RAM; 12 late (35-46) or middle (17-28) layers, -4.9 GiB; KL against BPW2.5 and speed | running (chain132) |
+
 ### MiMo quality tests (added 2026-10-18) - loops seen in 28K runs: does BPW2.5 or an INT8 / FP16 K/V cache fix them?
 
 Seen: 28K raw-completion runs (the K8V4 default, both prompt kernels) ended in loops ("4,444 4,444 ...", "11
