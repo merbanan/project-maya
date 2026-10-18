@@ -3423,7 +3423,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             bytes += cap * (rk + rv);
         }
         std::fprintf(stderr, "glm pack: CUDA%d mimo2 K/V records %s, %.2f GB (window layers: a %d-position ring)\n",
-                     dev_, mimo_kv_v4() ? "K8V4" : mimo_kv_q8() ? "INT8 (STRATA_MIMO_KV=int8)" : "FP16 (STRATA_MIMO_KV=fp16)", (double) bytes / 1073741824.0,
+                     dev_, mimo_kv_v4() ? "K8V4 (STRATA_MIMO_KV=k8v4)" : mimo_kv_q8() ? "INT8" : "FP16 (STRATA_MIMO_KV=fp16)", (double) bytes / 1073741824.0,
                      (int) std::min<int64_t>(max_ctx, g_.swa_window + 64));
     }
     if (mtp_il_ >= 0 && g_.gqa()) {   // hy_v3's draft block: its rows are in the records

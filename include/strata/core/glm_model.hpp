@@ -149,10 +149,11 @@ public:
     static int64_t mimo_kv_cap(const Glm5Geometry& g, int il, int64_t max_ctx) {
         return g.swa(il) ? std::min<int64_t>(max_ctx, (int64_t) g.swa_window + 64) : max_ctx;
     }
-    /// mimo2: the K / V records' format - STRATA_MIMO_KV=k8v4 (the default: INT8 K, rotated 4-bit V, ~0.40x FP16's
-    /// bytes; 8K KL 0.034 against FP16, decode the same speed), int8 (int8 + a scale per 32 values: ~0.53x) or fp16
+    /// mimo2: the K / V records' format - STRATA_MIMO_KV=int8 (the default: int8 + an FP16 scale per 32 values, ~0.53x
+    /// FP16's bytes; 24K KL 0.046 against FP16, the text's log-prob -0.003), k8v4 (INT8 K, rotated 4-bit V, ~0.40x - at
+    /// 24K KL 0.067, log-prob -0.018: not the default) or fp16 (exact)
     static const char* mimo_kv_name() {
-        static const char* n = getenv("STRATA_MIMO_KV") != nullptr ? getenv("STRATA_MIMO_KV") : "k8v4";
+        static const char* n = getenv("STRATA_MIMO_KV") != nullptr ? getenv("STRATA_MIMO_KV") : "int8";
         return n;
     }
     static bool mimo_kv_v4() {
