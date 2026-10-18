@@ -761,9 +761,11 @@ void attn_body(const float* q, int64_t qld, int T, int64_t p0, int n_head, const
                              (int) TcCfg<64, false>::smem);
         attr = true;
     }
-    // STRATA_MIMO_TC=1: the mma.m8n8k4 kernel (scores in registers)
-    static const int var = getenv("STRATA_MIMO_TC") != nullptr ? std::atoi(getenv("STRATA_MIMO_TC")) : 0;
-    if (var == 1) {
+    // the mma.m8n8k4 kernel (scores in registers) for the window layers by default - 28K prompt, FP16 K/V: window 0.83 vs
+    // 1.02 s, full-context 6.59 vs 6.65 (within noise: wmma kept there); the quality suite clean with it.
+    // STRATA_MIMO_TC=0: wmma everywhere; 1: mma.m8n8k4 everywhere
+    static const int var = getenv("STRATA_MIMO_TC") != nullptr ? std::atoi(getenv("STRATA_MIMO_TC")) : -1;
+    if (var == 1 || (var < 0 && window > 0)) {
         static bool attr1 = false;
         if (!attr1) {
             cudaFuncSetAttribute(rows_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kMmaSmem);
