@@ -528,6 +528,177 @@ __global__ void __launch_bounds__(kTW * 32) rows_tc_kernel(const float* __restri
         __syncwarp();
     }
 }
+
+// ---- the prompt on mma.sync.m8n8k4 (sm_70's native tensor instruction; STRATA_MIMO_TC=1): the wmma kernel's blocks
+// and tiles, but the fragments' layouts are known (measured on a V100: glm_gqa.cu's mma884 note, and .row.row's B -
+// lane L holds row L % 4, columns 4 (L >= 16) + i), so the scores stay in registers: the softmax runs on the
+// accumulators, P goes to shared memory once (FP16, the A operand of P.V), and O's rescale and normalization are
+// register-only.  A warp's 4 quad pairs: qp = (L >> 2) & 3 - rows 8 (qp & 1) .., keys (or V dims) 8 (qp >> 1) ...  A
+// lane's accumulator c[i]: row (L & 1) + (i & 2) + 4 (L >= 16), column (i & 4) + (L & 2) + (i & 1) of its quad pair's
+// 8 x 8 - two rows, so a row's values are on lanes L ^ 2 and L ^ 8 too.
+__device__ __forceinline__ void mma884(float* c, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+                 "{%0,%1,%2,%3,%4,%5,%6,%7};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void mma884rr(float* c, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m8n8k4.row.row.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+                 "{%0,%1,%2,%3,%4,%5,%6,%7};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+}
+constexpr int kMK = 64, kLdP8 = kMK + 8;
+constexpr size_t kMmaSmem = (size_t) kMK * kLdK * 2 + (size_t) kMK * kLdV * 2 + (size_t) kTW * 16 * kLdP8 * 2;
+__global__ void __launch_bounds__(kTW * 32, 1) rows_mma_kernel(const float* __restrict__ q, int64_t qld, Kv kv,
+                                                               int64_t p0, int T, int n_head, int window,
+                                                               const float* __restrict__ sinks, float scale,
+                                                               float out_scale, float* __restrict__ out, int64_t ldo) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    __half* sK = (__half*) smem;                  // [kMK][kLdK]
+    __half* sV = sK + kMK * kLdK;                 // [kMK][kLdV]
+    const int h = blockIdx.y, r0 = blockIdx.x * kTQ, t = threadIdx.x, L = t & 31, w = t >> 5;
+    __half* sP = sV + kMK * kLdV + (size_t) w * 16 * kLdP8;   // the warp's P [16][kLdP8]
+    const int kvh = h / (n_head / kv.n_kv);
+    const int j = L & 3, hi = L >> 4, qp = (L >> 2) & 3, rb = qp & 1, cb = qp >> 1;
+    // Q: the lane's A row (8 rb + j + 4 hi of the warp's 16), all 192 dims as half2, scaled
+    uint32_t qa[kDK / 2];
+    {
+        const int row = r0 + w * 16 + 8 * rb + j + 4 * hi;
+        const float* qr = q + (size_t) row * qld + (size_t) h * kDK;
+#pragma unroll
+        for (int d = 0; d < kDK / 2; ++d) {
+            const float2 f = row < T ? *(const float2*) (qr + 2 * d) : make_float2(0.0f, 0.0f);
+            const __half2 hv = __floats2half2_rn(f.x * scale, f.y * scale);
+            qa[d] = *(const uint32_t*) &hv;
+        }
+    }
+    // the lane's two accumulator rows (of the warp's 16): ra, ra + 2
+    const int ra = 8 * rb + (L & 1) + 4 * hi;
+    int64_t rpos[2], rlo[2];
+    bool rok[2];
+#pragma unroll
+    for (int x = 0; x < 2; ++x) {
+        const int row = r0 + w * 16 + ra + 2 * x;
+        rok[x] = row < T;
+        rpos[x] = p0 + row;
+        rlo[x] = window > 0 ? max((int64_t) 0, rpos[x] - window + 1) : 0;
+    }
+    const int64_t last = p0 + min(r0 + kTQ, T) - 1;
+    const int64_t wlast = p0 + min(r0 + w * 16 + 16, T) - 1;
+    const int64_t lo_blk = window > 0 ? max((int64_t) 0, p0 + r0 - window + 1) : 0;
+    const int64_t wfirst = p0 + r0 + w * 16;
+    float m[2], l[2];
+#pragma unroll
+    for (int x = 0; x < 2; ++x) {
+        m[x] = sinks != nullptr ? sinks[h] : -INFINITY;
+        l[x] = sinks != nullptr ? 1.0f : 0.0f;
+    }
+    float o[kDV / 16][8];
+#pragma unroll
+    for (int g = 0; g < kDV / 16; ++g)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) o[g][i] = 0.0f;
+    for (int64_t k0 = lo_blk / kMK * kMK; k0 <= last; k0 += kMK) {
+        __syncthreads();
+        for (int i = t; i < kMK * (kDK / 8 + kDV / 8); i += kTW * 32) {
+            const int r = i / (kDK / 8 + kDV / 8), c = i % (kDK / 8 + kDV / 8);
+            const int64_t kp = k0 + r;
+            const bool ok = kp >= lo_blk && kp <= last;
+            uint4 u = make_uint4(0u, 0u, 0u, 0u);
+            if (c < kDK / 8) {
+                if (ok) u = k8h(kv, kp, kvh, c);
+                *(uint4*) (sK + r * kLdK + c * 8) = u;
+            } else {
+                const int cv = c - kDK / 8;
+                if (ok) u = v8h(kv, kp, kvh, cv);
+                *(uint4*) (sV + r * kLdV + cv * 8) = u;
+            }
+        }
+        __syncthreads();
+        if (k0 > wlast || (window > 0 && k0 + kMK - 1 < wfirst - window + 1)) continue;
+        // S = Q K^T: 4 groups of 16 keys, the lane's B column key 16 n + 8 cb + j + 4 hi
+        float sc[kMK / 16][8];
+#pragma unroll
+        for (int n = 0; n < kMK / 16; ++n)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) sc[n][i] = 0.0f;
+#pragma unroll
+        for (int st = 0; st < kDK / 4; ++st) {   // (fully unrolled: qa stays in registers)
+#pragma unroll
+            for (int n = 0; n < kMK / 16; ++n) {
+                const uint2 b = *(const uint2*) (sK + (16 * n + 8 * cb + j + 4 * hi) * kLdK + 4 * st);
+                mma884(sc[n], qa[2 * st], qa[2 * st + 1], b.x, b.y);
+            }
+        }
+        // the mask, the rows' maxima (over the lane, L ^ 2 and L ^ 8)
+        float mt[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+        for (int n = 0; n < kMK / 16; ++n)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int x = (i >> 1) & 1;
+                const int64_t kp = k0 + 16 * n + 8 * cb + (i & 4) + (L & 2) + (i & 1);
+                if (!rok[x] || kp > rpos[x] || kp < rlo[x]) sc[n][i] = -INFINITY;
+                mt[x] = fmaxf(mt[x], sc[n][i]);
+            }
+        float corr[2], mn[2], ps[2] = {0.0f, 0.0f};
+#pragma unroll
+        for (int x = 0; x < 2; ++x) {
+            mt[x] = fmaxf(mt[x], __shfl_xor_sync(0xffffffffu, mt[x], 2));
+            mt[x] = fmaxf(mt[x], __shfl_xor_sync(0xffffffffu, mt[x], 8));
+            mn[x] = fmaxf(m[x], mt[x]);
+            corr[x] = m[x] == -INFINITY ? (mn[x] == -INFINITY ? 1.0f : 0.0f) : __expf(m[x] - mn[x]);
+            m[x] = mn[x];
+        }
+        // P (FP16) into the warp's rows of sP, its row sums
+#pragma unroll
+        for (int n = 0; n < kMK / 16; ++n)
+#pragma unroll
+            for (int i = 0; i < 8; i += 2) {
+                const int x = (i >> 1) & 1;
+                const float a = sc[n][i] == -INFINITY ? 0.0f : __expf(sc[n][i] - mn[x]);
+                const float b = sc[n][i + 1] == -INFINITY ? 0.0f : __expf(sc[n][i + 1] - mn[x]);
+                ps[x] += a + b;
+                *(__half2*) (sP + (ra + (i & 2)) * kLdP8 + 16 * n + 8 * cb + (i & 4) + (L & 2)) = __floats2half2_rn(a, b);
+            }
+#pragma unroll
+        for (int x = 0; x < 2; ++x) {
+            ps[x] += __shfl_xor_sync(0xffffffffu, ps[x], 2);
+            ps[x] += __shfl_xor_sync(0xffffffffu, ps[x], 8);
+            l[x] = l[x] * corr[x] + ps[x];
+        }
+#pragma unroll
+        for (int g = 0; g < kDV / 16; ++g)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) o[g][i] *= corr[(i >> 1) & 1];
+        __syncwarp();
+        // O += P V: A = P's row 8 rb + j + 4 hi, keys 4 st ..; B (.row) = V's key 4 st + j, dims 16 g + 8 cb + 4 hi ..
+#pragma unroll 2
+        for (int st = 0; st < kMK / 4; ++st) {
+            const uint2 a = *(const uint2*) (sP + (8 * rb + j + 4 * hi) * kLdP8 + 4 * st);
+#pragma unroll
+            for (int g = 0; g < kDV / 16; ++g) {
+                const uint2 b = *(const uint2*) (sV + (4 * st + j) * kLdV + 16 * g + 8 * cb + 4 * hi);
+                mma884rr(o[g], a.x, a.y, b.x, b.y);
+            }
+        }
+        __syncwarp();   // (P read before the next tile writes it)
+    }
+#pragma unroll
+    for (int x = 0; x < 2; ++x) {
+        if (!rok[x]) continue;
+        const float inv = l[x] > 0.0f ? out_scale / l[x] : 0.0f;
+        float* orow = out + (size_t) (r0 + w * 16 + ra + 2 * x) * ldo + (size_t) h * kDV;
+#pragma unroll
+        for (int g = 0; g < kDV / 16; ++g)
+#pragma unroll
+            for (int i = 0; i < 8; i += 2) {
+                if (((i >> 1) & 1) != x) continue;
+                *(float2*) (orow + 16 * g + 8 * cb + (i & 4) + (L & 2)) = make_float2(o[g][i] * inv, o[g][i + 1] * inv);
+            }
+    }
+}
 #endif
 
 constexpr int kDecRows = 16;   // up to this many rows go through the decode kernel
@@ -589,6 +760,18 @@ void attn_body(const float* q, int64_t qld, int T, int64_t p0, int n_head, const
         cudaFuncSetAttribute(rows_tc_kernel<64, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int) TcCfg<64, false>::smem);
         attr = true;
+    }
+    // STRATA_MIMO_TC=1: the mma.m8n8k4 kernel (scores in registers)
+    static const int var = getenv("STRATA_MIMO_TC") != nullptr ? std::atoi(getenv("STRATA_MIMO_TC")) : 0;
+    if (var == 1) {
+        static bool attr1 = false;
+        if (!attr1) {
+            cudaFuncSetAttribute(rows_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kMmaSmem);
+            attr1 = true;
+        }
+        rows_mma_kernel<<<dim3((T + kTQ - 1) / kTQ, n_head), kTW * 32, kMmaSmem, s>>>(
+            q, qld, kv, p0, T, n_head, window, sinks, scale, out_scale, out, ldo);
+        return;
     }
     rows_tc_kernel<64, false><<<dim3((T + kTQ - 1) / kTQ, n_head), kTW * 32, TcCfg<64, false>::smem, s>>>(
         q, qld, kv, p0, T, n_head, window, sinks, scale, out_scale, out, ldo);
