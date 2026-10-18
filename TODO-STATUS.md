@@ -493,6 +493,22 @@ prompts 9-14 % and no decode.
 | E5 | Branch consolidation: mimo-dflash carries GLM + Hy3 + MiMo - replace glm-dflash as the fork's main line? (the user's call) | CLOSED (the user, 2026-10-18): keep the per-model branches as they are (glm-dflash, hy3, mimo, mimo-dflash) - no consolidation |
 | E6 | DeepSeek-V4.1-Flash (vLLM #59857): scope a port | CLOSED, not feasible here: hidden 5120, 384 experts x 2304, 40 layers, compress ratios 2/1 (V4: 4/128), KV / indexer sharing (kv_source_layer_ids), Engram n-gram tables (2 layers x ~384M entries), DSpark drafter, vision - antirez's Q2 GGUF 366 GB, Q4 519 GB vs ~94 GB VRAM + RAM even with +32 GB |
 
+### GLM decode / prefill review (2026-10-18, lessons from Hy3 / MiMo applied to GLM-5.3-Flash S24, one V100)
+
+Decode profile after an 8K prompt (STRATA_GLM_PROF=16; 38.2 ms a token of GPU stream time): expert fetch 8.2 ms
+(21.5 %), expert waits 5.0 (13.1 %, mostly disk), CPU-lane wait 2.7 (7 %), expert gate/up + down 5.0, KDA projections +
+output 5.0, MLA 3.3, routing / shared expert / rest the remainder - ~42 % of a token moves experts; VRAM hit 65-78 %,
+disk 2.3-3.6 reads a token (the S24 pack does not fit VRAM + RAM either).  Prefill (27K): experts at ~53 TFLOPS FP16,
+kda q/k/v ~46 TFLOPS - near the V100's rate; dsa_attn ~13 TFLOPS is the outlier (6.4 s; the MiMo m8n8k4 lesson: a
+register-level kernel gave nothing there - not pursued).
+
+| # | Item | Result |
+|---|---|---|
+| G1 | Route tail swap (STRATA_GLM_ROUTE_SWAP=2, +5-12 % on Hy3 / MiMo) on GLM, 2 rounds, 2K / 8K / 27K + 128 decoded | decode 26.4 / 26.3, 31.1 / 32.1, 29.7 / 31.0 vs default 26.6 / 26.5, 30.6 / 31.4, 30.5 / 30.9 tok/s - within noise (VRAM hit 77-78 -> 78.5 %: the route affinity 0.02 already does it); KL 0.0016. Not adopted |
+| G2 | FP16-expert threshold STRATA_GLM_PREFILL_BLAS 64 / 256 (default 128) | prompt 2K / 8K / 27K 571 / 760 / 837 and 578 / 754 / 831 vs 568-593 / 762-773 / 836-848 tok/s - no change; 64 rows KL 0.013. Default kept |
+| G3 | CUDA graphs for the decode (STRATA_GLM_KDA_GRAPH=1; turns the deferred CPU lane off) | 2K / 8K decode 23.6 / 27.6 and 23.3 / 29.0 vs 26.3 / 32.3 and 26.4 / 31.7 tok/s - slower (the deferred CPU lane is worth more than the launch savings). Not adopted |
+| G4 | RAM headroom 4 (live) / 3 / 2.5 GB - the MiMo lesson (M2) | running (chain137) |
+
 ### MiMo BPW2.5 without more RAM (the user, 2026-10-18: "run without the extra ram and deep dive into memory use")
 
 BPW2.5's experts are 84.3 GiB (BPW2.0 66.3); one V100 holds 3,666 in VRAM (25.7 GB), the rest must be pinned RAM.
