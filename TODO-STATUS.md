@@ -486,8 +486,8 @@ prompts 9-14 % and no decode.
 
 | # | Item | Status |
 |---|---|---|
-| E1 | MiMo full-context prompt attention: 6.3 s of a 28K prompt at ~23 TFLOPS (rows_tc_kernel); restructure (the heads-inner grid order was slower: 6.82 vs 6.26 s) | open |
-| E2 | MiMo decode attention: ~4 ms a token in the 9 global layers at 19.5K, far under bandwidth - profile (ncu / nsys) | open |
+| E1 | MiMo full-context prompt attention: 6.3 s of a 28K prompt at ~23 TFLOPS (rows_tc_kernel) | CLOSED, both tries slower: heads-inner grid order 6.82 / 6.87 vs 6.26 / 6.28 s; 32-key tiles with P over S (39 KB: two blocks an SM) 6.48 / 6.48 vs 6.32 / 6.32 s (and KL 0.019). A faster kernel needs a different structure (register-resident S/P, mma.sync instead of WMMA round trips) |
+| E2 | MiMo decode attention: ~4 ms a token in the 9 global layers at 19.5K, far under bandwidth - profile (ncu / nsys) | BLOCKED: ncu needs the GPU performance counters (ERR_NVGPUCTRPERM) - root: `NVreg_RestrictProfilingToAdminUsers=0` (modprobe.d + driver reload) or `sudo ncu` |
 | E3 | MiMo K/V cache quantization (FP16 only; Hy3 has int8 / TQ modes) | open |
 | E4 | Re-port hy3's sampler92 kernel pair (ffc6335), dropped in the mimo-dflash merge | CLOSED: nothing lost - ffc6335 only adds an A/B gate back to the old kernel (STRATA_GLM_SAMPLER92=0); the #92 kernel itself is glm-dflash's 2a30f64 |
 | E5 | Branch consolidation: mimo-dflash carries GLM + Hy3 + MiMo - replace glm-dflash as the fork's main line? (the user's call) | needs the user: (a) make mimo-dflash the fork's main line (GLM bit-for-bit = glm-dflash, Hy3 / MiMo measured) and retire hy3 / mimo / glm-dflash; (b) keep the per-model branches and only merge forward; (c) send model support upstream as separate PRs (Hy3, MiMo) |
