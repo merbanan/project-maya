@@ -3331,6 +3331,45 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             cudaMemcpy(host_probs_b_.data() + (size_t) il * g_.n_expert, it->second,
                        (size_t) g_.n_expert * sizeof(float), cudaMemcpyDeviceToHost);
     }
+    // 5b. domain pruning (STRATA_GLM_PRUNE=<file>, tools/prune_experts.py): the listed experts' selection bias -1e30,
+    //     so no route picks them (their weights were never counted: the rest renormalize as for any top-k), and the
+    //     tiers leave them out (fast_warm)
+    if (const char* pf = getenv("STRATA_GLM_PRUNE"); pf != nullptr && pf[0] != '\0') {
+        std::ifstream in(pf);
+        if (!in) {
+            err = std::string("STRATA_GLM_PRUNE: cannot open ") + pf;
+            return false;
+        }
+        pruned_.assign((size_t) g_.n_layers * g_.n_expert, 0);
+        std::string line;
+        int total = 0;
+        while (std::getline(in, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            std::istringstream ss(line);
+            int il = -1, e = -1;
+            ss >> il;
+            if (il < l0_ || il >= l1_) continue;
+            auto it = w_.find("blk." + std::to_string(il) + ".exp_probs_b.bias");
+            if (it == w_.end()) it = w_.find("blk." + std::to_string(il) + ".exp_probs_b");
+            if (it == w_.end()) {
+                err = "STRATA_GLM_PRUNE: layer " + std::to_string(il) + " has no selection bias to mask";
+                return false;
+            }
+            const float off = -1e30f;
+            while (ss >> e) {
+                if (e < 0 || e >= g_.n_expert || pruned_[(size_t) il * g_.n_expert + e]) continue;
+                pruned_[(size_t) il * g_.n_expert + e] = 1;
+                host_probs_b_[(size_t) il * g_.n_expert + e] = off;
+                if (cudaMemcpy((float*) it->second + e, &off, sizeof off, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    err = "STRATA_GLM_PRUNE: the bias update failed";
+                    return false;
+                }
+                ++total;
+            }
+        }
+        std::fprintf(stderr, "glm pack: CUDA%d %d experts pruned (%s): never routed, not held in a tier\n", dev_, total,
+                     pf);
+    }
 
     // 6. the state and scratch arenas (identical to load()), then the CPU MoE buffers
     const int64_t hc_dim = (int64_t) g_.hc * g_.n_embd;

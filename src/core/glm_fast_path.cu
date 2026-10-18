@@ -1543,7 +1543,8 @@ bool Glm5Model::fast_setup(std::string& err) {
             // (the experts its main slots cannot hold: the pool's lendable tail counts as not held - a prompt
             // borrows it, and the experts there go to RAM meanwhile, prefill_lend)
             cls_weight[(size_t) c] +=
-                (double) std::max(2, g.n_expert - F->lp[(size_t) il].n_main + gf::kSpares + 2 + F->ram_slack) * (double) st;
+                (double) std::max(2, g.n_expert - n_pruned(il) - F->lp[(size_t) il].n_main + gf::kSpares + 2 +
+                                         F->ram_slack) * (double) st;
         }
         double wsum = 0;
         for (double w : cls_weight) wsum += w;
@@ -3306,8 +3307,13 @@ bool Glm5Model::fast_warm(std::string& err) {
             }
         for (int e = 0; e < g.n_expert; ++e)
             if (!seen[(size_t) e]) clean.push_back(e);
+        // (pruned experts last: the tiers below stop before them)
+        if (!pruned_.empty() && il < g.n_layers)
+            std::stable_partition(clean.begin(), clean.end(),
+                                  [&](int e) { return !pruned_[(size_t) il * g.n_expert + e]; });
         o.swap(clean);
     }
+    const auto n_keep = [&](int il) { return g.n_expert - (il < g.n_layers ? n_pruned(il) : 0); };
     struct Job {
         int il, e;
         uint8_t* dst;    // the RAM slot, or the VRAM slot (staged)
@@ -3320,7 +3326,7 @@ bool Glm5Model::fast_warm(std::string& err) {
     for (int il = l0_; il < lt_; ++il) {
         if (!F->L[(size_t) il].moe) continue;
         auto& P = F->lp[(size_t) il];
-        const int nv = glmfast::warm_pool_slots(F->unified_memory, P.n, g.n_expert, gf::kSpares);
+        const int nv = std::min(n_keep(il), glmfast::warm_pool_slots(F->unified_memory, P.n, g.n_expert, gf::kSpares));
         for (int j = 0; j < nv; ++j) {
             const int e = order[(size_t) il][(size_t) j];
             const int key = il * g.n_expert + e;
@@ -3338,7 +3344,7 @@ bool Glm5Model::fast_warm(std::string& err) {
     for (bool progress = true; progress;) {
         progress = false;
         for (int il = l0_; il < lt_; ++il) {
-            if (!F->L[(size_t) il].moe || next[(size_t) il] >= g.n_expert) continue;
+            if (!F->L[(size_t) il].moe || next[(size_t) il] >= n_keep(il)) continue;
             const int c = F->layer_rc[(size_t) il];
             auto& R = F->rc[(size_t) c];
             if (rfree[(size_t) c] <= (F->ram_resident ? 0 : 4)) continue;   // resident: no disk-read slots to keep

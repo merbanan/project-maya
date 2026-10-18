@@ -416,6 +416,15 @@ public:
     std::map<std::string, strata::kernels::exl3::Mat> exl3_mats_;
     std::vector<float> host_x_, host_moe_, host_h_;        // per-token CPU MoE scratch
     std::vector<float> host_probs_b_;                      // the per-layer router bias (prefetch ranking)
+    /// STRATA_GLM_PRUNE=<file> ("layer e e e ..." lines, tools/prune_experts.py): experts never routed (their router
+    /// bias -1e30) and never warmed into a tier - [layer * n_expert + e]; empty: none
+    std::vector<char> pruned_;
+    int n_pruned(int il) const {
+        if (pruned_.empty()) return 0;
+        int n = 0;
+        for (int e = 0; e < g_.n_expert; ++e) n += pruned_[(size_t) il * g_.n_expert + e];
+        return n;
+    }
     std::vector<float> host_ff_, host_dn_;                 // per-expert gate/up and down outputs
     std::vector<uint8_t> host_act_, host_hq_;              // quantized activations
     cudaError_t pack_moe_tail(std::string& err, const std::vector<int>& ids,
