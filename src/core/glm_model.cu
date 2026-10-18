@@ -72,6 +72,7 @@ static bool pack_shard_names(const std::string& pack_dir, std::vector<std::strin
         return false;
     }
     std::string line;
+    std::vector<std::string> extra;   // "# extra shards: NAME" (tools/hybrid_pack.py): a second model's shard 1
     while (std::getline(ne, line)) {
         if (line.rfind("#", 0) == 0 && line.find("absolute offsets in ") != std::string::npos) {
             const std::string key = "absolute offsets in ";
@@ -79,25 +80,37 @@ static bool pack_shard_names(const std::string& pack_dir, std::vector<std::strin
             const size_t b = line.find(',', a);
             shard_names.push_back(line.substr(a, b == std::string::npos ? line.size() : b - a));
         }
+        const std::string xkey = "# extra shards: ";
+        if (line.rfind(xkey, 0) == 0) {
+            std::string n = line.substr(xkey.size());
+            while (!n.empty() && (n.back() == ' ' || n.back() == '\r')) n.pop_back();
+            if (!n.empty()) extra.push_back(n);
+        }
     }
     if (shard_names.empty()) {
         err = "pack: native_experts.txt names no source shards";
         return false;
     }
     // the header names only shard 1; the siblings follow the -NNNNN-of-MMMMM pattern
-    const std::string first = shard_names[0];
-    const size_t of = first.find("-of-");
-    if (of != std::string::npos) {
+    const auto siblings = [](const std::string& first) {
+        std::vector<std::string> out;
+        const size_t of = first.find("-of-");
+        if (of == std::string::npos) return std::vector<std::string>{first};
         const size_t sdash = first.rfind("-", of - 1);   // the dash that starts this shard's number
         const std::string stem = first.substr(0, sdash);
         const int total = std::atoi(first.c_str() + of + 4);
-        shard_names.clear();
         for (int i = 1; i <= total; ++i) {
             char buf[512];
             std::snprintf(buf, sizeof(buf), "%s-%05d-of-%05d.gguf", stem.c_str(), i, total);
-            shard_names.push_back(buf);
+            out.push_back(buf);
         }
-    }
+        return out;
+    };
+    shard_names = siblings(shard_names[0]);
+    // a hybrid pack: some layers' experts from a second quant of the model - its shards after the first set's (the
+    // dense tensors are looked up in order, so they come from the first)
+    for (const auto& x : extra)
+        for (const auto& n : siblings(x)) shard_names.push_back(n);
     return true;
 }
 
