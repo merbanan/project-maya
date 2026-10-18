@@ -507,7 +507,8 @@ register-level kernel gave nothing there - not pursued).
 | G1 | Route tail swap (STRATA_GLM_ROUTE_SWAP=2, +5-12 % on Hy3 / MiMo) on GLM, 2 rounds, 2K / 8K / 27K + 128 decoded | decode 26.4 / 26.3, 31.1 / 32.1, 29.7 / 31.0 vs default 26.6 / 26.5, 30.6 / 31.4, 30.5 / 30.9 tok/s - within noise (VRAM hit 77-78 -> 78.5 %: the route affinity 0.02 already does it); KL 0.0016. Not adopted |
 | G2 | FP16-expert threshold STRATA_GLM_PREFILL_BLAS 64 / 256 (default 128) | prompt 2K / 8K / 27K 571 / 760 / 837 and 578 / 754 / 831 vs 568-593 / 762-773 / 836-848 tok/s - no change; 64 rows KL 0.013. Default kept |
 | G3 | CUDA graphs for the decode (STRATA_GLM_KDA_GRAPH=1; turns the deferred CPU lane off) | 2K / 8K decode 23.6 / 27.6 and 23.3 / 29.0 vs 26.3 / 32.3 and 26.4 / 31.7 tok/s - slower (the deferred CPU lane is worth more than the launch savings). Not adopted |
-| G4 | RAM headroom 4 (live) / 3 / 2.5 GB - the MiMo lesson (M2) | running (chain137) |
+| G4 | RAM headroom 4 (live) / 3 / 2.5 GB - the MiMo lesson (M2) | DONE, 2 rounds: decode 2K / 8K / 27K at 4 GB 27.2 / 31.4 / 31.3 and 26.5 / 32.0 / 31.7; 3 GB 27.6 / 32.2 / 31.1 and 27.3 / 33.1 / 32.0; 2.5 GB 27.9 / 32.2 / 30.7 and 28.0 / 32.0 / 32.1 tok/s (disk 1.9 -> 1.7 -> 1.2-1.7 reads a token; least free RAM 2.3 / 2.3 / 1.7 GB) - 3 GB ~+2 %, within a round's noise; a live-config change for the user to decide |
+| G5 | Upstream scan (2026-10-18; mw00 to #270, Strata #2818-3064): #227 AVX-512 one-token IQ2_XXS CPU rows (merged in v1.1.15, not in the live tree; the 7950X has F/BW/VL/VNNI/VBMI + BMI2) - A/B on upstream main; also #228 miss-skip by weight (lossy), #262 Volta grouped-WMMA prompt experts, #234 sm_70 sign decoding, Strata #2964 adaptive fetch, #3060 no second file read on promotion | #227 A/B running (chain138) |
 
 ### MiMo BPW2.5 without more RAM (the user, 2026-10-18: "run without the extra ram and deep dive into memory use")
 
