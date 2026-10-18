@@ -5199,6 +5199,7 @@ mimo::Kv Glm5Model::mimo_view(int il) const {
     v.ring = g_.swa(il);
     v.pos0 = 0;
     v.q8 = mimo_kv_q8();
+    v.v4 = mimo_kv_v4();
     return v;
 }
 

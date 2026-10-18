@@ -23,7 +23,7 @@ __device__ __forceinline__ const uint8_t* k_rec(const Kv& kv, int64_t pos) {
     return (const uint8_t*) kv.k + (size_t) slot_of(kv, pos) * rec_k_bytes(kv.n_kv, kv.q8);
 }
 __device__ __forceinline__ const uint8_t* v_rec(const Kv& kv, int64_t pos) {
-    return (const uint8_t*) kv.v + (size_t) slot_of(kv, pos) * rec_v_bytes(kv.n_kv, kv.q8);
+    return (const uint8_t*) kv.v + (size_t) slot_of(kv, pos) * rec_v_bytes(kv.n_kv, kv.q8, kv.v4);
 }
 // 8 values of a K row (dims 8c ..) as 8 halves
 __device__ __forceinline__ uint4 k8h(const Kv& kv, int64_t pos, int h, int c) {
@@ -42,6 +42,18 @@ __device__ __forceinline__ uint4 k8h(const Kv& kv, int64_t pos, int h, int c) {
 __device__ __forceinline__ uint4 v8h(const Kv& kv, int64_t pos, int h, int c) {
     const uint8_t* r = v_rec(kv, pos);
     if (!kv.q8) return ((const uint4*) ((const __half*) r + (size_t) h * kDV))[c];
+    if (kv.v4) {   // 4-bit codes (+ 8), the even dim in the low nibble
+        const float sc = __half2float(((const __half*) (r + (size_t) kv.n_kv * (kDV / 2)))[h * (kDV / 32) + c / 4]);
+        const uint32_t u = *(const uint32_t*) (r + (size_t) h * (kDV / 2) + 4 * c);
+        uint4 o;
+        __half2* oh = (__half2*) &o;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const uint32_t b = (u >> (8 * e)) & 0xffu;
+            oh[e] = __floats2half2_rn(((int) (b & 15u) - 8) * sc, ((int) (b >> 4) - 8) * sc);
+        }
+        return o;
+    }
     const float sc = __half2float(((const __half*) (r + (size_t) kv.n_kv * kDV))[h * (kDV / 32) + c / 4]);
     const uint2 u = *(const uint2*) (r + (size_t) h * kDV + 8 * c);
     const int8_t* b = (const int8_t*) &u;
@@ -61,6 +73,15 @@ __device__ __forceinline__ void v4f(const Kv& kv, int64_t pos, int h, int lane, 
         f[1] = a.y;
         f[2] = b.x;
         f[3] = b.y;
+        return;
+    }
+    if (kv.v4) {
+        const float sc = __half2float(((const __half*) (r + (size_t) kv.n_kv * (kDV / 2)))[h * (kDV / 32) + lane / 8]);
+        const uint32_t u = *(const uint16_t*) (r + (size_t) h * (kDV / 2) + 2 * lane);
+        f[0] = ((int) (u & 15u) - 8) * sc;
+        f[1] = ((int) ((u >> 4) & 15u) - 8) * sc;
+        f[2] = ((int) ((u >> 8) & 15u) - 8) * sc;
+        f[3] = ((int) (u >> 12) - 8) * sc;
         return;
     }
     const float sc = __half2float(((const __half*) (r + (size_t) kv.n_kv * kDV))[h * (kDV / 32) + lane / 8]);
@@ -91,6 +112,54 @@ __device__ __forceinline__ void put_row(const float* x, int n, uint8_t* rec, int
         if (lane == 0) scales[b] = sh;
     }
 }
+// the orthonormal 128-point Walsh-Hadamard transform of a warp's row (value 32 b + lane in x[b]), in place
+__device__ __forceinline__ void wht128(float x[4], int lane) {
+#pragma unroll
+    for (int m = 1; m < 32; m <<= 1) {
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            const float o = __shfl_xor_sync(0xffffffffu, x[b], m);
+            x[b] = (lane & m) ? o - x[b] : x[b] + o;
+        }
+    }
+    const float a0 = x[0] + x[1], a1 = x[0] - x[1], a2 = x[2] + x[3], a3 = x[2] - x[3];
+    x[0] = (a0 + a2) * 0.08838834764831845f;   // (1 / sqrt(128))
+    x[1] = (a1 + a3) * 0.08838834764831845f;
+    x[2] = (a0 - a2) * 0.08838834764831845f;
+    x[3] = (a1 - a3) * 0.08838834764831845f;
+}
+// a V row (128 floats) as v4's rotated 4-bit codes with an absmax / 7 scale (FP16) for each 32 values - a warp a head
+__device__ __forceinline__ void put_v4(const float* x, uint8_t* rec, int n_kv, int h, int lane) {
+    float y[4];
+#pragma unroll
+    for (int b = 0; b < 4; ++b) y[b] = x[b * 32 + lane];
+    wht128(y, lane);
+    uint8_t* d = rec + (size_t) h * (kDV / 2);
+    __half* scales = (__half*) (rec + (size_t) n_kv * (kDV / 2)) + (size_t) h * (kDV / 32);
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        float mx = fabsf(y[b]);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+        const __half sh = __float2half(mx > 0.0f ? mx / 7.0f : 1.0f);
+        const float sc = __half2float(sh);
+        const int q = __float2int_rn(fminf(7.0f, fmaxf(-7.0f, y[b] / sc))) + 8;
+        const int qn = __shfl_xor_sync(0xffffffffu, q, 1);
+        if ((lane & 1) == 0) d[(b * 32 + lane) / 2] = (uint8_t) (q | (qn << 4));
+        if (lane == 0) scales[b] = sh;
+    }
+}
+// the attention's output rows back from V's rotation: grid (T, n_head), a warp each head's 128 values (H H = I)
+__global__ void __launch_bounds__(32) unrot_kernel(float* __restrict__ out, int64_t ldo) {
+    float* o = out + (size_t) blockIdx.x * ldo + (size_t) blockIdx.y * kDV;
+    const int lane = threadIdx.x;
+    float y[4];
+#pragma unroll
+    for (int b = 0; b < 4; ++b) y[b] = o[b * 32 + lane];
+    wht128(y, lane);
+#pragma unroll
+    for (int b = 0; b < 4; ++b) o[b * 32 + lane] = y[b];
+}
 
 // ---- rope (NeoX: pairs i, i + n_rot / 2 over the first n_rot dims, theta = pos * base^(-2 i / n_rot), as ggml's
 // rope_neox) on q and k, then k and v into the records
@@ -115,17 +184,18 @@ __global__ void __launch_bounds__(256) prep_kernel(float* __restrict__ qkv, int6
     const float* v = k + (size_t) kv.n_kv * kDK;
     const int64_t sl = slot_of(kv, pos);
     uint8_t* kd = (uint8_t*) kv.k + (size_t) sl * rec_k_bytes(kv.n_kv, kv.q8);
-    uint8_t* vd = (uint8_t*) kv.v + (size_t) sl * rec_v_bytes(kv.n_kv, kv.q8);
+    uint8_t* vd = (uint8_t*) kv.v + (size_t) sl * rec_v_bytes(kv.n_kv, kv.q8, kv.v4);
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw = (int) (blockDim.x >> 5);
     for (int h = w; h < kv.n_kv; h += nw) {
         put_row(k + (size_t) h * kDK, kDK, kd, kv.n_kv, h, kv.q8, lane);
-        put_row(v + (size_t) h * kDV, kDV, vd, kv.n_kv, h, kv.q8, lane);
+        if (kv.v4) put_v4(v + (size_t) h * kDV, vd, kv.n_kv, h, lane);
+        else put_row(v + (size_t) h * kDV, kDV, vd, kv.n_kv, h, kv.q8, lane);
     }
 }
 
 __global__ void __launch_bounds__(256) copy_kernel(Kv src, Kv dst, int64_t lo) {
     const int64_t pos = lo + blockIdx.x;   // (both views in one format)
-    const size_t rk = rec_k_bytes(src.n_kv, src.q8), rv = rec_v_bytes(src.n_kv, src.q8);
+    const size_t rk = rec_k_bytes(src.n_kv, src.q8), rv = rec_v_bytes(src.n_kv, src.q8, src.v4);
     const uint2* ks = (const uint2*) ((const uint8_t*) src.k + (size_t) slot_of(src, pos) * rk);
     const uint2* vs = (const uint2*) ((const uint8_t*) src.v + (size_t) slot_of(src, pos) * rv);
     uint2* kd = (uint2*) ((uint8_t*) dst.k + (size_t) slot_of(dst, pos) * rk);
@@ -480,12 +550,13 @@ size_t attn_scratch_floats(int n_head, int T, int64_t max_keys, int min_kv) {
     return (size_t) T * n_head * n_split * kPart;
 }
 
-void attn(const float* q, int64_t qld, int T, int64_t p0, int n_head, const Kv& kv, int window, const float* sinks,
-          float scale, float out_scale, float* out, int64_t ldo, float* scratch, cudaStream_t s) {
+namespace {
+void attn_body(const float* q, int64_t qld, int T, int64_t p0, int n_head, const Kv& kv, int window, const float* sinks,
+               float scale, float out_scale, float* out, int64_t ldo, float* scratch, cudaStream_t s) {
     if (T <= 0) return;
 #if defined(STRATA_USE_HIP)
     for (int r = 0; r + kDecRows < T; r += kDecRows)
-        attn(q + (size_t) r * qld, qld, kDecRows, p0 + r, n_head, kv, window, sinks, scale, out_scale,
+        attn_body(q + (size_t) r * qld, qld, kDecRows, p0 + r, n_head, kv, window, sinks, scale, out_scale,
              out + (size_t) r * ldo, ldo, scratch, s);
     if (T > kDecRows) {
         const int r = (T - 1) / kDecRows * kDecRows;
@@ -522,6 +593,14 @@ void attn(const float* q, int64_t qld, int T, int64_t p0, int n_head, const Kv& 
     rows_tc_kernel<64, false><<<dim3((T + kTQ - 1) / kTQ, n_head), kTW * 32, TcCfg<64, false>::smem, s>>>(
         q, qld, kv, p0, T, n_head, window, sinks, scale, out_scale, out, ldo);
 #endif
+}
+}  // namespace
+
+void attn(const float* q, int64_t qld, int T, int64_t p0, int n_head, const Kv& kv, int window, const float* sinks,
+          float scale, float out_scale, float* out, int64_t ldo, float* scratch, cudaStream_t s) {
+    if (T <= 0) return;
+    attn_body(q, qld, T, p0, n_head, kv, window, sinks, scale, out_scale, out, ldo, scratch, s);
+    if (kv.v4) unrot_kernel<<<dim3(T, n_head), 32, 0, s>>>(out, ldo);
 }
 
 void copy(const Kv& src, const Kv& dst, int64_t lo, int64_t hi, cudaStream_t s) {
