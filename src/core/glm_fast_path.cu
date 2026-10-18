@@ -5198,6 +5198,7 @@ mimo::Kv Glm5Model::mimo_view(int il) const {
     v.cap = (int) mimo_kv_cap(g_, il, max_ctx_);
     v.ring = g_.swa(il);
     v.pos0 = 0;
+    v.q8 = mimo_kv_q8();
     return v;
 }
 
@@ -6695,9 +6696,9 @@ std::vector<std::pair<int64_t, int64_t>> Glm5Model::running_runs() const {
     for (const int il : ls) {
         if (g.is_recr(il)) r.push_back({kda_S_[(size_t) il], run});
         if (g.swa(il)) {
-            const int64_t cap = mimo_kv_cap(g, il, max_ctx_), nkv = g.n_head_kv[(size_t) il];
-            r.push_back({mimo_k_[(size_t) il], cap * nkv * g.head_dim / 2});
-            r.push_back({mimo_v_[(size_t) il], cap * nkv * g.v_dim / 2});
+            const int64_t cap = mimo_kv_cap(g, il, max_ctx_);
+            r.push_back({mimo_k_[(size_t) il], cap * mimo_rec_k(g, il) / 4});
+            r.push_back({mimo_v_[(size_t) il], cap * mimo_rec_v(g, il) / 4});
         }
     }
     return r;
@@ -7107,9 +7108,8 @@ std::vector<std::pair<int64_t, int64_t>> Glm5Model::slot_gqa_runs(int64_t n) con
     if (g_.mimo()) {   // mimo2: the full-context layers' K and V rows of [0, n) (the window rings are in the snapshot)
         for (int il = l0_; il < l1_; ++il)
             if (!g_.swa(il)) {
-                const int64_t nkv = g_.n_head_kv[(size_t) il];
-                r.push_back({mimo_k_[(size_t) il], n * nkv * g_.head_dim / 2});
-                r.push_back({mimo_v_[(size_t) il], n * nkv * g_.v_dim / 2});
+                r.push_back({mimo_k_[(size_t) il], n * mimo_rec_k(g_, il) / 4});
+                r.push_back({mimo_v_[(size_t) il], n * mimo_rec_v(g_, il) / 4});
             }
         return r;
     }

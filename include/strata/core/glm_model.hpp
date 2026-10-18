@@ -149,6 +149,18 @@ public:
     static int64_t mimo_kv_cap(const Glm5Geometry& g, int il, int64_t max_ctx) {
         return g.swa(il) ? std::min<int64_t>(max_ctx, (int64_t) g.swa_window + 64) : max_ctx;
     }
+    /// mimo2: the K / V records' format - STRATA_MIMO_KV=int8 (int8 + a scale a head and position: half of FP16's)
+    static bool mimo_kv_q8() {
+        static const bool q8 = getenv("STRATA_MIMO_KV") != nullptr && std::string(getenv("STRATA_MIMO_KV")) == "int8";
+        return q8;
+    }
+    /// ... and a layer's K and V record bytes for one position
+    static int64_t mimo_rec_k(const Glm5Geometry& g, int il) {
+        return (int64_t) strata::kernels::mimo::rec_k_bytes(g.n_head_kv[(size_t) il], mimo_kv_q8());
+    }
+    static int64_t mimo_rec_v(const Glm5Geometry& g, int il) {
+        return (int64_t) strata::kernels::mimo::rec_v_bytes(g.n_head_kv[(size_t) il], mimo_kv_q8());
+    }
     /// The fast decode path (src/core/glm_fast_path.cu) is the default for packs; STRATA_GLM_SLOW=1
     /// keeps the correctness-first per-op path (the reference the fast path is checked against).
     bool fast() const { return fast_ != nullptr; }

@@ -1569,7 +1569,9 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     }
     // (mimo2: a layer's FP16 K / V records - the whole context, or the sliding window's ring)
     const auto layer_state = [&](int l) -> double {
-        if (g.mimo()) return (double) Glm5Model::mimo_kv_cap(g, l, max_ctx) * g.n_head_kv[(size_t) l] * (g.head_dim + g.v_dim) * 2.0;
+        if (g.mimo())
+            return (double) Glm5Model::mimo_kv_cap(g, l, max_ctx) *
+                   (double) (Glm5Model::mimo_rec_k(g, l) + Glm5Model::mimo_rec_v(g, l));
         return g.is_recr(l) ? kda_state + win_kda : dsa_state;
     };
     // the experts: a layer's blob and its VRAM slot's stride (native_experts.txt)
@@ -3413,15 +3415,16 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         for (int il = l0_; il < l1_; ++il) ls.push_back(il);
         if (mtp_il_ >= 0) ls.push_back(mtp_il_);   // (the draft block: a window layer of its own)
         for (const int il : ls) {
-            const int64_t cap = mimo_kv_cap(g_, il, max_ctx), nkv = g_.n_head_kv[(size_t) il];
+            const int64_t cap = mimo_kv_cap(g_, il, max_ctx), rk = mimo_rec_k(g_, il), rv = mimo_rec_v(g_, il);
             mimo_k_[(size_t) il] = floats;
-            floats += (cap * nkv * g_.head_dim * 2 + 255) / 256 * 64;
+            floats += (cap * rk + 255) / 256 * 64;
             mimo_v_[(size_t) il] = floats;
-            floats += (cap * nkv * g_.v_dim * 2 + 255) / 256 * 64;
-            bytes += cap * nkv * (g_.head_dim + g_.v_dim) * 2;
+            floats += (cap * rv + 255) / 256 * 64;
+            bytes += cap * (rk + rv);
         }
-        std::fprintf(stderr, "glm pack: CUDA%d mimo2 K/V records FP16, %.2f GB (window layers: a %d-position ring)\n",
-                     dev_, (double) bytes / 1073741824.0, (int) std::min<int64_t>(max_ctx, g_.swa_window + 64));
+        std::fprintf(stderr, "glm pack: CUDA%d mimo2 K/V records %s, %.2f GB (window layers: a %d-position ring)\n",
+                     dev_, mimo_kv_q8() ? "INT8 (STRATA_MIMO_KV=int8)" : "FP16", (double) bytes / 1073741824.0,
+                     (int) std::min<int64_t>(max_ctx, g_.swa_window + 64));
     }
     if (mtp_il_ >= 0 && g_.gqa()) {   // hy_v3's draft block: its rows are in the records
     } else if (mtp_il_ >= 0) {
