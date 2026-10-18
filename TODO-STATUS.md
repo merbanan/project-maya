@@ -488,7 +488,11 @@ prompts 9-14 % and no decode.
 |---|---|---|
 | E1 | MiMo full-context prompt attention: 6.3 s of a 28K prompt at ~23 TFLOPS (rows_tc_kernel) | CLOSED, both tries slower: heads-inner grid order 6.82 / 6.87 vs 6.26 / 6.28 s; 32-key tiles with P over S (39 KB: two blocks an SM) 6.48 / 6.48 vs 6.32 / 6.32 s (and KL 0.019). A faster kernel needs a different structure (register-resident S/P, mma.sync instead of WMMA round trips) |
 | E2 | MiMo decode attention: ~4 ms a token in the 9 global layers at 19.5K, far under bandwidth - profile (ncu / nsys) | BLOCKED: ncu needs the GPU performance counters (ERR_NVGPUCTRPERM) - root: `NVreg_RestrictProfilingToAdminUsers=0` (modprobe.d + driver reload) or `sudo ncu` |
-| E3 | MiMo K/V cache quantization (FP16 only; Hy3 has int8 / TQ modes) | open |
+| E3 | MiMo K/V cache quantization (FP16 only; Hy3 has int8 / TQ modes) | DONE (mimo-dflash): STRATA_MIMO_KV=int8, a scale each 32 values - KL vs FP16 0.021 (floor 0.013), 262K context records 5.66 -> 2.90 GB, decode +10 % at 19.5K; opt-in |
 | E4 | Re-port hy3's sampler92 kernel pair (ffc6335), dropped in the mimo-dflash merge | CLOSED: nothing lost - ffc6335 only adds an A/B gate back to the old kernel (STRATA_GLM_SAMPLER92=0); the #92 kernel itself is glm-dflash's 2a30f64 |
 | E5 | Branch consolidation: mimo-dflash carries GLM + Hy3 + MiMo - replace glm-dflash as the fork's main line? (the user's call) | needs the user: (a) make mimo-dflash the fork's main line (GLM bit-for-bit = glm-dflash, Hy3 / MiMo measured) and retire hy3 / mimo / glm-dflash; (b) keep the per-model branches and only merge forward; (c) send model support upstream as separate PRs (Hy3, MiMo) |
 | E6 | DeepSeek-V4.1-Flash (vLLM #59857): scope a port | CLOSED, not feasible here: hidden 5120, 384 experts x 2304, 40 layers, compress ratios 2/1 (V4: 4/128), KV / indexer sharing (kv_source_layer_ids), Engram n-gram tables (2 layers x ~384M entries), DSpark drafter, vision - antirez's Q2 GGUF 366 GB, Q4 519 GB vs ~94 GB VRAM + RAM even with +32 GB |
+- MiMo BPW2.5 vs BPW2.0 (62 GB RAM, one V100): over 1024 decoded positions BPW2.5's target log-prob +0.059 (~6 %
+  lower perplexity), KL 0.27, top-1 76 % between them. Decode after 2K / 8K / 28K: BPW2.0 37.0-36.3 / 41.0-39.1 /
+  31.2-30.9 tok/s, BPW2.5 23.8-25.5 / 32.0-34.0 / 18.1-17.6 (2 / 2 / 12 disk reads a token: ~10 GB of its experts on
+  the NVMe); prompts equal (28K ~33 s). With +32 GB RAM the disk reads go away.
