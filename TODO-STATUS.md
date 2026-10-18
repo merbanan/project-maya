@@ -492,6 +492,23 @@ prompts 9-14 % and no decode.
 | E4 | Re-port hy3's sampler92 kernel pair (ffc6335), dropped in the mimo-dflash merge | CLOSED: nothing lost - ffc6335 only adds an A/B gate back to the old kernel (STRATA_GLM_SAMPLER92=0); the #92 kernel itself is glm-dflash's 2a30f64 |
 | E5 | Branch consolidation: mimo-dflash carries GLM + Hy3 + MiMo - replace glm-dflash as the fork's main line? (the user's call) | needs the user: (a) make mimo-dflash the fork's main line (GLM bit-for-bit = glm-dflash, Hy3 / MiMo measured) and retire hy3 / mimo / glm-dflash; (b) keep the per-model branches and only merge forward; (c) send model support upstream as separate PRs (Hy3, MiMo) |
 | E6 | DeepSeek-V4.1-Flash (vLLM #59857): scope a port | CLOSED, not feasible here: hidden 5120, 384 experts x 2304, 40 layers, compress ratios 2/1 (V4: 4/128), KV / indexer sharing (kv_source_layer_ids), Engram n-gram tables (2 layers x ~384M entries), DSpark drafter, vision - antirez's Q2 GGUF 366 GB, Q4 519 GB vs ~94 GB VRAM + RAM even with +32 GB |
+
+### MiMo quality tests (added 2026-10-18) - loops seen in 28K runs: does BPW2.5 or an INT8 / FP16 K/V cache fix them?
+
+Seen: 28K raw-completion runs (the K8V4 default, both prompt kernels) ended in loops ("4,444 4,444 ...", "11
+sparse-attention layers, 11 sparse-attention layers ..."); the FP16 runs before did not, but those prompts are raw text
+(no chat template), where greedy loops are common for any quant.  The tests separate the causes: the prompt format,
+the K/V cache format, the weight quant, and run-to-run noise (the tier state - STRATA_GLM_ROUTE_SWAP=0 /
+STRATA_GLM_CPU_LANE=0 make a run exact).
+
+| # | Test | Status |
+|---|---|---|
+| Q1 | Long-context KL: K8V4 / INT8 against FP16 K/V, 24K teacher-forced, 512 decoded positions (the 8K test gave K8V4 0.034, INT8 0.021) | running (chain120) |
+| Q2 | Loop suite (tools/mimo_quality.py): greedy, chat template (thinking off), 512-1024 new tokens - 28K / 8K summary, raw-completion summary (the format that looped), long story, a 40-item list, code, a math word problem; metrics: a loop at the tail (period <= 256, repeated 3x), repeated-4-gram rate, EOS reached, task checks (distinct list items, code compiles, the math answer) | TODO |
+| Q3 | Q2's matrix: BPW2.0 x {FP16, INT8, K8V4} K/V, BPW2.5 x {FP16, INT8, K8V4}; exact runs (swap / CPU lane off) so a difference is the format, not noise - where BPW2.0 loops, does BPW2.5 or INT8 / FP16 K/V fix it? | TODO |
+| Q4 | Needles: 3 facts at 10 / 50 / 85 % depth, 8K / 24K / 56K, every Q3 config | TODO |
+| Q5 | The prompt kernels: wmma vs mma.m8n8k4 (STRATA_MIMO_TC=1) on the Q2 suite (KL 0.018 against wmma at 8K) | TODO |
+| Q6 | Decide the defaults from Q1-Q5: the K/V format (K8V4 stays only if it loops no more than FP16) and the recommended weight quant | TODO |
 - MiMo BPW2.5 vs BPW2.0 (62 GB RAM, one V100): over 1024 decoded positions BPW2.5's target log-prob +0.059 (~6 %
   lower perplexity), KL 0.27, top-1 76 % between them. Decode after 2K / 8K / 28K: BPW2.0 37.0-36.3 / 41.0-39.1 /
   31.2-30.9 tok/s, BPW2.5 23.8-25.5 / 32.0-34.0 / 18.1-17.6 (2 / 2 / 12 disk reads a token: ~10 GB of its experts on
