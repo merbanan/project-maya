@@ -789,4 +789,104 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
     return ok;
 }
 
+// ---------------------------------------------------------------- the lookup decode (E7)
+// Drafts that cost nothing: when the answer repeats text the context already has (a file given back with an edit, a
+// quoted passage, a renamed identifier), what followed the earlier occurrence is the guess.  A round with a proposal
+// runs one verify window over [last token, drafts...] and keeps the drafts while the target's picks match them; a
+// round without one is a plain token, so ordinary text runs as before.  The number of drafts follows the match (as
+// VecSzn/PolyStrata does it): STRATA_GLM_LOOKUP_SHORT (3) for a match shorter than STRATA_GLM_LOOKUP_LONG (8) tokens,
+// STRATA_GLM_LOOKUP_MAX (12) from there.  A window touches more distinct experts than a token, and on one V100 with a
+// third of the experts in VRAM that is not free: a match whose drafts keep failing costs a window a round, so after
+// a rejected first draft the next STRATA_GLM_LOOKUP_BACKOFF (4) rounds' short proposals are not tried.
+bool Glm5Model::decode_lookup(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
+                              const std::function<int(int32_t* out, int max, int& match)>& propose, int64_t& produced,
+                              std::string& err) {
+    produced = 0;
+    if (fast_ == nullptr || split_next_ != nullptr) {
+        err = "glm lookup: needs the fast path on one GPU";
+        return false;
+    }
+    const auto env_i = [](const char* k, int d) {
+        const char* v = getenv(k);
+        return v != nullptr ? std::atoi(v) : d;
+    };
+    static const int n_short = std::max(1, std::min(kWinMax - 1, env_i("STRATA_GLM_LOOKUP_SHORT", 3)));
+    static const int n_long = std::max(n_short, std::min(kWinMax - 1, env_i("STRATA_GLM_LOOKUP_MAX", 12)));
+    static const int long_from = env_i("STRATA_GLM_LOOKUP_LONG", 8);
+    static const int backoff = std::max(0, env_i("STRATA_GLM_LOOKUP_BACKOFF", 4));
+    static const bool trace = getenv("STRATA_GLM_LOOKUP_TRACE") != nullptr;
+    int y = -1;
+    if (sp.greedy && last_tok_ >= 0) {
+        y = last_tok_;
+    } else {
+        y = fast_sample(sp, err);
+        if (y < 0) return false;
+    }
+    y = forced(y);
+    sp.counter += 1;
+    last_tok_ = y;
+    ++produced;
+    if (!emit(y) || produced >= max_new || pos_ + 1 >= max_ctx_) return true;
+    std::vector<int32_t> win((size_t) kWinMax), out((size_t) kWinMax), prop((size_t) kWinMax);
+    int cool = 0;
+    for (;;) {
+        const int64_t p0 = pos_;   // where y goes
+        int match = 0;
+        int nd = propose(prop.data(), n_long, match);
+        if (nd > 0 && match < long_from) {
+            nd = cool > 0 ? 0 : std::min(nd, n_short);
+        }
+        if (cool > 0) --cool;
+        nd = (int) std::min<int64_t>(nd, max_new - produced - 1);
+        nd = (int) std::min<int64_t>(nd, max_ctx_ - 1 - p0);
+        nd = std::max(nd, 0);
+        if (nd == 0) {
+            // ---- a plain token
+            if (!fast_token(y, err)) return false;
+            int y2 = -1;
+            if (sp.greedy) {
+                y2 = last_tok_;
+            } else {
+                y2 = fast_sample(sp, err);
+                if (y2 < 0) return false;
+            }
+            y2 = forced(y2);
+            sp.counter += 1;
+            last_tok_ = y2;
+            ++produced;
+            y = y2;
+            if (!emit(y2) || produced >= max_new || p0 + 2 >= max_ctx_) return true;
+            continue;
+        }
+        const int T = 1 + nd;
+        win[0] = y;
+        for (int i = 0; i < nd; ++i) win[(size_t) i + 1] = prop[(size_t) i];
+        if (!window(win.data(), T, out.data(), err, &sp)) return false;
+        // row t's pick is the truth for p0 + t + 1; draft t + 1 stands while they match
+        int keep = 1, acc = 0;
+        bool more = true;
+        for (int t = 0; t < T; ++t) {
+            const int yy = forced(out[(size_t) t]);
+            sp.counter += 1;
+            last_tok_ = yy;
+            ++produced;
+            keep = t + 1;
+            y = yy;
+            more = emit(yy) && produced < max_new && p0 + keep + 1 < max_ctx_;
+            if (!more || t + 1 >= T) break;
+            if (yy != win[(size_t) t + 1]) break;
+            ++acc;
+        }
+        if (!window_commit(keep, err)) return false;
+        if (acc == 0 && match < long_from) cool = backoff;
+        ++lookup_rounds_;
+        lookup_tokens_ += (uint64_t) keep;
+        spec_steps_ += (uint64_t) nd;
+        spec_hits_ += (uint64_t) acc;
+        if (trace)
+            std::fprintf(stderr, "glm lookup: p %lld match %d drafts %d accepted %d\n", (long long) p0, match, nd, acc);
+        if (!more) return true;
+    }
+}
+
 }  // namespace strata::core

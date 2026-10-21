@@ -1101,6 +1101,14 @@ bool Glm5Model::fast_setup(std::string& err) {
             std::fprintf(stderr, "glm mtp: CUDA%d %s - decoding token by token\n", dev_, werr.c_str());
         }
     }
+    // the lookup decode (E7, STRATA_GLM_LOOKUP): the same window and backup, before the pool too (at the first window
+    // the pool has the VRAM and the backup does not allocate)
+    if (const char* lk = getenv("STRATA_GLM_LOOKUP"); lk != nullptr && std::atoi(lk) > 0 && split_next_ == nullptr &&
+                                                      l0_ == 0 && !dflash_on_ && !mtp_dec_) {
+        std::string werr;
+        if (!win_reserve(werr))
+            std::fprintf(stderr, "glm lookup: CUDA%d %s - decoding token by token\n", dev_, werr.c_str());
+    }
     // ---- the expert pool: per-layer partitions (equal quota per layer within its size class)
     size_t blob_max = 0;
     int n_moe = 0;

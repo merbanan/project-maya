@@ -2931,6 +2931,8 @@ struct RouteArgs {
                                 // weight stays its own probability) - LOSSY, it changes which experts run (0: off)
     int swap_ranks;             // STRATA_GLM_ROUTE_SWAP=<n>: the last n ranks may take a VRAM-resident runner-up
     float swap_margin;          // STRATA_GLM_ROUTE_SWAP_MARGIN: within this much of the swapped one's selection score
+    float miss_skip_w;          // STRATA_GLM_MISS_SKIP_W: an expert not in VRAM whose share of the route's weights is
+                                // below this is left out (no fetch, no CPU work) - LOSSY (0: off)
 };
 
 __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_constant__ RouteArgs a) {
@@ -3129,7 +3131,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             unsigned int rcnt[8];
             for (int i = 0; i < a.k; ++i) {
                 const unsigned int c = s_cnt[i];
-                if (i < skip_from && s_tv[i] == 0ull && s_rv[i] != 0ull) {
+                if (i < skip_from && s_tv[i] == 0ull && s_rv[i] != 0ull &&
+                    !((float) ((double) s_p[s_ids[i]] * inv) < a.miss_skip_w)) {
                     ri[f_ram] = i;
                     rcnt[f_ram++] = c;
                 }
@@ -3152,6 +3155,10 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             s_cs[i] = 0ull;
             if (ptr == 0ull && i >= skip_from) {
                 // left out: the expert kernels skip a null plan entry (a draft only has to be a good guess)
+            } else if (ptr == 0ull && (float) ((double) s_p[s_ids[i]] * inv) < a.miss_skip_w) {
+                // MISS SKIP (STRATA_GLM_MISS_SKIP_W, PolyStrata's --skip-weight): not in VRAM and of a small weight
+                // share - left out like a disk skip (the other weights are not renormalised), counted with them
+                skip |= 1u << i;
             } else if (ptr == 0ull) {
                 src = s_rv[i];
                 if (src != 0ull && ((host_set >> i) & 1u)) {
@@ -4732,6 +4739,10 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
     static const float swap_m = getenv("STRATA_GLM_ROUTE_SWAP_MARGIN") ? (float) std::atof(getenv("STRATA_GLM_ROUTE_SWAP_MARGIN")) : 0.02f;
     a.swap_ranks = std::min(swap, k);
     a.swap_margin = swap_m;
+    // STRATA_GLM_MISS_SKIP_W=<share> (G8, LOSSY, off by default): a routed expert outside VRAM - RAM tier (the PCIe
+    // fetch or the CPU lane) or disk - whose share of the route's weights is below this is left out of the token
+    static const float miss_w = getenv("STRATA_GLM_MISS_SKIP_W") ? std::max(0.0f, (float) std::atof(getenv("STRATA_GLM_MISS_SKIP_W"))) : 0.0f;
+    a.miss_skip_w = miss_w;
     if (ahead_logits != nullptr && ahead_bias != nullptr && n_expert <= 512) {
         a.n_ahead = std::min(n_ahead, kAhead);
         for (int i = 0; i < a.n_ahead; ++i) a.ahead_bias[i] = ahead_bias[i];

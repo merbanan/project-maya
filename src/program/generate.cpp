@@ -1935,6 +1935,34 @@ static int glm_pack_generate(const Options& o) {
                              (unsigned long long) (model.mtp_rounds_ - rounds0),
                              (double) n_spec / (double) (model.mtp_rounds_ - rounds0), lens.c_str());
             }
+        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && req_spec != 1 && !model.spec_ready() &&
+                   env_num("STRATA_GLM_LOOKUP", 0) > 0) {
+            // the LOOKUP decode (E7, STRATA_GLM_LOOKUP=<min match>): drafts from the conversation itself - what
+            // followed an earlier occurrence of the last tokens - checked by a verify window (same tokens as the loop
+            // below for the same samples)
+            strata::spec::SuffixDrafter sfx(std::max(1, (int) env_num("STRATA_GLM_LOOKUP", 3)), 64, prompt.size() + (size_t) max_new + 64);
+            sfx.append(prompt.data(), prompt.size());
+            int64_t n_spec = 0;
+            const uint64_t r0 = model.lookup_rounds_, k0 = model.lookup_tokens_;
+            const auto emit = [&](int tok) -> bool {
+                sfx.append((int32_t) tok);
+                return on_token(tok);
+            };
+            const auto propose = [&](int32_t* out, int max, int& match) -> int {
+                const int n = sfx.propose(max, out);
+                match = sfx.last_match();
+                return n;
+            };
+            if (!model.decode_lookup(sp, max_new, emit, propose, n_spec, err)) {
+                drop_if_poisoned(prompt, err);
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
+            if (model.lookup_rounds_ > r0)
+                std::fprintf(stderr, "glm lookup: %llu windows, %llu of %lld tokens from them (%.2f a window)\n",
+                             (unsigned long long) (model.lookup_rounds_ - r0),
+                             (unsigned long long) (model.lookup_tokens_ - k0), (long long) n_spec,
+                             (double) (model.lookup_tokens_ - k0) / (double) (model.lookup_rounds_ - r0));
         } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready()) {
             // the pipelined speculative decode: the two halves of the split work on consecutive tokens, the head
             // running the NextN block's draft (same tokens as the loop below)
@@ -2004,7 +2032,7 @@ static int glm_pack_generate(const Options& o) {
                          prompt_ms / (double) std::max<size_t>(1, prompt.size()), (long long) st2.pool_used,
                          (long long) st2.pool_slots, (long long) st2.ram_used, (long long) st2.ram_slots);
             if (st2.disk_skips > st1.disk_skips)
-                std::fprintf(stderr, "glm skip: %.2f disk-only experts/tok left out (STRATA_GLM_DISK_SKIP_W / _FROM)\n",
+                std::fprintf(stderr, "glm skip: %.2f experts/tok left out (disk-only: STRATA_GLM_DISK_SKIP_W / _FROM; outside VRAM: STRATA_GLM_MISS_SKIP_W)\n",
                              (double) (st2.disk_skips - st1.disk_skips) / n);
             if (model.spec_steps_ > spec0)
                 std::fprintf(stderr, "glm spec: %llu of %llu drafts accepted (%.1f%%)\n",

@@ -714,6 +714,15 @@ public:
     bool mtp_ready() const;
     bool decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
                     int64_t& produced, std::string& err);
+    /// The LOOKUP decode (E7, src/core/glm_mtp.cu; STRATA_GLM_LOOKUP=<min match>, opt-in): no draft model - each
+    /// round `propose(out, max)` gives the tokens that followed an earlier occurrence of the context's current suffix
+    /// (the caller's suffix drafter, fed every emitted token through `emit`), one verify window (window()) checks
+    /// [last token, drafts...]; no proposal: a plain token.  The same tokens the token-at-a-time loop gives for the same
+    /// samples.  `propose` returns the drafts written (0: none) and sets `match` to the match length behind them.
+    bool decode_lookup(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
+                       const std::function<int(int32_t* out, int max, int& match)>& propose, int64_t& produced,
+                       std::string& err);
+    uint64_t lookup_rounds_ = 0, lookup_tokens_ = 0;       // its verify windows, and the tokens they emitted
     uint64_t mtp_rounds_ = 0;                              // verify passes (spec_steps_ / spec_hits_: drafts, accepted)
     uint64_t mtp_round_n_[9] = {};                         // ... by the draft length the round used
     bool mtp_fill_prev(int32_t token, int64_t p, std::string& err);   // the token path: entry p - 1 from head_x and token
