@@ -384,6 +384,18 @@ __global__ void rows_to_f16(const float* __restrict__ x, int64_t ldx, const int3
         for (int c = threadIdx.x; c < cols; c += blockDim.x) dst[(size_t) r * cols + c] = __float2half(src[c]);
     }
 }
+// rows of the chunk's FP16 input x16 (row ids[i]) packed, cols a multiple of 8: the FP16 experts' gate/up input without
+// converting the same F32 row again for each of the k experts a token routes to - x16 holds __float2half of x's values
+// (rms_rows and the mHC read write both), so these are the bytes rows_to_f16 makes from x, at half the reads
+__global__ void rows_gather_f16(const __half* __restrict__ x16, const int32_t* __restrict__ ids, int n, int cols,
+                                __half* __restrict__ dst) {
+    const int c8 = cols / 8;
+    for (int r = blockIdx.x; r < n; r += gridDim.x) {
+        const uint4* src = (const uint4*) (x16 + (size_t) ids[r] * cols);
+        uint4* out = (uint4*) (dst + (size_t) r * cols);
+        for (int c = threadIdx.x; c < c8; c += blockDim.x) out[c] = src[c];
+    }
+}
 void blas_ck(cublasStatus_t st, const char* what) {
     if (st != CUBLAS_STATUS_SUCCESS) std::fprintf(stderr, "glm prefill: %s: cuBLAS status %d\n", what, (int) st);
 }
@@ -2839,9 +2851,19 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             float* GU = M.OUTP + (size_t) o * E;
             mmq::to_f16(Ly.gu_type, blob, (uint16_t*) S->w16, wgu, s);
             __half* X16 = (__half*) S->w16 + wgu;
+            // the gate/up input: the token rows gathered from x16 (STRATA_GLM_X16_GATHER=0: converted from x again,
+            // the same bytes)
+            static const bool x16_gather = [] {
+                const char* v = getenv("STRATA_GLM_X16_GATHER");
+                return v == nullptr || std::atoi(v) != 0;
+            }();
             for (int c0 = 0; c0 < nrows; c0 += gu_rows) {
                 const int n = std::min(gu_rows, nrows - c0);
-                rows_to_f16<<<std::min(n, 4096), 256, 0, s>>>(S->x, E, M.row_tok + r0 + a + c0, n, (int) E, X16);
+                if (x16_gather && S->x16 != nullptr && E % 8 == 0)
+                    rows_gather_f16<<<std::min(n, 4096), 128, 0, s>>>((const __half*) S->x16, M.row_tok + r0 + a + c0, n,
+                                                                      (int) E, X16);
+                else
+                    rows_to_f16<<<std::min(n, 4096), 256, 0, s>>>(S->x, E, M.row_tok + r0 + a + c0, n, (int) E, X16);
                 blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, S->w16, CUDA_R_16F, E,
                                      X16, CUDA_R_16F, E, &zero, GU + (size_t) c0 * 2 * nff, CUDA_R_32F, 2 * nff,
                                      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
