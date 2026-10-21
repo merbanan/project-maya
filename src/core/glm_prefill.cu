@@ -1111,6 +1111,7 @@ bool Glm5Model::prefill_lend(std::string& err) {
     if (F == nullptr || S == nullptr || S->lent) return true;
     cudaSetDevice(dev_);
     if (!lend_tail(S->need, S->moved, S->dropped, err)) return false;
+    F->pcnt.assign((size_t) g_.n_layers * g_.n_expert, 0u);   // (G9: this prompt's routes)
     // the borrowed memory holds expert bytes: what the prompt path reads before writing is set up again
     mmq::iota(S->iota, (int64_t) S->T_bound * g_.n_exp_used, F->cs);
     for (int b = 0; b < PrefillState::NG; ++b) cudaEventRecord(S->ev_free[b], F->cs);
@@ -1359,6 +1360,84 @@ bool Glm5Model::prefill_return(std::string& err) {
             if (P.st[(size_t) s] == FastState::kLent) P.st[(size_t) s] = FastState::kFree;
     }
     S->lent = false;
+    return true;
+}
+
+// G9 - the REFILL after a prompt: the lent tail comes back empty (about a quarter of a V100's VRAM tier on Maya-S24),
+// and the boundaries' refill (STRATA_GLM_PROMOTE_FILL, 24 a token) ranks by the aged LFU counts, which a long prompt's
+// own routes age away (every 32768 routing events halve them all: an 8K prompt adds ~65K a layer, so by its end the
+// early layers' counts are ~0).  Here each layer's free slots take its RAM-tier experts the prompt routed most (its
+// own counts, not aged; ties by the LFU counts), hottest first over all layers, as background promotions on the copy
+// stream (fast_boundary's step (a) makes each live once its copy landed - the expert stays usable from RAM until
+// then).  Placement only: the tokens are the same.  OPT-IN, measured no gain: STRATA_GLM_PREFILL_REFILL=<experts at
+// most> (-1: every free slot; unset / 0: off).  Maya-S24, one V100, two rounds: 474-615 experts (3.1-4.1 GB) a prompt;
+// decode after fresh 2K / 8K / 27K filler prompts and after four real code prompts (4K-24K) within +-1 % of off, VRAM
+// hits equal or 1-3 points lower; prompts 1-9 % slower (the next prompt lends those slots again).  The gap to a cached
+// prompt is the disk: 1.3-2.1 reads a token after a fresh prompt vs 0.1-0.7 - the lend's parked experts push RAM-tier
+// ones to disk, which no VRAM refill brings back.
+bool Glm5Model::prefill_refill(std::string& err) {
+    FastState* F = fast_;
+    static const long cap = [] {
+        const char* v = getenv("STRATA_GLM_PREFILL_REFILL");
+        return v != nullptr ? std::max(-1L, std::atol(v)) : 0L;
+    }();
+    if (F == nullptr || cap == 0 || F->pcnt.empty() || F->bg_hold) return true;
+    const int NE = g_.n_expert;
+    struct Cand {
+        uint32_t p, c;
+        int il, e, rs, slot;
+    };
+    std::vector<Cand> cands;
+    cudaSetDevice(dev_);
+    std::lock_guard<std::mutex> lk(F->mu);
+    for (int il = l0_; il < lt_; ++il) {
+        if (!F->L[(size_t) il].moe || F->layer_rc[(size_t) il] < 0) continue;
+        const auto& P = F->lp[(size_t) il];
+        const auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
+        std::vector<int> frees;
+        for (int s = 0; s < P.n; ++s)
+            if (P.st[(size_t) s] == FastState::kFree) frees.push_back(s);
+        if (frees.empty()) continue;
+        std::vector<Cand> lay;
+        for (int e = 0; e < NE; ++e) {
+            const size_t key = (size_t) il * NE + e;
+            if (F->slot_of[key] >= 0 || F->pcnt[key] == 0) continue;
+            const int rs = F->ram_of[key];
+            if (rs < 0 || R.st[(size_t) rs] != FastState::kRHold) continue;
+            lay.push_back(Cand{F->pcnt[key], F->cnt[key], il, e, rs, -1});
+        }
+        const size_t n = std::min(lay.size(), frees.size());
+        std::partial_sort(lay.begin(), lay.begin() + (std::ptrdiff_t) n, lay.end(), [](const Cand& a, const Cand& b) {
+            return a.p != b.p ? a.p > b.p : a.c > b.c;
+        });
+        for (size_t j = 0; j < n; ++j) {
+            lay[j].slot = frees[j];
+            cands.push_back(lay[j]);
+        }
+    }
+    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.p != b.p ? a.p > b.p : a.c > b.c; });
+    if (cap > 0 && (long) cands.size() > cap) cands.resize((size_t) cap);   // (cap -1: all)
+    size_t bytes = 0;
+    for (const auto& c : cands) {
+        auto& P = F->lp[(size_t) c.il];
+        const int rc = F->layer_rc[(size_t) c.il];
+        auto& R = F->rc[(size_t) rc];
+        P.st[(size_t) c.slot] = FastState::kLanding;
+        R.st[(size_t) c.rs] = FastState::kRPin;
+        if (!glmfast::cuda_ok(cudaMemcpyAsync(P.slot_ptr(c.slot), R.base + (size_t) c.rs * R.stride,
+                                              F->L[(size_t) c.il].blob, cudaMemcpyHostToDevice, F->copy),
+                              "glm prompt refill", err))
+            return false;
+        cudaEvent_t ev = F->get_event();
+        cudaEventRecord(ev, F->copy);
+        F->bg.push_back(FastState::BgMove{c.il, c.slot, c.il * NE + c.e, rc, c.rs, true, ev});
+        bytes += F->L[(size_t) c.il].blob;
+    }
+    F->pcnt.clear();   // (once a lend: the next prompt's lend counts afresh)
+    static const bool say = getenv("STRATA_GLM_REFILL_LOG") != nullptr;
+    if (say && !cands.empty())
+        std::fprintf(stderr, "glm refill: CUDA%d %zu experts (%.2f GB) from the prompt's routes into the returned slots\n",
+                     dev_, cands.size(), (double) bytes / 1073741824.0);
     return true;
 }
 
@@ -2330,6 +2409,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 if (cnt == 0) continue;
                 uint32_t& cc = F->cnt[(size_t) il * NE + e];
                 cc = (uint32_t) std::min<uint64_t>((uint64_t) cc + (uint64_t) cnt, 1u << 24);
+                if (!F->pcnt.empty()) {
+                    uint32_t& pc = F->pcnt[(size_t) il * NE + e];
+                    pc = (uint32_t) std::min<uint64_t>((uint64_t) pc + (uint64_t) cnt, 1u << 30);
+                }
                 ev += (uint64_t) cnt;
                 uint32_t& uu = F->usage[(size_t) il * NE + e];
                 uu = (uint32_t) std::min<uint64_t>((uint64_t) uu + (uint64_t) cnt, 1u << 30);
@@ -3418,7 +3501,7 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         m->cap_floor_ = 0;
         std::string return_err;
-        if (!m->prefill_return(return_err)) {
+        if (!m->prefill_return(return_err) || !m->prefill_refill(return_err)) {
             if (ok) err = return_err;
             ok = false;
         }

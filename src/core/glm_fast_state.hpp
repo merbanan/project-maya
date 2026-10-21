@@ -453,6 +453,7 @@ struct Glm5Model::FastState {
         all_resident = all;
     }
     std::vector<uint32_t> cnt;   // il * n_expert + e -> LFU count (aged), over both tiers
+    std::vector<uint32_t> pcnt;  // ... this request's prompt routes, not aged (G9: prefill_refill ranks by them)
     // ... and the long memory: routes per key across sessions (expert_usage.txt), halved when one passes 2^30 -
     // the warm-up fills the tiers in its order (this user's experts first)
     std::vector<uint32_t> usage;
