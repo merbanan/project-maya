@@ -1028,15 +1028,18 @@ __global__ void __launch_bounds__(256) mla_attn_tc2_kernel(const float* __restri
     }
 }
 
-// G7: the tc2 attention in ONE pass (Volta, STRATA_GLM_PREFILL_ATTN=v70).  tc2 walks a token's cells twice - the
-// gather and Q.K^T once for the softmax's max / sum and again for P - because a wmma accumulator's layout is not
-// known on Volta, so O could not be rescaled in registers.  mma.sync.m8n8k4's is (mimo_attn.cu's mma884 note): here
-// Q.K^T stays on wmma (into shared memory, as tc2), the online softmax keeps each head's max and sum and writes P
-// (FP16) and the rescale factor, and P.V runs on mma.m8n8k4 with O in registers - warp w owns heads 16 (w & 1) ..
-// +15 and dims 128 (w >> 1) .. +127 (8 groups of 16: 64 floats a lane), rescaled by its rows' factors each tile.
-// The next tile's latent rows are read into registers while this one computes (Volta has no cp.async).  The design
-// follows 1CatAI/1Cat-vLLM #1092 / #1125 (one pass, FP32 scores and softmax, FP16 operands, F32 sums); the code is
-// this file's.  Same block, tiles and shared memory as tc2: block = (token, 32 heads), 256 threads.
+// G7: the tc2 attention in ONE pass (Volta's default; STRATA_GLM_PREFILL_ATTN=tc2 runs tc2).  tc2 walks a token's cells
+// twice - the gather and Q.K^T once for the softmax's max / sum and again for P - because a wmma accumulator's layout
+// is not known on Volta, so O could not be rescaled in registers.  mma.sync.m8n8k4's is (the layout measured on a
+// V100): here Q.K^T stays on wmma (into shared memory, as tc2), the online softmax keeps each head's max and sum and
+// writes P (FP16) and the rescale factor, and P.V runs on mma.m8n8k4 with O in registers - warp w owns heads 16 (w & 1)
+// .. +15 and dims 128 (w >> 1) .. +127 (8 groups of 16: 64 floats a lane), rescaled by its rows' factors each tile. The
+// next tile's latent rows are read into registers while this one computes (Volta has no cp.async).  The design follows
+// 1CatAI/1Cat-vLLM #1092 / #1125 (one pass, FP32 scores and softmax, FP16 operands, F32 sums); the code is this file's.
+// Same block, tiles and shared memory as tc2: block = (token, 32 heads), 256 threads.
+// The m8n8k4 layout (sm_70): a warp's 4 quad pairs qp = (L >> 2) & 3 each compute an 8 x 8 block - rows 8 (qp & 1) ..,
+// columns 8 (qp >> 1) ..; A row 8 rb + (L & 3) + 4 (L >= 16) holds k 0..3; .row B: lane L holds k row L & 3, columns
+// 4 (L >= 16) + i of its block; accumulator c[i]: row (L & 1) + (i & 2) + 4 (L >= 16), column (i & 4) + (L & 2) + (i & 1).
 __device__ __forceinline__ void v7_mma884rr(float* c, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
     asm volatile("mma.sync.aligned.m8n8k4.row.row.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
                  "{%0,%1,%2,%3,%4,%5,%6,%7};"
@@ -2345,21 +2348,23 @@ void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const i
                      cudaSuccess;
             cudaGetLastError();
         }
-        // G7: STRATA_GLM_PREFILL_ATTN=v70 - the one-pass kernel (mla_attn_v70_kernel), Volta only
-        static const bool want_v70 = attn_mode != nullptr && std::strcmp(attn_mode, "v70") == 0;
-        static int v70_ok = -1;
-        if (v70_ok < 0) {
-            int major = 0;
+        // G7: the one-pass kernel (mla_attn_v70_kernel) by default on Volta (sm_70 / sm_72); STRATA_GLM_PREFILL_ATTN=tc2:
+        // the two-pass one.  Maya-S24, one V100: dsa_attn of a 27K prompt 6.87 -> 4.09 s, prompts 2K / 8K / 27K +4 / +9 /
+        // +9 %; KL against tc2 0.0119 where the exact F32 kernel's is 0.0124; needles 6 / 6 at 40K and 100K (128K context)
+        static const bool want_v70 = attn_mode == nullptr || std::strcmp(attn_mode, "v70") == 0;
+        static int v70_ok[16] = {};
+        if (v70_ok[dev] == 0) {
+            int major = 0, minor = 0;
             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-            v70_ok = want_v70 && major == 7 &&
-                     cudaFuncSetAttribute(mla_attn_v70_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                          (int) kV7Smem) == cudaSuccess;
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+            v70_ok[dev] = want_v70 && major == 7 && minor < 5 &&
+                          cudaFuncSetAttribute(mla_attn_v70_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                               (int) kV7Smem) == cudaSuccess ? 1 : -1;
             cudaGetLastError();
-            if (want_v70)
-                std::fprintf(stderr, "glm_batch: CUDA%d prompt attention: the one-pass v70 kernel %s\n", dev,
-                             v70_ok ? "(G7)" : "unavailable here - tc2 runs");
+            if (v70_ok[dev] == 1)
+                std::fprintf(stderr, "glm_batch: CUDA%d prompt attention: the one-pass kernel (mma.m8n8k4)\n", dev);
         }
-        if (tc_ok[dev] == 1 && v70_ok == 1 && n_head % T2_H == 0)
+        if (tc_ok[dev] == 1 && v70_ok[dev] == 1 && n_head % T2_H == 0)
             mla_attn_v70_kernel<<<dim3((unsigned) T, (unsigned) (n_head / T2_H)), 256, kV7Smem, s>>>(
                 q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8);
         else if (tc_ok[dev] == 1 && want_tc2 && tc2_ok == 1 && n_head % T2_H == 0)
