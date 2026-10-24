@@ -2766,6 +2766,34 @@ __device__ __forceinline__ void kda_prep_block(const KdaPrepArgs& a, int h, int 
     sv[tid] = in[tid];
     __syncthreads();
     const int rbase = quarter * (hd / 4) + warp * (hd / 16);
+    if (hd == 128) {
+        // the warp's 8 rows unrolled, their 32 loads issued together (the loop below took one row's 4 loads and
+        // shuffles after another); each row's sum in the same order, so the same bits
+        float acc[8];
+#pragma unroll
+        for (int rr = 0; rr < 8; ++rr) {
+            const uint16_t* wr = W + (size_t) (h * 128 + rbase + rr) * 128;
+            acc[rr] = 0.0f;
+#pragma unroll
+            for (int jj = 0; jj < 4; ++jj) acc[rr] += bf(wr[lane + 32 * jj]) * sv[lane + 32 * jj];
+        }
+#pragma unroll
+        for (int rr = 0; rr < 8; ++rr) acc[rr] = warp_sum(acc[rr]);
+        if (lane < 8) {
+            float av = acc[0];
+#pragma unroll
+            for (int rr = 1; rr < 8; ++rr)
+                if (lane == rr) av = acc[rr];
+            const int c = h * 128 + rbase + lane;
+            if (is_g1) {
+                const float v = av + a.dt_bias[c];
+                a.g1[c] = a.lower_bound * dsigmoid(-v * a.ssm_a[h]);
+            } else {
+                a.g2[c] = av;
+            }
+        }
+        return;
+    }
     for (int r = rbase; r < rbase + hd / 16; ++r) {
         const int c = h * hd + r;
         const uint16_t* wr = W + (size_t) c * hd;
@@ -2856,6 +2884,90 @@ __global__ void __launch_bounds__(256) kda_rec_kernel(const float* __restrict__ 
                                                       float eps, int n_head, block_q8_1* __restrict__ out) {
     kda_rec_block(q, k, v, g1, beta_raw, state, g2, norm_w, eps, out, blockIdx.x);
 }
+// kda_rec in column groups (STRATA_GLM_KDA_COLS, on by default; =0: a block a head): a state column's sums do not
+// depend on the other columns, so block (h, cg) takes columns [32 cg, 32 cg + 32) of head h - 4 blocks a head instead
+// of one, the state's 128 KB a head read and written by 4 SMs.  Each column's two 64-row halves and their sums are
+// kda_rec_block's, in its order; the head's last block to finish (a ticket a head) takes the 128 outputs from obuf and
+// does the out gate's sum as block_sum did it there (the 4 warps' sums of o^2 in turn; its other 4 warps added 0) - the
+// same bits
+constexpr int kKdaCols = 32;
+__global__ void __launch_bounds__(64) kda_rec_cols_kernel(const float* __restrict__ q, const float* __restrict__ k,
+                                                         const float* __restrict__ v, const float* __restrict__ g1,
+                                                         const float* __restrict__ beta_raw, float* __restrict__ state,
+                                                         const float* __restrict__ g2, const float* __restrict__ norm_w,
+                                                         float eps, block_q8_1* __restrict__ out, float* obuf,
+                                                         unsigned int* ticket) {
+    constexpr int HD = 128;
+    const int h = blockIdx.x, cg = blockIdx.y;
+    const int t = threadIdx.x, jj = t & (kKdaCols - 1), half = t >> 5, lane = t & 31;
+    const int j = cg * kKdaCols + jj;
+    __shared__ float sq[HD], sk[HD], sdec[HD], sdel[kKdaCols];
+    __shared__ float sacc[2][kKdaCols];
+    __shared__ float sred[4];
+    __shared__ unsigned int s_last;
+    for (int i = t; i < HD; i += 64) {
+        sq[i] = q[h * HD + i];
+        sk[i] = k[h * HD + i];
+        sdec[i] = __expf(g1[h * HD + i]);
+    }
+    const float b = 1.0f / (1.0f + expf(-beta_raw[h]));
+    __syncthreads();
+    float* Sh = state + (size_t) h * HD * HD;
+    float reg[64];
+    float A = 0.0f;
+#pragma unroll
+    for (int ii = 0; ii < 64; ++ii) {
+        const int i = half * 64 + ii;
+        const float s0 = Sh[i * HD + j] * sdec[i];
+        reg[ii] = s0;
+        A += s0 * sk[i];
+    }
+    sacc[half][jj] = A;
+    __syncthreads();
+    if (half == 0) sdel[jj] = b * (v[h * HD + j] - (sacc[0][jj] + sacc[1][jj]));
+    __syncthreads();
+    const float dl = sdel[jj];
+    float O = 0.0f;
+#pragma unroll
+    for (int ii = 0; ii < 64; ++ii) {
+        const int i = half * 64 + ii;
+        const float s2 = reg[ii] + sk[i] * dl;
+        Sh[i * HD + j] = s2;
+        O += s2 * sq[i];
+    }
+    if (out == nullptr) return;   // (uniform: the whole block)
+    __syncthreads();
+    sacc[half][jj] = O;
+    __syncthreads();
+    if (half == 0) obuf[h * HD + j] = (sacc[0][jj] + sacc[1][jj]) * rsqrtf((float) HD);
+    __threadfence();
+    __syncthreads();
+    if (t == 0) s_last = atomicAdd(ticket + h, 1u) == (unsigned int) (HD / kKdaCols - 1) ? 1u : 0u;
+    __syncthreads();
+    if (s_last == 0u) return;
+    __threadfence();
+    // the head's out gate: warp w of kda_rec_block's 256 threads is (here) warp w & 1's pass w >> 1
+    float ov[2];
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int w = 2 * p + half;
+        ov[p] = __ldcg(obuf + h * HD + 32 * w + lane);
+        const float ws = warp_sum(ov[p] * ov[p]);
+        if (lane == 0) sred[w] = ws;
+    }
+    if (t == 0) ticket[h] = 0u;   // (the next launch is ordered after this one)
+    __syncthreads();
+    float ss = 0.0f;
+    for (int w = 0; w < 8; ++w) ss += w < 4 ? sred[w] : 0.0f;
+    const float inv = rsqrtf(ss / (float) HD + eps);
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int jo = 32 * (2 * p + half) + lane;
+        const float gv = ov[p] * inv * norm_w[jo] * dsigmoid(g2[h * HD + jo]);
+        q8_1_store_warp(gv, out + h * (HD / 32) + (jo >> 5), lane);
+    }
+}
+
 struct KdaRecBatch {
     KdaRecArgs a[kKdaLayers];
     float eps;
@@ -5948,6 +6060,37 @@ void kda_rec(const float* q, const float* k, const float* v, const float* g1, co
     if (head_dim != 128) {
         std::fprintf(stderr, "glm_fast kda_rec: head_dim %d (the kernel is built for 128)\n", head_dim);
         return;
+    }
+    static const bool split = [] {
+        const char* e = getenv("STRATA_GLM_KDA_COLS");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    // the split's per-device scratch: the heads' outputs and tickets (allocated once, on the first decode)
+    constexpr int kDevs = 64;
+    static float* obuf[kDevs] = {};
+    static unsigned int* tick[kDevs] = {};
+    static int ncap[kDevs] = {};
+    int dev = 0;
+    if (split && cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < kDevs) {
+        if (ncap[dev] < n_head) {
+            if (obuf[dev] != nullptr) cudaFree(obuf[dev]);
+            if (tick[dev] != nullptr) cudaFree(tick[dev]);
+            obuf[dev] = nullptr;
+            tick[dev] = nullptr;
+            ncap[dev] = 0;
+            if (cudaMalloc((void**) &obuf[dev], (size_t) n_head * 128 * sizeof(float)) == cudaSuccess &&
+                cudaMalloc((void**) &tick[dev], (size_t) n_head * sizeof(unsigned int)) == cudaSuccess &&
+                cudaMemset(tick[dev], 0, (size_t) n_head * sizeof(unsigned int)) == cudaSuccess)
+                ncap[dev] = n_head;
+            else
+                cudaGetLastError();
+        }
+        if (ncap[dev] >= n_head) {
+            kda_rec_cols_kernel<<<dim3(n_head, 128 / kKdaCols), 64, 0, s>>>(
+                q, k, v, g1, beta_raw, state, g2, norm_w, eps, (block_q8_1*) out_q8_1, obuf[dev], tick[dev]);
+            launch_check("kda_rec_cols");
+            return;
+        }
     }
     kda_rec_kernel<<<n_head, 256, 0, s>>>(q, k, v, g1, beta_raw, state, g2, norm_w, eps, n_head,
                                           (block_q8_1*) out_q8_1);
