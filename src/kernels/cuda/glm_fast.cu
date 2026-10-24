@@ -3976,12 +3976,42 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     }
     __syncthreads();
     ROUTE_MARK(3);   // the route counts
+    // ROUTE_FAST: the weights' sum and the CPU lane's picks in warp 0 - each lane adds the k weights in route order
+    // (thread 0's sum, the same bits); the picks, thread 0's coldest-first (ties: the later in route order) taken
+    // to_cpu times, are the experts whose rank in that order is below to_cpu: a lane an expert, its rank by shuffles
+    float inv_w = 1.0f;
+    unsigned int host_w = 0;
+    if (a.fast && tid < 32) {
+        const float pv = tid < a.k ? s_p[s_ids[tid]] : 0.0f;
+        double sum = 0.0;
+        for (int i = 0; i < a.k; ++i) sum += (double) __shfl_sync(0xffffffffu, pv, i);
+        inv_w = (float) (a.norm_w ? 1.0 / fmax(sum, 6.103515625e-5) : 1.0);
+        if (lane_plan) {
+            const float msw = skipped ? 0.0f : a.miss_skip_w;
+            const bool light = msw > 0.0f && (float) ((double) pv * inv_w) < msw;
+            const bool ram = tid < a.k && tid < skip_from && !light && s_tab[tid] == 0ull && s_rtab[tid] != 0ull &&
+                             s_ho[tid] == 0;
+            const unsigned int rm = __ballot_sync(0xffffffffu, ram);
+            const int to_cpu = (int) ((a.cpu_plan >> (4 * __popc(rm))) & 15ull);
+            const unsigned int c = ram ? s_cnt[tid] : 0u;
+            int rank = 0;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const unsigned int cj = __shfl_sync(0xffffffffu, c, j);
+                if (((rm >> j) & 1u) && (cj < c || (cj == c && j > tid))) ++rank;
+            }
+            host_w = __ballot_sync(0xffffffffu, ram && rank < to_cpu);
+        }
+    }
     if (tid == 0) {
         const long long pt0 = clock64();   // (ROUTE_PROF: the plan's own phases, prof[9..13])
         long long pt[4] = {pt0, pt0, pt0, pt0};
-        double sum = 0.0;
-        for (int i = 0; i < a.k; ++i) sum += (double) s_p[s_ids[i]];
-        const float inv = (float) (a.norm_w ? 1.0 / fmax(sum, 6.103515625e-5) : 1.0);
+        float inv = inv_w;
+        if (!a.fast) {
+            double sum = 0.0;
+            for (int i = 0; i < a.k; ++i) sum += (double) s_p[s_ids[i]];
+            inv = (float) (a.norm_w ? 1.0 / fmax(sum, 6.103515625e-5) : 1.0);
+        }
         unsigned int mask = 0, fetch = 0, promo = 0, cpu = 0, skip = 0;
         unsigned long long* rtab = a.d.tab + a.d.n_keys;
         unsigned long long* spares = a.d.tab + 2 * (size_t) a.d.n_keys + (size_t) a.layer * kSpares;
@@ -3993,9 +4023,9 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         // the CPU LANE: of this route's f RAM-tier experts, cpu_take(f) (the plan's split table) are computed by the
         // host from their RAM-tier blobs while the device pulls the others over PCIe - the COLDEST by the route counts
         // (ties: the later in route order), so the hot ones are still promoted into VRAM
-        unsigned int host_set = 0;
+        unsigned int host_set = host_w;
         pt[0] = clock64();   // the weights' sum
-        if (lane_plan) {
+        if (!a.fast && lane_plan) {
             int f_ram = 0, ri[8];
             unsigned int rcnt[8];
             for (int i = 0; i < a.k; ++i) {
