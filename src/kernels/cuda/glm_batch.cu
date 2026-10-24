@@ -1082,7 +1082,8 @@ __global__ void __launch_bounds__(256, 1) mla_attn_v70_kernel(const float* __res
                                                               const int* __restrict__ cells_all,
                                                               const int* __restrict__ n_sel_arr, int n_sel_max,
                                                               int n_head, float scale, float* __restrict__ ctx, bool q8,
-                                                              int cblk = 0, float* __restrict__ part = nullptr) {
+                                                              int cblk = 0, float* __restrict__ part = nullptr,
+                                                              const __half* __restrict__ q16 = nullptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
     // Pascal (sm_6x): no tensor cores - mla_attn launches this on Volta only
 #else
@@ -1097,6 +1098,10 @@ __global__ void __launch_bounds__(256, 1) mla_attn_v70_kernel(const float* __res
     float* sm = (float*) (sp16 + T2_H * T2_CP);             // T2_H max
     float* sl = sm + T2_H;                                  // T2_H sums
     float* sc = sl + T2_H;                                  // T2_H this tile's rescale
+    // SPLIT with q16 (STRATA_GLM_MLA_V70=2): Q as FP16 high + low parts from q16 (n_head x KV each, read through L1)
+    // and P's low part beside sp16 - each product twice, so both keep F32's precision as mla_split_mma_kernel's do
+    const bool hl = SPLIT && q16 != nullptr;
+    __half* sp16lo = (__half*) (sc + T2_H);                 // T2_H x T2_CP (hl only: kV7Smem + kV7Lo)
     __shared__ int s_cell[T2_C];
     const int t = SPLIT ? 0 : blockIdx.x, h0 = blockIdx.y * T2_H, tid = threadIdx.x, wp = tid >> 5, L = tid & 31;
     // the cells [cb0, ns) of the token: all of them, or the split's
@@ -1104,7 +1109,8 @@ __global__ void __launch_bounds__(256, 1) mla_attn_v70_kernel(const float* __res
     const int ns = SPLIT ? min(n_sel_max, cb0 + cblk) : n_sel_arr[t];
     const int* cl = cells_all + (size_t) t * n_sel_max;
     const float* qa = q_abs + ((size_t) t * n_head + h0) * KV;
-    for (int i = tid; i < T2_H * KV; i += 256) sq[(i / KV) * T2_LD + i % KV] = __float2half_rn(qa[i]);
+    if (!hl)
+        for (int i = tid; i < T2_H * KV; i += 256) sq[(i / KV) * T2_LD + i % KV] = __float2half_rn(qa[i]);
     if (tid < T2_H) {
         sm[tid] = -INFINITY;
         sl[tid] = 0.0f;
@@ -1151,9 +1157,17 @@ __global__ void __launch_bounds__(256, 1) mla_attn_v70_kernel(const float* __res
             for (int kk = 0; kk < T2_KW; kk += 16) {
                 wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
-                wmma::load_matrix_sync(fa, sq + st_r * 16 * T2_LD + kp * T2_KW + kk, T2_LD);
                 wmma::load_matrix_sync(fb, srow + st_c * 16 * T2_LD + kp * T2_KW + kk, T2_LD);
-                wmma::mma_sync(sacc, fa, fb, sacc);
+                if (hl) {
+                    const __half* qh = q16 + (size_t) (h0 + st_r * 16) * KV + kp * T2_KW + kk;
+                    wmma::load_matrix_sync(fa, qh, KV);
+                    wmma::mma_sync(sacc, fa, fb, sacc);
+                    wmma::load_matrix_sync(fa, qh + (size_t) n_head * KV, KV);
+                    wmma::mma_sync(sacc, fa, fb, sacc);
+                } else {
+                    wmma::load_matrix_sync(fa, sq + st_r * 16 * T2_LD + kp * T2_KW + kk, T2_LD);
+                    wmma::mma_sync(sacc, fa, fb, sacc);
+                }
             }
             wmma::store_matrix_sync(spart + kp * T2_H * T2_C + st_r * 16 * T2_C + st_c * 16, sacc, T2_C,
                                     wmma::mem_row_major);
@@ -1177,7 +1191,9 @@ __global__ void __launch_bounds__(256, 1) mla_attn_v70_kernel(const float* __res
             for (int jj = 0; jj < T2_CPT; ++jj) {
                 const float p = sv[jj] > -INFINITY ? expf(sv[jj] - mn) : 0.0f;
                 ps += p;
-                sp16[hh * T2_CP + c0 + jj] = __float2half_rn(p);
+                const __half ph = __float2half_rn(p);
+                sp16[hh * T2_CP + c0 + jj] = ph;
+                if (hl) sp16lo[hh * T2_CP + c0 + jj] = __float2half_rn(p - __half2float(ph));
             }
 #pragma unroll
             for (int x = T2_TPH / 2; x > 0; x >>= 1) ps += __shfl_xor_sync(0xffffffffu, ps, x);
@@ -1201,10 +1217,13 @@ __global__ void __launch_bounds__(256, 1) mla_attn_v70_kernel(const float* __res
 #pragma unroll
             for (int st = 0; st < T2_C / 4; ++st) {
                 const uint2 a = *(const uint2*) (sp16 + (pr * 16 + 8 * rb + j + 4 * hi) * T2_CP + 4 * st);
+                const uint2 alo = hl ? *(const uint2*) (sp16lo + (pr * 16 + 8 * rb + j + 4 * hi) * T2_CP + 4 * st)
+                                     : make_uint2(0u, 0u);
 #pragma unroll
                 for (int g = 0; g < 8; ++g) {
                     const uint2 b = *(const uint2*) (srow + (4 * st + j) * T2_LD + cbase + 16 * g + 8 * cb + 4 * hi);
                     v7_mma884rr(o[g], a.x, a.y, b.x, b.y);
+                    if (hl) v7_mma884rr(o[g], alo.x, alo.y, b.x, b.y);
                 }
             }
         }
@@ -1246,6 +1265,16 @@ __global__ void __launch_bounds__(256, 1) mla_attn_v70_kernel(const float* __res
             }
     }
 #endif
+}
+
+constexpr size_t kV7Lo = (size_t) T2_H * T2_CP * 2;   // SPLIT with q16: P's low parts
+// mla_decode_v70's Q as FP16 high + low parts: q16[0 .. n) high, q16[n .. 2 n) low
+__global__ void mla_q16_split_kernel(const float* __restrict__ q, int n, __half* __restrict__ q16) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const __half h = __float2half_rn(q[i]);
+    q16[i] = h;
+    q16[n + i] = __float2half_rn(q[i] - __half2float(h));
 }
 
 // mla_decode_v70's merge of its splits' partials: a block per (head, 128 columns), the splits' weights once into shared
@@ -2421,10 +2450,12 @@ void dsa_select(const float* score, int score_ld, int p0, int kpool, int top_poo
 bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int kv_lora,
                     float scale, float* ctx, float* part, int part_cap, cudaStream_t s, bool lat_q8) {
     // Volta (sm_70 / sm_72) only, and the v70 kernel's shapes; STRATA_GLM_MLA_V70=0: the F32 split kernel (A/B)
-    static const bool want = [] {
+    // =2: Q and P as FP16 high + low parts (two products each, F32-class precision)
+    static const int mode = [] {
         const char* v = getenv("STRATA_GLM_MLA_V70");
-        return v == nullptr || std::atoi(v) != 0;
+        return v == nullptr ? 1 : std::atoi(v);
     }();
+    const bool want = mode != 0;
     if (!want || kv_lora != 512 || n_head % T2_H != 0 || n_sel <= 0 || part == nullptr) return false;
     int dev = 0;
     cudaGetDevice(&dev);
@@ -2438,7 +2469,7 @@ bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, i
         cudaDeviceGetAttribute(&sms[dev], cudaDevAttrMultiProcessorCount, dev);
         ok[dev] = major == 7 && minor < 5 &&
                           cudaFuncSetAttribute(mla_attn_v70_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                               (int) kV7Smem) == cudaSuccess
+                                               (int) (kV7Smem + kV7Lo)) == cudaSuccess
                       ? 1
                       : -1;
         cudaGetLastError();
@@ -2452,12 +2483,22 @@ bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, i
         return v ? std::max(1, std::atoi(v)) : 0;
     }();
     const int groups = n_head / T2_H;
-    const int target = std::min(64, std::min(part_cap, want_splits > 0 ? want_splits : std::max(1, sms[dev] / groups)));
+    // (mode 2: the partial buffer's slot after the splits holds Q's FP16 parts - n_head x (kv_lora + 2) floats is
+    // more than 2 n_head x kv_lora halves)
+    const int target = std::min(64, std::min(part_cap - (mode == 2 ? 1 : 0),
+                                             want_splits > 0 ? want_splits : std::max(1, sms[dev] / groups)));
+    if (target < 1) return false;
     const int tiles = (n_sel + T2_C - 1) / T2_C;
     const int cblk = T2_C * ((tiles + target - 1) / target);
     const int n_split = (n_sel + cblk - 1) / cblk;
-    mla_attn_v70_kernel<true><<<dim3((unsigned) n_split, (unsigned) groups), 256, kV7Smem, s>>>(
-        q_abs, lat, cells, nullptr, n_sel, n_head, scale, ctx, lat_q8, cblk, part);
+    __half* q16 = nullptr;
+    if (mode == 2) {
+        q16 = (__half*) (part + (size_t) n_split * n_head * (kv_lora + 2));
+        const int n = n_head * kv_lora;
+        mla_q16_split_kernel<<<(n + 255) / 256, 256, 0, s>>>(q_abs, n, q16);
+    }
+    mla_attn_v70_kernel<true><<<dim3((unsigned) n_split, (unsigned) groups), 256, kV7Smem + (q16 ? kV7Lo : 0), s>>>(
+        q_abs, lat, cells, nullptr, n_sel, n_head, scale, ctx, lat_q8, cblk, part, q16);
     mla_dec_combine_kernel<<<dim3((unsigned) n_head, (unsigned) (kv_lora / 128)), 128, 0, s>>>(part, n_split, n_head, ctx);
     return true;
 }
