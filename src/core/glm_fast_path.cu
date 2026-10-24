@@ -666,6 +666,9 @@ bool Glm5Model::fast_setup(std::string& err) {
     if (cudaStreamCreateWithFlags(&F->cs, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&F->copy, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&F->ps, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&F->sh_s, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&F->ev_sh_in, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&F->ev_sh_out, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&F->ev_hop, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&F->ev_pred, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&F->ev_pf, cudaEventDisableTiming) != cudaSuccess ||
@@ -3805,6 +3808,9 @@ void Glm5Model::fast_destroy() {
     if (F->cs) cudaStreamDestroy(F->cs);
     if (F->copy) cudaStreamDestroy(F->copy);
     if (F->ps) cudaStreamDestroy(F->ps);
+    if (F->ev_sh_in) cudaEventDestroy(F->ev_sh_in);
+    if (F->ev_sh_out) cudaEventDestroy(F->ev_sh_out);
+    if (F->sh_s) cudaStreamDestroy(F->sh_s);
     delete F;
     fast_ = nullptr;
 }
@@ -5347,6 +5353,19 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     fast_moe_route(il, io, md, F->sh_hq, pred, n_ah, ah_bias, lane);
     if (F->prof_on) F->mark("moe_route");
     ++F->expected;
+    // STRATA_GLM_SHARED_SIDE=1 (after kindlingai/gr8 #86): the shared expert's down - its input is the route
+    // kernel's q8_1 swiglu, sh_hq - on a side stream from the route's end, so its weight reads fill the time the
+    // device waits on the host's reads and the PCIe fetch; the routed gate/up launch then carries no shared rows, and
+    // moe_down (which adds sh_out) waits for it.  Not in a captured graph, not for EXL3 layers, not in a rows step
+    static const bool sh_side_env = getenv("STRATA_GLM_SHARED_SIDE") != nullptr && std::atoi(getenv("STRATA_GLM_SHARED_SIDE")) != 0;
+    const bool sh_side = sh_side_env && !rows && !Ly.exl3 && Ly.sh_down.q != nullptr && !F->kda_graph_on && F->sh_s != nullptr;
+    if (sh_side) {
+        cudaEventRecord(F->ev_sh_in, s);
+        cudaStreamWaitEvent(F->sh_s, F->ev_sh_in, 0);
+        const gf::MvJob sd = {Ly.sh_down.q, F->sh_hq, nullptr, F->sh_out, nullptr, 1.0f, Ly.sh_down.type, FFs, g.n_embd};
+        if (!gf::mv(&sd, 1, F->sh_s)) { err = "glm fast: shared expert down (side stream)"; return false; }
+        cudaEventRecord(F->ev_sh_out, F->sh_s);
+    }
     // the side stream copies the next layer's predicted experts while this layer computes.  STRATA_GLM_PREFETCH_AT:
     // when that copy starts - "route" (the default: at once, beside this layer's own PCIe fetch and CPU lane),
     // "fetch" (after this layer's own fetch: the link is free) or "cpu" (after this layer's CPU-lane answer: RAM is
@@ -5408,10 +5427,11 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
         strata::kernels::exl3::moe_down(xa, nullptr, Ly.sh_down.q != nullptr ? F->sh_out : nullptr, io.ffn, s);
         if (F->prof_on) F->mark("moe_down");
     } else {
-    // (the shared expert's down rides the gate/up launch: sh_out)
-    gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, g.swiglu_exp, io.xq, F->hq, Ly.sh_down.q,
-                    Ly.sh_down.type, F->sh_hq, FFs, F->sh_out, s);
+    // (the shared expert's down rides the gate/up launch: sh_out - or ran on the side stream, sh_side)
+    gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, g.swiglu_exp, io.xq, F->hq,
+                    sh_side ? nullptr : Ly.sh_down.q, Ly.sh_down.type, F->sh_hq, FFs, F->sh_out, s);
     if (F->prof_on) F->mark("moe_gate_up");
+    if (sh_side) cudaStreamWaitEvent(s, F->ev_sh_out, 0);
     gf::moe_down(Ly.d_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, Ly.down_off, F->hq,
                  Ly.sh_down.q != nullptr ? F->sh_out : nullptr, io.ffn, s);
     if (F->prof_on) F->mark("moe_down");
