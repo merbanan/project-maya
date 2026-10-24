@@ -3976,6 +3976,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     __syncthreads();
     ROUTE_MARK(3);   // the route counts
     if (tid == 0) {
+        const long long pt0 = clock64();   // (ROUTE_PROF: the plan's own phases, prof[9..13])
+        long long pt[4] = {pt0, pt0, pt0, pt0};
         double sum = 0.0;
         for (int i = 0; i < a.k; ++i) sum += (double) s_p[s_ids[i]];
         const float inv = (float) (a.norm_w ? 1.0 / fmax(sum, 6.103515625e-5) : 1.0);
@@ -3991,6 +3993,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         // host from their RAM-tier blobs while the device pulls the others over PCIe - the COLDEST by the route counts
         // (ties: the later in route order), so the hot ones are still promoted into VRAM
         unsigned int host_set = 0;
+        pt[0] = clock64();   // the weights' sum
         if (lane_plan) {
             int f_ram = 0, ri[8];
             unsigned int rcnt[8];
@@ -4011,6 +4014,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
                 host_set |= 1u << ri[best];
             }
         }
+        pt[1] = clock64();   // the CPU lane's picks
         for (int i = 0; i < a.k; ++i) {
             const float w = (float) ((double) s_p[s_ids[i]] * inv * a.w_scale);
             s_w[i] = w;
@@ -4089,6 +4093,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         s_promo = promo;
         s_cpu = cpu;
         s_skip = skip;
+        pt[2] = clock64();   // the entries' plan
         // PREFETCH: the predicted experts of the next layer that are not in VRAM but are in the RAM tier claim
         // that layer's spares now (one spare stays for its real misses); the side stream copies them while this
         // layer and the next one's attention compute, and the next route sees them as resident.  Only the
@@ -4134,6 +4139,13 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         *a.d.wait_seq = mask ? seq : 0u;
         if (a.d.cpu_seq != nullptr) *a.d.cpu_seq = cpu ? seq : 0u;
         *a.d.cpu_flag = 0;
+        pt[3] = clock64();   // the prefetch and the sequence
+        if (a.prof != nullptr) {
+            atomicAdd(a.prof + 9, (unsigned long long) (pt[0] - pt0));
+            atomicAdd(a.prof + 10, (unsigned long long) (pt[1] - pt[0]));
+            atomicAdd(a.prof + 11, (unsigned long long) (pt[2] - pt[1]));
+            atomicAdd(a.prof + 12, (unsigned long long) (pt[3] - pt[2]));
+        }
     }
     __syncthreads();
     ROUTE_MARK(4);   // thread 0's plan
@@ -6121,6 +6133,9 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
             const unsigned long long n = prof_h[15] > 0 ? prof_h[15] : 1;
             std::fprintf(stderr, "glm route prof: %llu routes, cycles from the kernel's start (block 0):", prof_h[15]);
             for (int i = 0; i < 9; ++i) std::fprintf(stderr, " | %s %.0f", names[i], (double) prof_h[i] / (double) n);
+            const char* sub[] = {"sum", "lane picks", "entries", "prefetch + seq"};
+            std::fprintf(stderr, "\nglm route prof: thread 0's plan, cycles a phase:");
+            for (int i = 0; i < 4; ++i) std::fprintf(stderr, " | %s %.0f", sub[i], (double) prof_h[9 + i] / (double) n);
             std::fprintf(stderr, "\n");
         });
         return p;
