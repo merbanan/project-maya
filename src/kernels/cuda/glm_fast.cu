@@ -3652,6 +3652,9 @@ struct RouteArgs {
     int rank_sel;               // the selections by topk_rank (STRATA_GLM_ROUTE_RANK; the host checks E fits it)
     unsigned long long* prof;   // STRATA_GLM_ROUTE_PROF (measurement): block 0's cycles from its start to each phase's
                                 // end, summed over routes (host-mapped; [15] counts the routes); null: off
+    int fast;                   // STRATA_GLM_ROUTE_FAST (on by default; =0: the old order, A/B): the error flag from
+                                // its device copy, the request's x out at the start, the plan's reads in parallel
+                                // into shared memory, the request head a thread a field - the same plan and request
 };
 
 __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_GRID_CONSTANT RouteArgs a) {
@@ -3678,7 +3681,15 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     __shared__ float s_w[8];
     __shared__ unsigned int s_mask, s_seq;
     __shared__ int bad;
-    if (tid == 0) bad = a.d.route_error != nullptr && *a.d.route_error != 0 ? 1 : 0;
+    if (tid == 0)
+        bad = a.fast && a.d.route_err_d != nullptr ? (*a.d.route_err_d != 0 ? 1 : 0)
+                                                   : (a.d.route_error != nullptr && *a.d.route_error != 0 ? 1 : 0);
+    // ROUTE_FAST: the FFN input out to the request's slot now (this route's slot: seq is this kernel's to advance),
+    // its PCIe writes beside the selection instead of after the plan - whether or not the CPU lane takes an expert
+    if (a.fast) {
+        MoeRequest* rq0 = (MoeRequest*) a.d.ring + ((*a.d.seq + 1) % kRingSize);
+        for (int e = tid; e < a.n_embd; e += ROUTE_THREADS) rq0->x[e] = a.x[e];
+    }
     __syncthreads();
     // the CPU lane's frequency counts age: every 4096 routes all of them halve (the whole block, before any use)
     if (a.cpu_plan != 0ull && a.d.dcnt != nullptr && ((*a.d.seq + 1) & 4095u) == 0u)
@@ -3788,6 +3799,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         if (tid == 0) {
             // No probability/table lookup or DMA for an invalid route. Still publish and retire its sequence.
             if (a.d.route_error != nullptr && *a.d.route_error == 0) *a.d.route_error = 4 * a.layer + bad;
+            if (a.d.route_err_d != nullptr && *a.d.route_err_d == 0) *a.d.route_err_d = 4 * a.layer + bad;
             *a.d.wait_seq = 0u;
             if (a.d.cpu_seq != nullptr) *a.d.cpu_seq = 0u;
             *a.d.cpu_flag = 0;
@@ -3822,6 +3834,33 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     const bool lane_plan = a.cpu_plan != 0ull && skip_from > 0;
     if (tid < a.k && tid < 8)
         s_cnt[tid] = lane_plan && a.d.dcnt != nullptr ? ++a.d.dcnt[(size_t) a.layer * E + s_ids[tid]] : 0u;
+    // ROUTE_FAST: what thread 0's plan reads from global memory, loaded at once - the route experts' counts (after the
+    // increments above: a route's keys are distinct) and helper flags, this layer's spares, and the next layer's
+    // spares and the predicted experts' entries.  The plan keeps its own copies of the spares it takes and writes
+    // the global ones as before; nothing else it reads changes under it (its table writes are other keys)
+    __shared__ unsigned int s_rc[8];
+    __shared__ uint8_t s_ho[8], s_pho[8];
+    __shared__ unsigned long long s_sp[kSpares], s_sp1[kSpares], s_ptab[8], s_prtab[8];
+    if (a.fast) {
+        const size_t lk = (size_t) a.layer * E;
+        if (tid < a.k && tid < 8) {
+            const size_t key = lk + s_ids[tid];
+            s_rc[tid] = a.d.dcnt == nullptr ? 0u : lane_plan ? s_cnt[tid] : a.d.dcnt[key];
+            s_ho[tid] = a.d.helper_owned ? a.d.helper_owned[key] : (uint8_t) 0;
+        } else if (tid >= 32 && tid < 32 + kSpares) {
+            s_sp[tid - 32] = a.d.tab[2 * (size_t) a.d.n_keys + (size_t) a.layer * kSpares + (tid - 32)];
+        } else if (tid >= 64 && tid < 64 + kSpares && a.pred_logits != nullptr) {
+            s_sp1[tid - 64] = a.d.tab[2 * (size_t) a.d.n_keys + (size_t) (a.layer + 1) * kSpares + (tid - 64)];
+        } else if (tid >= 96 && tid < 96 + a.k && tid < 104 && a.pred_logits != nullptr) {
+            const int i = tid - 96, e = s_pred[i];
+            if (e >= 0) {
+                const size_t key = (size_t) (a.layer + 1) * E + e;
+                s_ptab[i] = a.d.tab[key];
+                s_prtab[i] = a.d.tab[(size_t) a.d.n_keys + key];
+                s_pho[i] = a.d.helper_owned ? a.d.helper_owned[key] : (uint8_t) 0;
+            }
+        }
+    }
     __syncthreads();
     ROUTE_MARK(3);   // the route counts
     if (tid == 0) {
@@ -3847,7 +3886,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
                 const size_t key = (size_t) a.layer * E + s_ids[i];
                 const unsigned int c = s_cnt[i];
                 if (i < skip_from && !light_miss(i) && s_tab[i] == 0ull && s_rtab[i] != 0ull &&
-                    !(a.d.helper_owned && a.d.helper_owned[key])) {
+                    !(a.fast ? s_ho[i] != 0 : a.d.helper_owned && a.d.helper_owned[key])) {
                     ri[f_ram] = i;
                     rcnt[f_ram++] = c;
                 }
@@ -3870,7 +3909,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
             s_cs[i] = 0ull;
             if (ptr == 0ull && (i >= skip_from || light_miss(i))) {
                 // left out: the expert kernels skip a null plan entry (a draft only has to be a good guess)
-            } else if (ptr == 0ull && a.d.helper_owned && a.d.helper_owned[key]) {
+            } else if (ptr == 0ull && (a.fast ? s_ho[i] != 0 : a.d.helper_owned && a.d.helper_owned[key])) {
                 // A helper resident is claimed BEFORE PCIe quotas, promotion or disk skipping.
                 // cpu_src stays zero: the host resolves this key in the helper's own cache.
                 cpu |= 1u << i;
@@ -3889,11 +3928,13 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
                     // not in VRAM: land it in a spare slot of this layer (it becomes resident: the table says so
                     // from here on) or, with none left, in this entry's scratch slot.  promote_min > 1: keep it
                     // only when its aged route count clears the bar - one-offs take scratch and do not churn the tier
-                    const unsigned int rc = a.d.dcnt != nullptr ? a.d.dcnt[key] : 0u;
-                    while (next_spare < kSpares && spares[next_spare] == 0ull) ++next_spare;
+                    const unsigned int rc = a.fast ? s_rc[i] : a.d.dcnt != nullptr ? a.d.dcnt[key] : 0u;
+                    unsigned long long* const sp = a.fast ? s_sp : spares;
+                    while (next_spare < kSpares && sp[next_spare] == 0ull) ++next_spare;
                     if (next_spare < kSpares && (a.promote_min <= 1 || rc >= (unsigned int) a.promote_min)) {
-                        ptr = spares[next_spare];
-                        spares[next_spare] = 0ull;
+                        ptr = sp[next_spare];
+                        sp[next_spare] = 0ull;
+                        if (a.fast) spares[next_spare] = 0ull;
                         a.d.tab[key] = ptr;
                         promo |= 1u << i;
                         s_pp[i] = ptr;
@@ -3950,18 +3991,21 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
                 const int e = s_pred[i];
                 if (e < 0) continue;
                 const size_t key = (size_t) L1 * E + e;
-                if (a.d.tab[key] != 0ull || (a.d.helper_owned && a.d.helper_owned[key])) continue;
-                const unsigned long long src = rtab[key];
+                if (a.fast ? s_ptab[i] != 0ull || s_pho[i] != 0
+                           : a.d.tab[key] != 0ull || (a.d.helper_owned && a.d.helper_owned[key])) continue;
+                const unsigned long long src = a.fast ? s_prtab[i] : rtab[key];
                 if (src == 0ull) continue;
+                unsigned long long* const q1 = a.fast ? s_sp1 : sp1;
                 int navail = 0, first = -1;
                 for (int j = 0; j < kSpares; ++j)
-                    if (sp1[j] != 0ull) {
+                    if (q1[j] != 0ull) {
                         ++navail;
                         if (first < 0) first = j;
                     }
                 if (navail < 2) break;
-                const unsigned long long dst = sp1[first];
-                sp1[first] = 0ull;
+                const unsigned long long dst = q1[first];
+                q1[first] = 0ull;
+                if (a.fast) sp1[first] = 0ull;
                 a.d.tab[key] = dst;
                 a.d.pf_src[npf] = src;
                 a.d.pf_dst[npf] = dst;
@@ -3991,7 +4035,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         a.d.fetch_src[tid] = on ? s_fsrc[tid] : 0ull;
     }
     MoeRequest* rq = (MoeRequest*) a.d.ring + (s_seq % kRingSize);
-    if (s_cpu != 0u)
+    if (s_cpu != 0u && !a.fast)
         for (int e = tid; e < a.n_embd; e += ROUTE_THREADS) rq->x[e] = a.x[e];
     // the request's fields before x: put together in shared memory by thread 0, then out over PCIe in 8-byte words by
     // as many threads at once (thread 0's ~70 scalar stores to host memory one after another were most of the
@@ -4000,7 +4044,41 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     static_assert(offsetof(MoeRequest, x) % 8 == 0 && offsetof(MoeRequest, layer) == 4, "MoeRequest's head");
     __shared__ unsigned long long s_rq[kHeadWords];
     ROUTE_MARK(5);   // the plan out, the request's x
-    if (tid == 0) {
+    if (a.fast) {
+        // the same fields as thread 0's loop below, a thread a field (or a route entry's fields)
+        MoeRequest* q = (MoeRequest*) s_rq;
+        if (tid == 0) {
+            q->layer = a.layer;
+            q->error = 0;
+            q->miss_mask = s_mask;
+            q->fetch_mask = s_fetch;
+            q->promo_mask = s_promo;
+            q->cpu_mask = s_cpu;
+            q->win = a.win;
+            q->win_n = a.win_n;
+            q->win_rows = a.win_rows;
+            q->pad_ = 0;
+            q->skip_mask = s_skip;
+            q->pf_n = s_npf;
+            rq->layer = a.layer;
+        } else if (tid >= 32 && tid < 40) {
+            const int i = tid - 32;
+            const bool on = i < a.k;
+            q->ids[i] = on ? s_ids[i] : 0;
+            q->w[i] = on ? s_w[i] : 0.0f;
+            q->promo_ptr[i] = on ? s_pp[i] : 0ull;
+            q->pred[i] = on ? s_pred[i] : 0;
+            q->cpu_src[i] = on ? s_cs[i] : 0ull;
+            q->pf_ids[i] = i < s_npf ? s_pfid[i] : 0;
+            q->pf_ptr[i] = i < s_npf ? s_pfptr[i] : 0ull;
+        } else if (tid >= 64 && tid < 64 + kAhead * 8) {
+            const int d2 = (tid - 64) / 8, i = (tid - 64) % 8;
+            q->ahead[d2][i] = d2 < a.n_ahead && i < a.k ? s_ah[d2][i] : (short) -1;
+        } else if (tid >= 128 && tid < 144) {
+            const int i = tid - 128;
+            q->near_ids[i] = i < a.near_n ? (short) s_near[i] : (short) -1;
+        }
+    } else if (tid == 0) {
         MoeRequest* q = (MoeRequest*) s_rq;
         q->layer = a.layer;
         q->error = 0;
@@ -5879,6 +5957,12 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
         return v == nullptr || std::atoi(v) != 0;
     }();
     a.rank_sel = rank_on && n_expert % 32 == 0 && n_expert <= ROUTE_THREADS && k <= 8 ? 1 : 0;
+    // STRATA_GLM_ROUTE_FAST=0: the route kernel's old order of reads and writes (A/B; the same plan and request)
+    static const int route_fast = [] {
+        const char* v = getenv("STRATA_GLM_ROUTE_FAST");
+        return v == nullptr || std::atoi(v) != 0 ? 1 : 0;
+    }();
+    a.fast = route_fast && k <= 8 ? 1 : 0;
     // STRATA_GLM_ROUTE_PROF=1 (measurement): the route kernel's phases in cycles, averaged and printed at exit
     static unsigned long long* prof_h = [] {
         unsigned long long* p = nullptr;
