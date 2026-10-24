@@ -3650,10 +3650,14 @@ struct RouteArgs {
     float affinity;             // STRATA_GLM_ROUTE_AFFINITY: added to a VRAM-resident expert's selection score (its
                                 // weight stays its own probability) - LOSSY, it changes which experts run (0: off)
     int rank_sel;               // the selections by topk_rank (STRATA_GLM_ROUTE_RANK; the host checks E fits it)
+    unsigned long long* prof;   // STRATA_GLM_ROUTE_PROF (measurement): block 0's cycles from its start to each phase's
+                                // end, summed over routes (host-mapped; [15] counts the routes); null: off
 };
 
 __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_GRID_CONSTANT RouteArgs a) {
     const int tid = threadIdx.x, lane = tid & 31;
+    const long long rp_t0 = clock64();
+#define ROUTE_MARK(i) do { if (a.prof != nullptr && tid == 0) atomicAdd(a.prof + (i), (unsigned long long) (clock64() - rp_t0)); } while (0)
     // a token past a wrong draft (set_skip): every expert not in VRAM is left out - no fetch, no CPU work, no counts
     const bool skipped = a.skip != nullptr && *a.skip;
     const int skip_from = skipped ? 0 : a.skip_from;
@@ -3689,6 +3693,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     __shared__ float s_bv[32];
     __shared__ int s_bi[32];
     __syncthreads();
+    ROUTE_MARK(0);   // the sigmoid scores
     // the NEAR MISSES (STRATA_GLM_ROUTE_LOG only, cache studies): ranks k+1 .. k+near_n by the same selection score -
     // topk_rank has them with the top k; else the top k are -inf in s_sel after the selection, so it simply goes on
     // (s_sel is rewritten for the prediction below)
@@ -3696,6 +3701,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     if (a.rank_sel) topk_rank(s_sel, E, a.k, s_ids, a.near_n, s_near);
     else if (E <= 512) topk_warp(s_sel, E, a.k, s_ids);
     else topk_argmax(s_sel, E, a.k, s_ids, s_bv, s_bi);
+    ROUTE_MARK(1);   // the top k
     if (tid == 0)
         for (int i = 0; i < a.k; ++i)
             if (s_ids[i] < 0 || s_ids[i] >= E) atomicMax(&bad, 1);
@@ -3777,6 +3783,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         s_rtab[tid] = a.d.tab[(size_t) a.d.n_keys + key];
     }
     __syncthreads();
+    ROUTE_MARK(2);   // near misses, prediction, lookahead, the table entries
     if (bad != 0) {
         if (tid == 0) {
             // No probability/table lookup or DMA for an invalid route. Still publish and retire its sequence.
@@ -3816,6 +3823,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     if (tid < a.k && tid < 8)
         s_cnt[tid] = lane_plan && a.d.dcnt != nullptr ? ++a.d.dcnt[(size_t) a.layer * E + s_ids[tid]] : 0u;
     __syncthreads();
+    ROUTE_MARK(3);   // the route counts
     if (tid == 0) {
         double sum = 0.0;
         for (int i = 0; i < a.k; ++i) sum += (double) s_p[s_ids[i]];
@@ -3972,6 +3980,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         *a.d.cpu_flag = 0;
     }
     __syncthreads();
+    ROUTE_MARK(4);   // thread 0's plan
     if (tid < 8) {
         const bool on = tid < a.k;
         if (on) {
@@ -3990,6 +3999,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     constexpr int kHeadWords = (int) (offsetof(MoeRequest, x) / 8);
     static_assert(offsetof(MoeRequest, x) % 8 == 0 && offsetof(MoeRequest, layer) == 4, "MoeRequest's head");
     __shared__ unsigned long long s_rq[kHeadWords];
+    ROUTE_MARK(5);   // the plan out, the request's x
     if (tid == 0) {
         MoeRequest* q = (MoeRequest*) s_rq;
         q->layer = a.layer;
@@ -4020,9 +4030,11 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         rq->layer = a.layer;
     }
     __syncthreads();
+    ROUTE_MARK(6);   // the request's head put together
     for (int w8 = 1 + tid; w8 < kHeadWords; w8 += ROUTE_THREADS) ((unsigned long long*) rq)[w8] = s_rq[w8];
     __threadfence_system();
     __syncthreads();
+    ROUTE_MARK(7);   // the head out to host memory and fenced
     if (tid == 0) {
         __threadfence_system();
         rq->seq = s_seq;
@@ -4032,6 +4044,9 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         __threadfence_system();
 #endif
     }
+    ROUTE_MARK(8);   // the sequence published
+    if (a.prof != nullptr && tid == 0) atomicAdd(a.prof + 15, 1ull);
+#undef ROUTE_MARK
 }
 
 __global__ void moe_wait_kernel(MoeDev d, int n_embd) {
@@ -5864,6 +5879,30 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
         return v == nullptr || std::atoi(v) != 0;
     }();
     a.rank_sel = rank_on && n_expert % 32 == 0 && n_expert <= ROUTE_THREADS && k <= 8 ? 1 : 0;
+    // STRATA_GLM_ROUTE_PROF=1 (measurement): the route kernel's phases in cycles, averaged and printed at exit
+    static unsigned long long* prof_h = [] {
+        unsigned long long* p = nullptr;
+        if (getenv("STRATA_GLM_ROUTE_PROF") == nullptr) return p;
+        if (cudaHostAlloc((void**) &p, 16 * sizeof(unsigned long long), cudaHostAllocMapped) != cudaSuccess) {
+            cudaGetLastError();
+            return (unsigned long long*) nullptr;
+        }
+        for (int i = 0; i < 16; ++i) p[i] = 0ull;
+        std::atexit([] {
+            const char* names[] = {"sigmoid", "top k", "near/pred/table", "counts", "plan (thread 0)", "plan out + x",
+                                   "request head", "head to host", "seq published"};
+            const unsigned long long n = prof_h[15] > 0 ? prof_h[15] : 1;
+            std::fprintf(stderr, "glm route prof: %llu routes, cycles from the kernel's start (block 0):", prof_h[15]);
+            for (int i = 0; i < 9; ++i) std::fprintf(stderr, " | %s %.0f", names[i], (double) prof_h[i] / (double) n);
+            std::fprintf(stderr, "\n");
+        });
+        return p;
+    }();
+    if (prof_h != nullptr) {
+        unsigned long long* d = nullptr;
+        if (cudaHostGetDevicePointer((void**) &d, (void*) prof_h, 0) == cudaSuccess) a.prof = d;
+        else cudaGetLastError();
+    }
     if (ahead_logits != nullptr && ahead_bias != nullptr && n_expert <= 512) {
         a.n_ahead = std::min(n_ahead, kAhead);
         for (int i = 0; i < a.n_ahead; ++i) a.ahead_bias[i] = ahead_bias[i];
