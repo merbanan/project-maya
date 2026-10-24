@@ -2884,7 +2884,8 @@ __global__ void __launch_bounds__(256) kda_rec_kernel(const float* __restrict__ 
                                                       float eps, int n_head, block_q8_1* __restrict__ out) {
     kda_rec_block(q, k, v, g1, beta_raw, state, g2, norm_w, eps, out, blockIdx.x);
 }
-// kda_rec in column groups (STRATA_GLM_KDA_COLS, on by default; =0: a block a head): a state column's sums do not
+// kda_rec in column groups (STRATA_GLM_KDA_COLS=1; off by default - on a V100 it is slower, 16 us a call against
+// kda_rec_kernel's 14 us, 0.05-0.1 ms a token in decode): a state column's sums do not
 // depend on the other columns, so block (h, cg) takes columns [32 cg, 32 cg + 32) of head h - 4 blocks a head instead
 // of one, the state's 128 KB a head read and written by 4 SMs.  Each column's two 64-row halves and their sums are
 // kda_rec_block's, in its order; the head's last block to finish (a ticket a head) takes the 128 outputs from obuf and
@@ -6063,7 +6064,7 @@ void kda_rec(const float* q, const float* k, const float* v, const float* g1, co
     }
     static const bool split = [] {
         const char* e = getenv("STRATA_GLM_KDA_COLS");
-        return e == nullptr || std::atoi(e) != 0;
+        return e != nullptr && std::atoi(e) != 0;
     }();
     // the split's per-device scratch: the heads' outputs and tickets (allocated once, on the first decode)
     constexpr int kDevs = 64;
