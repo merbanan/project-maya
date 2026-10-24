@@ -26,8 +26,9 @@ struct Exl3Part {
 inline bool exl3_cpu_k2_ok(int k2) { return (k2 >= 2 && k2 <= 16 && (k2 & 1) == 0) || k2 == 3 || k2 == 5 || k2 == 7; }
 /// Whether a vector kernel runs here (AVX-512F/BW or AVX2 + FMA); the scalar one otherwise.
 bool exl3_cpu_vector();
-/// The kernel the functions below run here: 2 AVX-512 (F, BW), 1 AVX2 + FMA (+ F16C), 0 scalar.  STRATA_FORCE_AVX2=1
-/// keeps an AVX-512 CPU on AVX2 (to compare the two; they give the same bits).
+/// The kernel the functions below run here: 3 AVX-512 (F, BW) + VBMI2 + VNNI, 2 AVX-512 (F, BW), 1 AVX2 + FMA (+ F16C),
+/// 0 scalar.  STRATA_FORCE_AVX2=1 keeps an AVX-512 CPU on AVX2, STRATA_EXL3_CPU_X=0 a tier 3 CPU on tier 2 (to compare
+/// them; they give the same bits).
 int exl3_cpu_tier();
 /// xh = H(x * suh) (k values, k % 128 == 0); returns the sum of xh.
 float exl3_cpu_prepare(const Exl3Part& m, const float* x, float* xh);
@@ -60,7 +61,7 @@ void exl3_cpu_rows_acc_cols_n(const Exl3Part& m, const float* const* xh, int n, 
 size_t exl3_cpu_gemm_scratch();
 void exl3_cpu_band_gemm(const Exl3Part& m, const float* const* xh, int n, int c0, int nb, float* const* acc,
                         float* wc);
-/// exl3_cpu_band_acc_n on a given tier (0, 1, 2 as exl3_cpu_tier) - tests and benchmarks; false (nothing computed)
+/// exl3_cpu_band_acc_n on a given tier (0..3 as exl3_cpu_tier) - tests and benchmarks; false (nothing computed)
 /// where this CPU cannot run it.
 bool exl3_cpu_band_acc_on(int tier, const Exl3Part& m, const float* const* xh, int n, int c0, int ks0, int ks1,
                           float* const* acc);

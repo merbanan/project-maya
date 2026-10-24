@@ -170,7 +170,7 @@ std::vector<int> k2_list(const char* s) {
     return v;
 }
 
-const char* tier_name(int t) { return t == 2 ? "avx512" : t == 1 ? "avx2" : "scalar"; }
+const char* tier_name(int t) { return t == 3 ? "avx512x" : t == 2 ? "avx512" : t == 1 ? "avx2" : "scalar"; }
 
 }  // namespace
 
