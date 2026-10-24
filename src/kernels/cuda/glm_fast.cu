@@ -6,6 +6,7 @@
 // serial reference kernels - the values agree to float rounding, which the fast-vs-reference check in
 // glm_pack_test pins on the real model.
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/glm_batch.hpp"   // mla_decode_v70 (Volta)
 #include "strata/kernels/exl3.hpp"
 #if defined(STRATA_USE_HIP)
 #include "strata/kernels/glm_expert_bench.hpp"
@@ -5713,6 +5714,14 @@ static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int*
     cudaGetDevice(&dev);
     if (dev >= 16) return false;
     if (mla_attend_batch(q_abs, 0, lat, cells, 0, &n_sel, 1, n_head, qk_nope, kv_lora, ctx, 0, s, lat_q8)) return true;
+    // Volta: the prompt's one-pass tensor-core kernel in cell splits (STRATA_GLM_MLA_V70=0: the F32 chunks below)
+    if (kv_lora == 512 && getenv("STRATA_GLM_MLA_ATTN1") == nullptr) {
+        int vcap = 0;
+        float* vpart = mla_part(dev, n_head, kv_lora, 64, &vcap);
+        if (vpart != nullptr && strata::kernels::glmb::mla_decode_v70(q_abs, lat, cells, n_sel, n_head, kv_lora,
+                                                                      1.0f / std::sqrt((float) qk_nope), ctx, vpart, vcap, s, lat_q8))
+            return true;
+    }
     const int n_chunks = (n_sel + MLA_CHUNK - 1) / MLA_CHUNK;
     const size_t smem = (size_t) MLA_CHUNK * kv_lora * sizeof(uint16_t) + (size_t) MLA_HPB * MLA_CHUNK * sizeof(float);
     static int attr_smem[16] = {};

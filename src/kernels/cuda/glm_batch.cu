@@ -1073,11 +1073,16 @@ __device__ __forceinline__ void v7_mma884rr(float* c, uint32_t a0, uint32_t a1, 
 #endif
 }
 constexpr size_t kV7Smem = kT2Smem + (size_t) T2_H * 4;   // tc2's, and the heads' rescale factors
+// SPLIT (the decode, mla_decode_v70): one token's cells in splits of cblk, block (split, 32 heads) - its context
+// unnormalised and its heads' max and sum go to part[split][head][KV + 2] for mla_dec_combine_kernel (n_sel_max is the
+// token's cell count, n_sel_arr unused); else the prompt's block (token, 32 heads) over all its cells
+template <bool SPLIT>
 __global__ void __launch_bounds__(256, 1) mla_attn_v70_kernel(const float* __restrict__ q_abs,
                                                               const uint16_t* __restrict__ lat,
                                                               const int* __restrict__ cells_all,
                                                               const int* __restrict__ n_sel_arr, int n_sel_max,
-                                                              int n_head, float scale, float* __restrict__ ctx, bool q8) {
+                                                              int n_head, float scale, float* __restrict__ ctx, bool q8,
+                                                              int cblk = 0, float* __restrict__ part = nullptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
     // Pascal (sm_6x): no tensor cores - mla_attn launches this on Volta only
 #else
@@ -1093,8 +1098,10 @@ __global__ void __launch_bounds__(256, 1) mla_attn_v70_kernel(const float* __res
     float* sl = sm + T2_H;                                  // T2_H sums
     float* sc = sl + T2_H;                                  // T2_H this tile's rescale
     __shared__ int s_cell[T2_C];
-    const int t = blockIdx.x, h0 = blockIdx.y * T2_H, tid = threadIdx.x, wp = tid >> 5, L = tid & 31;
-    const int ns = n_sel_arr[t];
+    const int t = SPLIT ? 0 : blockIdx.x, h0 = blockIdx.y * T2_H, tid = threadIdx.x, wp = tid >> 5, L = tid & 31;
+    // the cells [cb0, ns) of the token: all of them, or the split's
+    const int cb0 = SPLIT ? blockIdx.x * cblk : 0;
+    const int ns = SPLIT ? min(n_sel_max, cb0 + cblk) : n_sel_arr[t];
     const int* cl = cells_all + (size_t) t * n_sel_max;
     const float* qa = q_abs + ((size_t) t * n_head + h0) * KV;
     for (int i = tid; i < T2_H * KV; i += 256) sq[(i / KV) * T2_LD + i % KV] = __float2half_rn(qa[i]);
@@ -1126,8 +1133,8 @@ __global__ void __launch_bounds__(256, 1) mla_attn_v70_kernel(const float* __res
                                : ((const uint4*) (lat + (size_t) KV * cell))[c8];
         }
     };
-    if (ns > 0) fetch(0);
-    for (int i0 = 0; i0 < ns; i0 += T2_C) {
+    if (ns > cb0) fetch(cb0);
+    for (int i0 = cb0; i0 < ns; i0 += T2_C) {
         __syncthreads();   // (the last tile's P.V has read srow and sp16)
 #pragma unroll
         for (int r = 0; r < RPT; ++r) {
@@ -1203,21 +1210,78 @@ __global__ void __launch_bounds__(256, 1) mla_attn_v70_kernel(const float* __res
         }
     }
     __syncthreads();
+    if constexpr (SPLIT) {   // the split's partial: the context as summed (unnormalised), then each head's max and sum
 #pragma unroll
-    for (int x = 0; x < 2; ++x) {
-        const int hl = pr * 16 + ra + 2 * x;
-        const float Ls = sl[hl];
-        const float inv = Ls > 0.0f ? 1.0f / Ls : 0.0f;
-        float* orow = ctx + ((size_t) t * n_head + h0 + hl) * KV + cbase;
+        for (int x = 0; x < 2; ++x) {
+            const int hl = pr * 16 + ra + 2 * x;
+            float* orow = part + ((size_t) blockIdx.x * n_head + h0 + hl) * (KV + 2) + cbase;
 #pragma unroll
-        for (int g = 0; g < 8; ++g)
+            for (int g = 0; g < 8; ++g)
 #pragma unroll
-            for (int i = 0; i < 8; i += 2) {
-                if (((i >> 1) & 1) != x) continue;
-                *(float2*) (orow + 16 * g + 8 * cb + (i & 4) + (L & 2)) = make_float2(o[g][i] * inv, o[g][i + 1] * inv);
-            }
+                for (int i = 0; i < 8; i += 2) {
+                    if (((i >> 1) & 1) != x) continue;
+                    orow[16 * g + 8 * cb + (i & 4) + (L & 2)] = o[g][i];
+                    orow[16 * g + 8 * cb + (i & 4) + (L & 2) + 1] = o[g][i + 1];
+                }
+        }
+        if (tid < T2_H) {
+            float* ph = part + ((size_t) blockIdx.x * n_head + h0 + tid) * (KV + 2);
+            ph[KV] = sm[tid];
+            ph[KV + 1] = sl[tid];
+        }
+    } else {
+#pragma unroll
+        for (int x = 0; x < 2; ++x) {
+            const int hl = pr * 16 + ra + 2 * x;
+            const float Ls = sl[hl];
+            const float inv = Ls > 0.0f ? 1.0f / Ls : 0.0f;
+            float* orow = ctx + ((size_t) t * n_head + h0 + hl) * KV + cbase;
+#pragma unroll
+            for (int g = 0; g < 8; ++g)
+#pragma unroll
+                for (int i = 0; i < 8; i += 2) {
+                    if (((i >> 1) & 1) != x) continue;
+                    *(float2*) (orow + 16 * g + 8 * cb + (i & 4) + (L & 2)) =
+                        make_float2(o[g][i] * inv, o[g][i + 1] * inv);
+                }
+        }
     }
 #endif
+}
+
+// mla_decode_v70's merge of its splits' partials: a block per (head, 128 columns), the splits' weights once into shared
+// memory (exp(m_split - M)), then one coalesced pass over the splits' rows; ctx = sum w O / sum w l
+__global__ void __launch_bounds__(128) mla_dec_combine_kernel(const float* __restrict__ part, int n_split, int n_head,
+                                                              float* __restrict__ ctx) {
+    constexpr int KV = 512;
+    __shared__ float s_w[64];
+    __shared__ float s_L;
+    const int h = blockIdx.x, tid = threadIdx.x;
+    const size_t st = (size_t) n_head * (KV + 2);
+    const float* ph = part + (size_t) h * (KV + 2);
+    if (tid < 32) {
+        float M = -INFINITY;
+        for (int b = tid; b < n_split; b += 32) M = fmaxf(M, ph[b * st + KV]);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
+        float Lsum = 0.0f;
+        for (int b = tid; b < n_split; b += 32) {
+            const float mb = ph[b * st + KV];
+            const float w = mb == -INFINITY ? 0.0f : expf(mb - M);
+            s_w[b] = w;
+            Lsum += w * ph[b * st + KV + 1];
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) Lsum += __shfl_xor_sync(0xffffffffu, Lsum, o);
+        if (tid == 0) s_L = Lsum;
+    }
+    __syncthreads();
+    const float invL = s_L > 0.0f ? 1.0f / s_L : 0.0f;
+    const int c = blockIdx.y * 128 + tid;
+    float acc = 0.0f;
+#pragma unroll 8
+    for (int b = 0; b < n_split; ++b) acc += s_w[b] * ph[b * st + c];
+    ctx[(size_t) KV * h + c] = acc * invL;
 }
 
 // The same tensor-core attention with the context O in the wmma accumulator registers (four 16-wide column tiles a
@@ -2355,6 +2419,56 @@ void dsa_select(const float* score, int score_ld, int p0, int kpool, int top_poo
     check("dsa_select");
 }
 
+bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int kv_lora,
+                    float scale, float* ctx, float* part, int part_cap, cudaStream_t s, bool lat_q8) {
+#if defined(STRATA_USE_HIP)
+    (void) q_abs, (void) lat, (void) cells, (void) n_sel, (void) n_head, (void) kv_lora, (void) scale, (void) ctx;
+    (void) part, (void) part_cap, (void) s, (void) lat_q8;
+    return false;   // (Volta only)
+#else
+    // Volta (sm_70 / sm_72) only, and the v70 kernel's shapes; STRATA_GLM_MLA_V70=0: the F32 split kernel (A/B)
+    static const bool want = [] {
+        const char* v = getenv("STRATA_GLM_MLA_V70");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (!want || kv_lora != 512 || n_head % T2_H != 0 || n_sel <= 0 || part == nullptr) return false;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev >= 16) return false;
+    static int ok[16] = {};
+    static int sms[16] = {};
+    if (ok[dev] == 0) {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        cudaDeviceGetAttribute(&sms[dev], cudaDevAttrMultiProcessorCount, dev);
+        ok[dev] = major == 7 && minor < 5 &&
+                          cudaFuncSetAttribute(mla_attn_v70_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                               (int) kV7Smem) == cudaSuccess
+                      ? 1
+                      : -1;
+        cudaGetLastError();
+        if (ok[dev] == 1) std::fprintf(stderr, "glm_batch: CUDA%d decode attention: the split one-pass kernel (mma.m8n8k4)\n", dev);
+    }
+    if (ok[dev] != 1) return false;
+    // splits of whole 32-cell tiles, about one block a multiprocessor over the head groups (STRATA_GLM_MLA_V70_SPLITS:
+    // the splits a head group wants), at most 64 (the combine's weights) and the partial buffer's capacity
+    static const int want_splits = [] {
+        const char* v = getenv("STRATA_GLM_MLA_V70_SPLITS");
+        return v ? std::max(1, std::atoi(v)) : 0;
+    }();
+    const int groups = n_head / T2_H;
+    const int target = std::min(64, std::min(part_cap, want_splits > 0 ? want_splits : std::max(1, sms[dev] / groups)));
+    const int tiles = (n_sel + T2_C - 1) / T2_C;
+    const int cblk = T2_C * ((tiles + target - 1) / target);
+    const int n_split = (n_sel + cblk - 1) / cblk;
+    mla_attn_v70_kernel<true><<<dim3((unsigned) n_split, (unsigned) groups), 256, kV7Smem, s>>>(
+        q_abs, lat, cells, nullptr, n_sel, n_head, scale, ctx, lat_q8, cblk, part);
+    mla_dec_combine_kernel<<<dim3((unsigned) n_head, (unsigned) (kv_lora / 128)), 128, 0, s>>>(part, n_split, n_head, ctx);
+    return true;
+#endif
+}
+
 void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max, int n_head,
               int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8) {
     if (T <= 0) return;
@@ -2427,14 +2541,14 @@ void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const i
             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
             cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
             v70_ok[dev] = want_v70 && major == 7 && minor < 5 &&
-                          cudaFuncSetAttribute(mla_attn_v70_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                          cudaFuncSetAttribute(mla_attn_v70_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                (int) kV7Smem) == cudaSuccess ? 1 : -1;
             cudaGetLastError();
             if (v70_ok[dev] == 1)
                 std::fprintf(stderr, "glm_batch: CUDA%d prompt attention: the one-pass kernel (mma.m8n8k4)\n", dev);
         }
         if (tc_ok[dev] == 1 && v70_ok[dev] == 1 && n_head % T2_H == 0)
-            mla_attn_v70_kernel<<<dim3((unsigned) T, (unsigned) (n_head / T2_H)), 256, kV7Smem, s>>>(
+            mla_attn_v70_kernel<false><<<dim3((unsigned) T, (unsigned) (n_head / T2_H)), 256, kV7Smem, s>>>(
                 q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8);
         else if (tc_ok[dev] == 1 && want_tc2 && tc2_ok[dev] == 1 && n_head % T2_H == 0)
             mla_attn_tc2_kernel<<<dim3((unsigned) T, (unsigned) (n_head / T2_H)), 256, kT2Smem, s>>>(
