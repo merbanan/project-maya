@@ -2356,8 +2356,12 @@ static int wmma_rows() {
 }
 template <class F>
 static void with_rows(F&& f) {   // (f(std::integral_constant<int, wmma_rows()>{}))
+#if defined(STRATA_USE_HIP)
     if (wmma_rows() == 16) f(std::integral_constant<int, 16>{});
     else f(std::integral_constant<int, 32>{});
+#else
+    f(std::integral_constant<int, 16>{});   // (sm_7x: 32 rows' gate/up block is over the 48 KB of static shared memory)
+#endif
 }
 template <int K2, int cb> struct RunWmmaGateUp {
     static void run(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, cudaStream_t s) {
