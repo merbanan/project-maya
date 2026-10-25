@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <utility>
@@ -571,6 +572,40 @@ __global__ void __launch_bounds__(kThreads) moe_gate_up_kernel(const KMoe a) {
         a.h[(size_t) ei * a.n_ff + g * kCols + threadIdx.x] = swiglu(gu[0][threadIdx.x], gu[1][threadIdx.x], a.limit);
 }
 
+// moe_gate_up_kernel with gate and up in blocks of their own (grid (n_ff / 128, k, 2), z: gate / up): a token's ~5
+// VRAM experts gave the V100's 80 SMs 80 blocks, each through 2 x 4096 inputs in turn (179 us against moe_down's 68
+// for as many bytes).  Each block's product and block_out are moe_gate_up_kernel's; it leaves its 128 values in part
+// ([k][2][n_ff], the stream's scratch - live only within the kernel), and the second of an (expert, output block)'s
+// pair to finish takes both through the swiglu - the same bits (STRATA_EXL3_GU_SPLIT=0: moe_gate_up_kernel)
+template <int K2, int cb>
+__global__ void __launch_bounds__(kThreads) moe_gate_up2_kernel(const KMoe a) {
+    __shared__ __half xs[kMaxKR];
+    __shared__ uint32_t stage[kWarps * 32 * K2];
+    __shared__ float red[kWarps * kCols];
+    __shared__ int last;
+    const int ei = blockIdx.y, g = blockIdx.x, r = blockIdx.z;
+    const unsigned long long ptr = a.plan_ptr[ei];
+    if (ptr == 0ull) return;
+    const uint8_t* blob = (const uint8_t*) ptr;
+    const int warp = threadIdx.x >> 5;
+    rotate_in(a.x, nullptr, (const uint16_t*) (blob + a.suh[r]), 0, a.n_embd, xs);
+    __syncthreads();
+    block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd / 16, xs, stage, red);
+    float* gu = a.part + ((size_t) ei * 2) * a.n_ff + g * kCols;
+    if (warp == 0) block_out(red, (const uint16_t*) (blob + a.svh[r]) + g * kCols, gu + (size_t) r * a.n_ff);
+    __threadfence();
+    __syncthreads();
+    unsigned* cnt = a.cnt + (size_t) ei * (a.n_ff / kCols) + g;
+    if (threadIdx.x == 0) last = atomicAdd(cnt, 1u) == 1u;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    if (threadIdx.x < kCols)
+        a.h[(size_t) ei * a.n_ff + g * kCols + threadIdx.x] =
+            swiglu(*(volatile const float*) &gu[threadIdx.x], *(volatile const float*) &gu[a.n_ff + threadIdx.x], a.limit);
+    if (threadIdx.x == 0) *cnt = 0u;
+}
+
 // grid (n_embd / 128, k): expert blockIdx.y's down rows for 128 outputs; the last block of each output block adds
 // the experts up in plan order (as the engine's moe_down), then the CPU lane's part and the shared expert
 template <int K2, int cb>
@@ -758,6 +793,11 @@ template <int K2, int cb> struct AllowSmemN {
 template <int K2, int cb> struct RunGU {
     static void run(const KMoe& a, cudaStream_t s) {
         moe_gate_up_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) a.k), kThreads, 0, s>>>(a);
+    }
+};
+template <int K2, int cb> struct RunGU2 {
+    static void run(const KMoe& a, cudaStream_t s) {
+        moe_gate_up2_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) a.k, 2u), kThreads, 0, s>>>(a);
     }
 };
 template <int K2, int cb> struct RunDown {
@@ -979,6 +1019,17 @@ void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s) {
     }
     m.x = x;
     if (h != nullptr) m.h = h;
+    static const bool split = [] {
+        const char* e = std::getenv("STRATA_EXL3_GU_SPLIT");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    // (the split's scratch: [k][2][n_ff] partials, k * n_ff / 128 counters)
+    if (split && (size_t) a.k * 2 * a.n_ff <= kPartFloats && (size_t) a.k * (a.n_ff / kCols) <= kCounters) {
+        if (!dispatch<RunGU2>(a.lay.k2[0], a.lay.cb, m, s))
+            std::fprintf(stderr, "exl3 moe_gate_up: K %g cb %d\n", a.lay.k2[0] / 2.0, a.lay.cb);
+        launch_check("moe_gate_up (split)");
+        return;
+    }
     if (!dispatch<RunGU>(a.lay.k2[0], a.lay.cb, m, s))
         std::fprintf(stderr, "exl3 moe_gate_up: K %g cb %d\n", a.lay.k2[0] / 2.0, a.lay.cb);
     launch_check("moe_gate_up");
