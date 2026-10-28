@@ -6334,7 +6334,7 @@ void dsa_select_all(int n_vis, int kpool, int n_sel, int pos, int* cells, cudaSt
 static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head,
                              int qk_nope, int kv_lora, float* ctx, cudaStream_t s, bool lat_q8, bool token = false);
 
-#if defined(STRATA_USE_HIP)
+// (glm_attn_bench's hooks: on CUDA too, where the take-two kernels also run)
 namespace {
 __global__ void lanes_kind_kernel(int* out) { *out = kLaneSum ? 1 : 0; }
 __global__ void warp_reduce_check_kernel(const float* __restrict__ in, float* sum_shfl, float* sum_lanes, float* max_shfl,
@@ -6389,7 +6389,6 @@ void warp_reduce_check(const float* in, float* sum_shfl, float* sum_lanes, float
     launch_check("warp_reduce_check");
 }
 }  // namespace hip_expert_bench
-#endif
 
 void mla_q_abs(const float* q, int64_t q_stride, const uint16_t* wk_b, int n_head, int qk_nope, int kv_lora, int ncol,
                float* q_abs, int64_t qa_stride, cudaStream_t s) {

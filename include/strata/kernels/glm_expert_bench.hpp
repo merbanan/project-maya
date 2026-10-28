@@ -26,6 +26,10 @@ namespace strata::kernels::glmf::hip_expert_bench {
 // lds > 0 the Q6_K activations staged in LDS, lds < 0 the default's choice.  r == 0 launches the original kernels,
 // r < 0 the default shape.
 void mv_config(int r, int u, int wpb, int lds);
+}
+#endif
+
+namespace strata::kernels::glmf::hip_expert_bench {
 // glm_attn_bench: the decode attention's take-two kernels by label (glm_fast.cu - dsa_score2 [r|s][l|x][1|2]b<2|4|8|16>,
 // mla_split2 h<16|32|64>[l|x][v|e][c|o]); "original" the original kernels; nullptr the engine's env again.  false: no label
 bool dsa_score_config(const char* label);
@@ -36,4 +40,3 @@ int lanes_kind(cudaStream_t s);
 void warp_reduce_check(const float* in, float* sum_shfl, float* sum_lanes, float* max_shfl, float* max_lanes, int n_warps,
                        cudaStream_t s);
 }
-#endif
