@@ -2823,21 +2823,18 @@ class Service:
 
     def _tool_repeat(self, messages):
         """The loop guard across turns (loop_guard.tool_repeat): the request's last tool call, made again and again
-        with the same arguments and the same result - its result gets loop_guard.tool_note() after it, as text the
-        model reads before it answers.  Only this prompt changes: the client's conversation stays as it sent it (its
-        next request matches the kept one up to that result, so only the tail is read again)."""
+        with the same arguments and the same result - a user message with loop_guard.tool_note() follows its result
+        (inside the result GLM-5.3 ran the call again; as a message of its own it moved on).  Only this prompt changes:
+        the client's conversation stays as it sent it (its next request matches the kept one up to that result, so
+        only the tail is read again)."""
         rep = loop_guard.tool_repeat(messages)
         if rep is None:
             return messages
-        last = dict(messages[-1])
-        note = loop_guard.tool_note(rep)
-        c = last.get("content")
-        last["content"] = c + [{"type": "text", "text": note}] if isinstance(c, list) else (c or "") + note
         print(f"[maya] loop guard: `{rep.name}` {rep.times} times with the same arguments and result: a note after it",
               flush=True)
         with self.status_lock:
             self.loop_guard_counts["tool_repeats"] += 1
-        return messages[:-1] + [last]
+        return messages + [{"role": "user", "content": loop_guard.tool_note(rep)}]
 
     def _loop_noted(self, act, written: int):
         """A loop the guard broke: a line in the server window, and the Monitor's count."""

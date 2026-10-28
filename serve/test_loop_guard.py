@@ -478,6 +478,8 @@ class ToolRepeat(unittest.TestCase):
         rep = LG.tool_repeat(self.messages(agent(NMCLI, GREP, NMCLI, GREP, NMCLI)))
         self.assertEqual(rep, LG.ToolRepeat("bash", 3))
         self.assertIn("`bash` has now run 3 times", LG.tool_note(rep))
+        self.assertIsNone(LG.tool_repeat(self.messages(agent(NMCLI, NMCLI, NMCLI)) +       # (the note itself)
+                                         [{"role": "user", "content": LG.tool_note(rep)}]))
         self.assertIsNone(LG.tool_repeat(self.messages(agent(NMCLI, GREP, NMCLI, GREP))))       # twice: not yet
         # the same command after an edit: another result each time - not a loop
         self.assertIsNone(LG.tool_repeat(self.messages(agent(*[("make test", f"{n} failed") for n in (5, 4, 3, 2)]))))
@@ -498,14 +500,15 @@ class ToolRepeat(unittest.TestCase):
         req = agent(NMCLI, GREP, NMCLI, GREP, NMCLI)
         msgs, tools, kw = __import__("serve.frontend", fromlist=["x"]).openai_to_messages(req)
         svc.prepare(msgs, tools, dict(kw), 100)
-        self.assertTrue(seen[-1][-1]["content"].startswith(NMCLI[1] + "\n\n[Loop guard: `bash` has now run 3"))
+        self.assertEqual(seen[-1][-2:], [msgs[-1], {"role": "user", "content": LG.tool_note(LG.ToolRepeat("bash", 3))}])
+        self.assertEqual(len(seen[-1]), len(msgs) + 1)
         self.assertEqual(msgs[-1]["content"], NMCLI[1])                 # the request's own messages stay as sent
         self.assertEqual(svc.metrics()["loop_guard"]["tool_repeats"], 1)
         self.assertIn("maya:loop_guard_tool_repeats_total 1", svc.prometheus())
         svc.prepare(msgs, tools, dict(kw), 100, guard=False)          # the request's "loop_guard": false
-        self.assertEqual(seen[-1][-1]["content"], NMCLI[1])
+        self.assertEqual(seen[-1], msgs)
         svc.prepare(self.messages(agent(NMCLI, GREP)), tools, dict(kw), 100)
-        self.assertEqual(seen[-1][-1]["content"], GREP[1])
+        self.assertEqual(seen[-1][-1], {"role": "tool", "content": GREP[1]})
         self.assertEqual(svc.metrics()["loop_guard"]["tool_repeats"], 1)
 
 

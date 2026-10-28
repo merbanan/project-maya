@@ -327,9 +327,10 @@ model (GLM, DeepSeek, MiniMax) - beside the GLM engine's own check for short pat
 - **Nothing changes without a loop:** the same engine calls with the same sampling, the same tokens.
 - **Across turns (agents):** an agent can loop with every answer short and fine - the same tool call, the same result,
   the same call again. When a request ends with tool results and its last call (name, arguments and result all the
-  same) is the 3rd of its kind among the last 12 calls since the user's last message, a note goes after that result:
-  the call gave nothing new, so use what is there, try a different approach or answer. Only that prompt changes; the
-  model goes on. A command run again after an edit gives another result, so it does not count.
+  same) is the 3rd of its kind among the last 12 calls since the user's last message, a short message follows that
+  result, marked as the server's: the call gave nothing new, so use what is there, try a different approach or answer.
+  Only that prompt changes; the model goes on. A command run again after an edit gives another result, so it does not
+  count.
 
 The server window gets a line for each loop broken (`[maya] loop guard: a 19-token block 5 times in the answer at
 token 1,763: repeats dropped, a short repetition penalty`); the dashboard's Monitor marks that request (Loop guard,

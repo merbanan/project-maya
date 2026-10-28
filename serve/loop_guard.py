@@ -20,7 +20,8 @@ and runs it again (GLM-5.3 ran two commands in turn 25 times over opencode, unti
 
     tool_repeat      the request's own conversation: has the last tool call - its name, its arguments and its result
                      all the same - come TOOL_REPS times among the last TOOL_WINDOW calls since the user's last
-                     message?  Then tool_note() goes after that result, for the model to read before it answers.
+                     message?  Then tool_note() follows that result as a message of its own, for the model to read before it
+                     answers (inside the tool's result GLM-5.3 ran the call a 4th time; as a message it moved on).
 
 Until a loop is seen nothing changes: the engine gets the same calls with the same sampling and writes the same
 tokens (the stream only holds back the tail that repeats while it does).  Legit repetition - a table's rows, an array
@@ -237,7 +238,8 @@ def tool_repeat(messages: list[dict]) -> ToolRepeat | None:
 
 
 def tool_note(rep: ToolRepeat) -> str:
-    """What goes after the repeated call's result: plain words, as a user would write them."""
-    return (f"\n\n[Loop guard: `{rep.name}` has now run {rep.times} times since the user's last message with these "
-            "same arguments and given this same result. Running it again will not show anything new. Do not repeat "
-            "it: use what you already have, try a different approach, or answer the user.]")
+    """The message after the repeated call's result: plain words, as a user would write them, said to be the
+    server's."""
+    return (f"[The server's loop guard, not the user: `{rep.name}` has now run {rep.times} times since the user's last "
+            "message with these same arguments and given this same result. Running it again will not show anything "
+            "new. Do not repeat it: use what you already have, try a different approach, or answer the user.]")
