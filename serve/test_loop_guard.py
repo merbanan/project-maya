@@ -348,7 +348,8 @@ class Server(unittest.TestCase):
         self.assertEqual(done["finish"], "stop")
         self.assertLess(done["completion_tokens"], 200)
         self.assertEqual(len(eng.calls), 2)
-        self.assertEqual(svc.loop_guard_counts, {"detected": 2, "penalised": 1, "thinking_closed": 0, "stopped": 1})
+        self.assertEqual(svc.loop_guard_counts, {"detected": 2, "penalised": 1, "thinking_closed": 0, "stopped": 1,
+                                                 "tool_repeats": 0})
 
     def test_a_second_loop_in_the_thinking_closes_it(self):
         tok = Tok()
@@ -448,6 +449,67 @@ class Http(unittest.TestCase):
         off = json.loads(self.post(dict(msg, loop_guard=False, max_tokens=400)))
         self.assertEqual(off["choices"][0]["finish_reason"], "length")
         self.assertGreater(off["choices"][0]["message"]["content"].count(BLOCK), 8)
+
+
+def agent(*rounds, user="find out why the module is offline"):
+    """A Chat Completions request: the user's message, then (command, result) rounds of one bash call each."""
+    msgs = [{"role": "user", "content": user}]
+    for i, (cmd, out) in enumerate(rounds):
+        msgs += [{"role": "assistant", "content": "", "tool_calls": [
+                     {"id": f"c{i}", "type": "function",
+                      "function": {"name": "bash", "arguments": json.dumps({"command": cmd})}}]},
+                 {"role": "tool", "tool_call_id": f"c{i}", "content": out}]
+    return {"messages": msgs, "tools": [{"type": "function", "function": {"name": "bash", "parameters": {}}}]}
+
+
+NMCLI = ("nmcli -s connection show Smulnet | grep pmf", "802-11-wireless-security.pmf: 0 (default)")
+GREP = ("grep -n UL_RETRY src/uplink.cpp", "13:#define UL_RETRY_MIN 2000")
+
+
+class ToolRepeat(unittest.TestCase):
+    """Across turns: the same tool call with the same result again and again (GLM-5.3 over opencode ran two
+    commands in turn 25 times) gets a note after its result; the model reads it before it answers."""
+
+    def messages(self, req):
+        from serve.frontend import openai_to_messages
+        return openai_to_messages(req)[0]
+
+    def test_what_counts(self):
+        rep = LG.tool_repeat(self.messages(agent(NMCLI, GREP, NMCLI, GREP, NMCLI)))
+        self.assertEqual(rep, LG.ToolRepeat("bash", 3))
+        self.assertIn("`bash` has now run 3 times", LG.tool_note(rep))
+        self.assertIsNone(LG.tool_repeat(self.messages(agent(NMCLI, NMCLI, NMCLI)) +       # (the note itself)
+                                         [{"role": "user", "content": LG.tool_note(rep)}]))
+        self.assertIsNone(LG.tool_repeat(self.messages(agent(NMCLI, GREP, NMCLI, GREP))))       # twice: not yet
+        # the same command after an edit: another result each time - not a loop
+        self.assertIsNone(LG.tool_repeat(self.messages(agent(*[("make test", f"{n} failed") for n in (5, 4, 3, 2)]))))
+        # the user spoke since: only the calls after their message count
+        req = agent(NMCLI, NMCLI, NMCLI)
+        req["messages"] += [{"role": "user", "content": "stop repeating and try a different approach"}]
+        req["messages"] += agent(NMCLI)["messages"][1:]
+        self.assertIsNone(LG.tool_repeat(self.messages(req)))
+        # the request does not end with a tool result: the model is answering the user
+        self.assertIsNone(LG.tool_repeat(self.messages(agent(NMCLI, NMCLI, NMCLI, user="x")) +
+                                         [{"role": "user", "content": "thanks"}]))
+
+    def test_the_prompt_gets_the_note_and_the_counts(self):
+        svc = Server().service(LoopingEngine(Tok(), HEAD, BLOCK))
+        seen = []
+        render = svc.render_ids
+        svc.render_ids = lambda messages, *a, **k: seen.append(messages) or render(messages, *a, **k)
+        req = agent(NMCLI, GREP, NMCLI, GREP, NMCLI)
+        msgs, tools, kw = __import__("serve.frontend", fromlist=["x"]).openai_to_messages(req)
+        svc.prepare(msgs, tools, dict(kw), 100)
+        self.assertEqual(seen[-1][-2:], [msgs[-1], {"role": "user", "content": LG.tool_note(LG.ToolRepeat("bash", 3))}])
+        self.assertEqual(len(seen[-1]), len(msgs) + 1)
+        self.assertEqual(msgs[-1]["content"], NMCLI[1])                 # the request's own messages stay as sent
+        self.assertEqual(svc.metrics()["loop_guard"]["tool_repeats"], 1)
+        self.assertIn("maya:loop_guard_tool_repeats_total 1", svc.prometheus())
+        svc.prepare(msgs, tools, dict(kw), 100, guard=False)          # the request's "loop_guard": false
+        self.assertEqual(seen[-1], msgs)
+        svc.prepare(self.messages(agent(NMCLI, GREP)), tools, dict(kw), 100)
+        self.assertEqual(seen[-1][-1], {"role": "tool", "content": GREP[1]})
+        self.assertEqual(svc.metrics()["loop_guard"]["tool_repeats"], 1)
 
 
 class GuardedUsage(unittest.TestCase):

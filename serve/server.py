@@ -1742,7 +1742,7 @@ class Service:
         # the loop guard (serve/loop_guard.py; MAYA_LOOP_GUARD=0 / "loop_guard": false: off) and what it did since
         # the server started: loops seen, and how each was broken (the Monitor's totals, /metrics, Prometheus)
         self.loop_guard = True
-        self.loop_guard_counts = {"detected": 0, "penalised": 0, "thinking_closed": 0, "stopped": 0}
+        self.loop_guard_counts = {"detected": 0, "penalised": 0, "thinking_closed": 0, "stopped": 0, "tool_repeats": 0}
         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
@@ -2440,6 +2440,8 @@ class Service:
              guard["thinking_closed"]),
             ("maya:loop_guard_stopped_total", "counter", "Answers the loop guard ended (a loop that came back)",
              guard["stopped"]),
+            ("maya:loop_guard_tool_repeats_total", "counter",
+             "Tool calls made again and again with the same result that got a note after them", guard["tool_repeats"]),
         ]
         rows += [(f"maya:engine_{k}", "counter" if k in self.PROM_STAT_COUNTERS else "gauge", h, stat[k])
                  for k, h in self.PROM_STAT.items()
@@ -2504,10 +2506,14 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
-    def prepare(self, messages, tools, kwargs, max_new=None, cancel=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, cancel=None, guard=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  A tool_choice that requires a call ("_force_tool": "" any, else the tool's name)
-        starts the answer with the call's opening, thinking off; that text goes back in kwargs["_prefill"] for run()."""
+        starts the answer with the call's opening, thinking off; that text goes back in kwargs["_prefill"] for run().
+        With the loop guard (`guard`, else the server's) a tool call the model keeps making with the same result gets
+        a note after that result (_tool_repeat)."""
+        if self.loop_guard if guard is None else guard:
+            messages = self._tool_repeat(messages)
         given, force = kwargs, kwargs.get("_force_tool")
         kwargs = {k: v for k, v in kwargs.items() if k != "_force_tool"}
         if force is not None and tools:
@@ -2771,6 +2777,21 @@ class Service:
         """The loop guard for this request: its own "loop_guard" when it sends one, else the server's."""
         own = (sampling or {}).get("loop_guard")
         return own if isinstance(own, bool) else bool(self.loop_guard)
+
+    def _tool_repeat(self, messages):
+        """The loop guard across turns (loop_guard.tool_repeat): the request's last tool call, made again and again
+        with the same arguments and the same result - a user message with loop_guard.tool_note() follows its result
+        (inside the result GLM-5.3 ran the call again; as a message of its own it moved on).  Only this prompt changes:
+        the client's conversation stays as it sent it (its next request matches the kept one up to that result, so
+        only the tail is read again)."""
+        rep = loop_guard.tool_repeat(messages)
+        if rep is None:
+            return messages
+        print(f"[maya] loop guard: `{rep.name}` {rep.times} times with the same arguments and result: a note after it",
+              flush=True)
+        with self.status_lock:
+            self.loop_guard_counts["tool_repeats"] += 1
+        return messages + [{"role": "user", "content": loop_guard.tool_note(rep)}]
 
     def _loop_noted(self, act, written: int):
         """A loop the guard broke: a line in the server window, and the Monitor's count."""
@@ -3311,7 +3332,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         # a required tool call applies to the first answer only: after the tools ran, the model answers freely
         kw = {k: v for k, v in kw.items() if k not in ("_force_tool", "_prefill")}
         sampling = {k: v for k, v in (sampling or {}).items() if k != "_prefill"}
-        ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req)
+        ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, guard=svc._loop_guard_on(sampling))
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
@@ -4349,7 +4370,8 @@ def make_handler(svc: Service):
             try:
                 if cancel.is_set():
                     raise ValueError("generation was cancelled before preparation")
-                ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, cancel=cancel)
+                ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, cancel=cancel,
+                                                     guard=svc._loop_guard_on(sampling))
                 if kw.get("_prefill"):
                     sampling["_prefill"] = kw["_prefill"]
                 effective = {**svc.sampling_defaults, **svc.shared, **sampling}
@@ -4382,7 +4404,7 @@ def make_handler(svc: Service):
                 extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(req))
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
@@ -4475,7 +4497,7 @@ def make_handler(svc: Service):
             svc.check_request(req)                             # a bad sampling field: a 400, now
             messages, tools, kw = anthropic_to_messages(req, deepseek=getattr(svc.template, "deepseek", False))
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(req))
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
