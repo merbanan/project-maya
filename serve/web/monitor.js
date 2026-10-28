@@ -451,6 +451,20 @@ function Hardware({m, gpuEach}) {
 // ------------------------------------------------------------------ recent requests
 const API_NAMES = {web: "Chat", openai: "OpenAI", anthropic: "Anthropic"};
 const FINISH = {stop: ["ok", "Done"], length: ["ok", "Max tokens"], cancel: ["warn", "Stopped"], disconnect: ["warn", "Closed"], error: ["danger", "Error"]};
+// the tokens and speeds of a totals block (/metrics' totals or totals_all): "N prompt tokens read at X tok/s (R reused) ·
+// W written at Y tok/s"
+function totalsBody(t) {
+  const read = t.prompt_tokens - t.reused;
+  const pSpeed = t.prompt_ms > 0 && read > 0 ? ` at ${fmt(read / (t.prompt_ms / 1000))} tok/s` : "";
+  const oSpeed = t.decode_ms > 0 && t.output_tokens > 0 ? ` at ${fmt(t.output_tokens / (t.decode_ms / 1000), 1)} tok/s` : "";
+  return `${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ${fmt(t.output_tokens)} written${oSpeed}`;
+}
+// every start's together (totals_all, kept next to the run config): the line under the one since this start
+function totalsAllLine(t) {
+  if (!t || !t.requests) return "";
+  const since = new Date(t.since * 1000).toLocaleString([], {day: "numeric", month: "short", hour: "2-digit", minute: "2-digit"});
+  return `In all, since ${since}: ${fmt(t.requests)} request${t.requests === 1 ? "" : "s"} · ${totalsBody(t)}`;
+}
 function totalsLine(t, lg = {}) {
   if (!t || !t.requests) return "";
   // the loop guard: the loops it saw and what it did about them (/metrics' maya:loop_guard_* counters, here only; the
@@ -460,11 +474,8 @@ function totalsLine(t, lg = {}) {
   const loops = lg.detected ? ` · loop guard: ${fmt(lg.detected)} loop${lg.detected === 1 ? "" : "s"} seen${did.length ? ` (${did.join(", ")})` : ""}`
               : lg.on === false ? " · loop guard off" : "";
   const since = new Date(t.since * 1000).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"});
-  const read = t.prompt_tokens - t.reused;
-  const pSpeed = t.prompt_ms > 0 && read > 0 ? ` at ${fmt(read / (t.prompt_ms / 1000))} tok/s` : "";
-  const oSpeed = t.decode_ms > 0 && t.output_tokens > 0 ? ` at ${fmt(t.output_tokens / (t.decode_ms / 1000), 1)} tok/s` : "";
   // (the requests' count is the hero's Requests served)
-  return `Since ${since}: ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ${fmt(t.output_tokens)} written${oSpeed}${loops}`;
+  return `Since ${since}: ${totalsBody(t)}${loops}`;
 }
 function Requests({m}) {
   const requests = m.requests || [], kept = m.requests_kept == null ? requests.length : m.requests_kept;
@@ -475,6 +486,7 @@ function Requests({m}) {
         ${reqAll.on ? "Show fewer" : `Show all ${kept}`}</button>` : null}</div>
     <div class=${`table-wrap${reqAll.on ? " is-all" : ""}`}><table class="table num">
       <thead><tr><th class="l">Time</th><th class="l">Status</th><th>Prompt</th><th title="Prompt tokens the conversation cache already held">Reused</th>
+        <th title="Prompt tokens read this time: the prompt less the reused (cached) prefix">New</th>
         <th title="Prompt tokens read per second (the reused ones not counted)">Prefill</th><th>Output</th>
         <th title="Answer tokens written per second">Decode</th><th title="While writing the answer: the share of the routed experts that were already in VRAM">VRAM hit</th><th>Took</th></tr></thead>
       <tbody>${rows.length ? rows.map((r) => {
@@ -486,12 +498,14 @@ function Requests({m}) {
             ${r.api ? html` <span class="muted small">${API_NAMES[r.api] || r.api}</span>` : null}
             ${r.loop_guard && r.loop_guard.length   /* (what the loop guard did in this answer: on hover) */
               ? html` <span class="badge badge--warn" title=${r.loop_guard.join("\n")}>Loop guard</span>` : null}</td>
-          <td>${fmt(r.prompt_tokens)}</td><td>${fmt(r.reused)}</td><td>${fmt(pre)}</td><td>${fmt(r.output_tokens)}</td>
+          <td>${fmt(r.prompt_tokens)}</td><td>${fmt(r.reused)}</td>
+          <td>${r.prompt_tokens == null ? "–" : fmt(r.prompt_tokens - (r.reused || 0))}</td><td>${fmt(pre)}</td><td>${fmt(r.output_tokens)}</td>
           <td class="strong">${fmt(r.decode_tok_s, 1)}</td><td>${r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%`}</td>
           <td>${fmt(r.duration_s, 1)} s</td></tr>`;
-      }) : html`<tr><td colspan="9" class="l muted">No requests yet</td></tr>`}</tbody>
+      }) : html`<tr><td colspan="10" class="l muted">No requests yet</td></tr>`}</tbody>
     </table></div>
     ${m.totals && m.totals.requests ? html`<p class="card__note">${totalsLine(m.totals, m.loop_guard || {})}</p>` : null}
+    ${m.totals_all && m.totals_all.requests ? html`<p class="card__note">${totalsAllLine(m.totals_all)}</p>` : null}
   </section>`;
 }
 

@@ -1755,6 +1755,10 @@ class Service:
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
                        "prompt_ms": 0.0, "decode_ms": 0.0}
+        # the same over every start (the Monitor's second totals line): kept in totals_path (next to the config, or
+        # the config's "totals_file"), written after each request; None without a config (nothing is kept)
+        self.totals_all = None
+        self.totals_path = None
         # the loop guard (serve/loop_guard.py; MAYA_LOOP_GUARD=0 / "loop_guard": false: off) and what it did since
         # the server started: loops seen, and how each was broken (the Monitor's totals, /metrics, Prometheus)
         self.loop_guard = True
@@ -1833,6 +1837,28 @@ class Service:
             return self.tok.encode(prompt + suffix, parse_special=True)
         prompt, plain = unmark_literals(prompt, self.literals)
         return self.tok.encode(prompt + suffix, parse_special=True, plain=plain)
+
+    def load_totals_all(self, path: str):
+        """The totals over every start, from path (a missing or unreadable file: from now, empty)."""
+        self.totals_path = path
+        zero = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
+                "prompt_ms": 0.0, "decode_ms": 0.0}
+        try:
+            got = json.loads(Path(path).read_text(encoding="utf-8"))
+            self.totals_all = {k: type(v)(got.get(k, v)) for k, v in zero.items()}
+        except (OSError, ValueError, TypeError):
+            self.totals_all = zero
+
+    def save_totals_all(self):
+        """Written whole to a temporary file and renamed over the old one: a stop mid-write keeps the last totals."""
+        if not self.totals_path or self.totals_all is None:
+            return
+        try:
+            tmp = Path(self.totals_path + ".tmp")
+            tmp.write_text(json.dumps(self.totals_all), encoding="utf-8")
+            os.replace(tmp, self.totals_path)
+        except OSError as e:
+            print(f"[maya] could not save the totals: {e}", flush=True)
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -2335,6 +2361,7 @@ class Service:
             answering = self.latest_request in self.current_requests
             hist = list(self.history)
             totals = dict(self.totals)
+            totals_all = dict(self.totals_all) if self.totals_all is not None else None
             guard = dict(self.loop_guard_counts, on=bool(self.loop_guard))   # (what the loop guard did since start)
             active = self.active
             writing = len(self.current_requests)        # (of the active ones, those past their prompt)
@@ -2381,7 +2408,7 @@ class Service:
         cards = hw.pop("vram", None)                      # (each card's processes: for the GPU map only)
         return {"engine": engine, "live": live, "tiers": tiers, "gpu_map": self._gpu_map(cards),
                 "requests": hist[::-1][:None if all_requests else 12],
-                "requests_kept": len(hist), "totals": totals, "loop_guard": guard, "hardware": hw,
+                "requests_kept": len(hist), "totals": totals, "totals_all": totals_all, "loop_guard": guard, "hardware": hw,
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now, "reload": reload, "storage": self.storage(),
                 "savings": self.savings.summary() if self.savings is not None else None}
@@ -3158,6 +3185,15 @@ class Service:
                     book = (len(ids), last.get("reused") or 0, n)
                     t["prompt_ms"] += last.get("prompt_ms") or 0.0
                     t["decode_ms"] += last.get("decode_ms") or 0.0
+                    if self.totals_all is not None:
+                        ta = self.totals_all
+                        ta["requests"] += 1
+                        ta["prompt_tokens"] += len(ids)
+                        ta["reused"] += last.get("reused") or 0
+                        ta["output_tokens"] += n
+                        ta["prompt_ms"] += last.get("prompt_ms") or 0.0
+                        ta["decode_ms"] += last.get("decode_ms") or 0.0
+                        self.save_totals_all()
                     fresh = getattr(self.engine, "last", None)
                     if fresh is not None and fresh is not before:      # the engine's clock for THIS request
                         timings = request_timings(len(ids), n, last)
@@ -5060,6 +5096,12 @@ def main() -> int:
         #  has them; MiniMax's says so itself, INFO dspark=)
         if models.family(cfg) == "deepseek":
             svc.dspark = models.flag(args, "--dspark", "on") not in ("off", "none") and models.ds4_has_drafter(cfg)
+    if a.config:                                        # the totals over every start, from last time
+        svc.load_totals_all(cfg.get("totals_file") or str(Path(a.config).with_suffix("")) + ".totals.json")
+        ta = svc.totals_all
+        print(f"[maya] totals since {time.strftime('%Y-%m-%d %H:%M', time.localtime(ta['since']))}: "
+              f"{ta['requests']} requests, {ta['prompt_tokens'] - ta['reused']} prompt tokens read, "
+              f"{ta['output_tokens']} written ({svc.totals_path})", flush=True)
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:

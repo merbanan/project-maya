@@ -302,6 +302,54 @@ class ImageMarkers(unittest.TestCase):
             svc.embeddings.path.unlink(missing_ok=True)
 
 
+class TotalsOverEveryStart(unittest.TestCase):
+    """The Monitor's second totals line: the requests and tokens of every start, kept in a file (totals_all)."""
+
+    def run_one(self, svc, tok):
+        list(svc.run(tok.encode("hi"), False, None, 20, {}, threading.Event()))
+
+    def test_kept_across_starts(self):
+        import tempfile
+        tok = ByteTokenizer()
+        with tempfile.TemporaryDirectory() as d:
+            path = str(Path(d) / "maya.totals.json")
+            svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+            svc.load_totals_all(path)                       # no file yet: from now, empty
+            since = svc.totals_all["since"]
+            self.run_one(svc, tok)
+            self.run_one(svc, tok)
+            self.assertEqual(svc.metrics()["totals_all"]["requests"], 2)
+            out = svc.totals_all["output_tokens"]
+            self.assertGreater(out, 0)
+            again = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+            again.load_totals_all(path)                     # the next start goes on from the file
+            self.assertEqual(again.totals_all["requests"], 2)
+            self.assertEqual(again.totals_all["since"], since)
+            self.run_one(again, tok)
+            m = again.metrics()
+            self.assertEqual(m["totals"]["requests"], 1)    # this start's
+            self.assertEqual(m["totals_all"]["requests"], 3)
+            self.assertEqual(m["totals_all"]["output_tokens"], out + m["totals"]["output_tokens"])
+
+    def test_a_broken_file_starts_again(self):
+        import tempfile
+        tok = ByteTokenizer()
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "maya.totals.json"
+            path.write_text("{not json")
+            svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+            svc.load_totals_all(str(path))
+            self.assertEqual(svc.totals_all["requests"], 0)
+            self.run_one(svc, tok)
+            self.assertEqual(json.loads(path.read_text())["requests"], 1)
+
+    def test_no_config_keeps_nothing(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.run_one(svc, tok)
+        self.assertIsNone(svc.metrics()["totals_all"])
+
+
 class GlmThinkingLevels(unittest.TestCase):
     """GLM-5.x's template knows reasoning_effort low / high and is "Max" otherwise (no effort given included), and it
     always opens <think>: the server's levels map onto low / high / max, and thinking off closes the think block."""
