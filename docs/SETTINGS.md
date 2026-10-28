@@ -325,11 +325,17 @@ model (GLM, DeepSeek, MiniMax) - beside the GLM engine's own check for short pat
 - **Streaming:** tokens that repeat what came just before them are held back while they do (two blocks at most), so
   a client never receives repeats that are dropped; when the text moves on, they follow at once.
 - **Nothing changes without a loop:** the same engine calls with the same sampling, the same tokens.
+- **Across turns (agents):** an agent can loop with every answer short and fine - the same tool call, the same result,
+  the same call again. When a request ends with tool results and its last call (name, arguments and result all the
+  same) is the 3rd of its kind among the last 12 calls since the user's last message, a note goes after that result:
+  the call gave nothing new, so use what is there, try a different approach or answer. Only that prompt changes; the
+  model goes on. A command run again after an edit gives another result, so it does not count.
 
 The server window gets a line for each loop broken (`[maya] loop guard: a 19-token block 5 times in the answer at
 token 1,763: repeats dropped, a short repetition penalty`); the dashboard's Monitor marks that request (Loop guard,
 on hover what it did) and counts the loops since the start, as do `/metrics` (`loop_guard`) and
-`/metrics/prometheus` (`maya:loop_guard_*_total`).
+`/metrics/prometheus` (`maya:loop_guard_*_total`; the notes across turns: `[maya] loop guard: `bash` 3 times with the
+same arguments and result: a note after it`, `maya:loop_guard_tool_repeats_total`).
 
 Off for the server: `MAYA_LOOP_GUARD=0`, or `"loop_guard": false` in the run config. A request can choose for itself
 with `"loop_guard": false` (or `true`) beside its sampling fields (Chat Completions, Anthropic Messages).

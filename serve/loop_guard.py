@@ -15,6 +15,13 @@ DeepSeek, MiniMax) gets it alike, in the thinking and in the answer.
                      2nd, thinking    the thinking is closed with the model's own end-of-thinking token: it answers
                      2nd in the answer, or a 3rd    the answer ends there (finish "stop")
 
+Across turns, an agent can loop with every answer short and fine: it runs the same tool call, gets the same result
+and runs it again (GLM-5.3 ran two commands in turn 25 times over opencode, until the user wrote "stop repeating").
+
+    tool_repeat      the request's own conversation: has the last tool call - its name, its arguments and its result
+                     all the same - come TOOL_REPS times among the last TOOL_WINDOW calls since the user's last
+                     message?  Then tool_note() goes after that result, for the model to read before it answers.
+
 Until a loop is seen nothing changes: the engine gets the same calls with the same sampling and writes the same
 tokens (the stream only holds back the tail that repeats while it does).  Legit repetition - a table's rows, an array
 literal, a function name over and over, code lines alike - is not an exact block repeated back to back three times
@@ -25,6 +32,7 @@ it on for that request when the server has it off).
 """
 from __future__ import annotations
 
+import json
 from typing import NamedTuple
 
 P_MIN = 8               # the shortest block: shorter loops (one token, "0, 0, 0") repeat a multiple of it in 8..15
@@ -187,3 +195,49 @@ class LoopGuard:
 
     def summary(self) -> list[str]:
         return [a.describe() for a in self.events]
+
+
+# ------------------------------------------------------------------------------------------------ across turns
+TOOL_WINDOW = 12        # the last this many tool calls since the user's last message ...
+TOOL_REPS = 3           # ... hold the last one (name, arguments and result the same) this many times: a loop
+
+
+class ToolRepeat(NamedTuple):
+    """The last tool call of a conversation that keeps coming back: `name`, `times` among the last TOOL_WINDOW."""
+    name: str
+    times: int
+
+
+def _same(v) -> str:
+    return json.dumps(v, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def tool_repeat(messages: list[dict]) -> ToolRepeat | None:
+    """The template messages (frontend.openai_to_messages / anthropic_to_messages) of a request that ends with tool
+    results: is the last call one the model made TOOL_REPS times among its last TOOL_WINDOW since the user's last
+    message, with the same arguments, and got the same result each time?  A command run again after an edit gives
+    another result, a poll that finally changes another one too: neither counts."""
+    if not messages or messages[-1].get("role") != "tool":
+        return None
+    calls, pending = [], []
+    for m in messages:
+        role = m.get("role")
+        if role == "user":                      # the user spoke: what came before is not this loop
+            calls, pending = [], []
+        elif role == "assistant":
+            pending = [((c.get("function") or c).get("name"), _same((c.get("function") or c).get("arguments")))
+                       for c in m.get("tool_calls") or []]
+        elif role == "tool" and pending:        # results answer the calls in their order
+            name, args = pending.pop(0)
+            calls.append((name, args, _same(m.get("content"))))
+    if not calls:
+        return None
+    times = calls[-TOOL_WINDOW:].count(calls[-1])
+    return ToolRepeat(str(calls[-1][0]), times) if times >= TOOL_REPS else None
+
+
+def tool_note(rep: ToolRepeat) -> str:
+    """What goes after the repeated call's result: plain words, as a user would write them."""
+    return (f"\n\n[Loop guard: `{rep.name}` has now run {rep.times} times since the user's last message with these "
+            "same arguments and given this same result. Running it again will not show anything new. Do not repeat "
+            "it: use what you already have, try a different approach, or answer the user.]")

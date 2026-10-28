@@ -471,8 +471,10 @@ function totalsLine(t, lg = {}) {
   // request rows say where), or that it is off
   const did = [[lg.penalised, "cut with a short penalty"], [lg.thinking_closed, "closed the thinking"],
                [lg.stopped, "ended the answer"]].filter(([n]) => n > 0).map(([n, s]) => `${fmt(n)} ${s}`);
-  const loops = lg.detected ? ` · loop guard: ${fmt(lg.detected)} loop${lg.detected === 1 ? "" : "s"} seen${did.length ? ` (${did.join(", ")})` : ""}`
-              : lg.on === false ? " · loop guard off" : "";
+  // (and across turns: a tool call made again and again with the same result, a note after it)
+  const tools = lg.tool_repeats ? `${fmt(lg.tool_repeats)} repeated tool call${lg.tool_repeats === 1 ? "" : "s"} noted` : "";
+  const loops = lg.detected ? ` · loop guard: ${fmt(lg.detected)} loop${lg.detected === 1 ? "" : "s"} seen${did.length ? ` (${did.join(", ")})` : ""}${tools ? `, ${tools}` : ""}`
+              : tools ? ` · loop guard: ${tools}` : lg.on === false ? " · loop guard off" : "";
   const since = new Date(t.since * 1000).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"});
   // (the requests' count is the hero's Requests served)
   return `Since ${since}: ${totalsBody(t)}${loops}`;
