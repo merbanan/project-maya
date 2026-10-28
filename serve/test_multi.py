@@ -298,5 +298,68 @@ class AWedgedRequest(unittest.TestCase):
         self.assertEqual(self.engine._routes, {})
 
 
+# One conversation, and STOP is looked at only after a slow "prompt chunk" (1.5 s): the stopped request's tokens and
+# DONE come long after the drain started.
+SLOW_STOP_ENGINE = r'''#!/usr/bin/env python3
+import sys, threading, time
+lock = threading.Lock()
+def out(s):
+    with lock:
+        sys.stdout.write(s + "\n"); sys.stdout.flush()
+stop = threading.Event()
+work = []
+def reader():
+    for line in sys.stdin:
+        if line.strip() == "STOP":
+            stop.set()
+        elif line.startswith("GEN"):
+            work.append(line.split()[-1].split(","))
+        elif line.startswith("QUIT"):
+            sys.exit(0)
+threading.Thread(target=reader, daemon=True).start()
+out("READY 4096 stop")
+while True:
+    if not work:
+        time.sleep(0.01); continue
+    ids = work.pop(0)
+    stop.clear()
+    out("PP 1 %d" % len(ids))
+    time.sleep(1.5)                                  # the chunk: STOP is not looked at until it is read
+    for i in range(3):
+        if stop.is_set():
+            break
+        out("T %d" % (int(ids[0]) * 100 + i))
+    out("DONE 3 %d 1 1 %s" % (len(ids), "cancel" if stop.is_set() else "length"))
+'''
+
+
+class AStoppedLongPrompt(unittest.TestCase):
+    """2026-10-28: a request cancelled during a long prompt read; the drain gave up after DRAIN_S while the engine was
+    still reading the chunk, and from then on every request got the one before's answer.  The drain now waits for
+    the stopped request's DONE, so the next request reads its own tokens."""
+
+    def setUp(self):
+        import serve.server as srv
+        self.srv = srv
+        self.old = srv.DRAIN_S
+        self.path = Path(tempfile.mkdtemp()) / "slow-stop-engine.py"
+        self.path.write_text(SLOW_STOP_ENGINE)
+        self.path.chmod(0o755)
+        self.engine = StrataEngine(str(self.path), [])
+
+    def tearDown(self):
+        self.srv.DRAIN_S = self.old
+        self.engine.close()
+        shutil.rmtree(self.path.parent, ignore_errors=True)
+
+    def test_the_next_request_gets_its_own_tokens(self):
+        self.srv.DRAIN_S = 0.3                                     # well under the 1.5 s chunk
+        gen = self.engine.generate([7, 8, 9], 3, {}, threading.Event())
+        next(gen)                                                  # its PP line: reading the prompt
+        gen.close()                                                # the client went away mid-read
+        got = [t for t in self.engine.generate([5, 6], 3, {}, threading.Event()) if t is not None]
+        self.assertEqual(got, [500, 501, 502])                     # not the stopped one's 7xx
+
+
 if __name__ == "__main__":
     unittest.main()
