@@ -962,20 +962,36 @@ class StrataEngine:
                         self.proc.stdin.flush()
                     except OSError:
                         pass
-                # Bounded like the multi one (see DRAIN_S): a STOP the engine does not honour must not hold the
-                # request's place in the FIFO for ever.
-                end = time.monotonic() + DRAIN_S
+                # Not bounded like the multi one: one conversation shares one line queue, so going on before this
+                # request's DONE handed its lines (T ... DONE) to the next request, and every request after it read
+                # the one before's answer (2026-10-28: a request cancelled 70 s into a long prompt; the engine looks
+                # at STOP between the prompt's chunks, and a 32K chunk deep in a long context takes over a minute).
+                # The engine is busy with it either way, so the drain waits; only a stuck engine (the stall watchdog,
+                # STRATA_ENGINE_STALL_S) ends it.  DRAIN_S is when it says so.
+                t0 = heard = time.monotonic()
+                said, stall = False, {}
                 while True:
                     try:
-                        line = self.lines.get(timeout=max(0.05, end - time.monotonic()))
+                        line = self.lines.get(timeout=5)
                     except queue.Empty:
-                        print(f"[maya] stopped, and the engine did not say the request had ended within {DRAIN_S:.0f} s "
-                              "(STRATA_DRAIN_S) - going on; the engine may still be writing it", flush=True)
-                        break
+                        if not said and time.monotonic() - t0 >= DRAIN_S:
+                            said = True
+                            print(f"[maya] stopped, and the engine has not said the request ended after {DRAIN_S:.0f} s "
+                                  "(STRATA_DRAIN_S) - it is still working on it (a long prompt is stopped between its "
+                                  "chunks); waiting for it", flush=True)
+                        why = self._stall_check(heard, stall) if ENGINE_STALL_S > 0 else None
+                        if why:
+                            self._end(why)
+                            break
+                        continue
+                    heard = time.monotonic()
+                    stall.clear()
                     if line is None or line.startswith("ERR"):
                         break
                     if line.startswith("DONE"):
                         self._parse_done(line)
+                        if said:
+                            print(f"[maya] the stopped request ended after {heard - t0:.0f} s", flush=True)
                         break
 
     def command(self, line: str, expect: str, timeout: float = 60.0) -> str:
