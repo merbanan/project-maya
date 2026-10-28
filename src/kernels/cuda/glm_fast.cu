@@ -3842,37 +3842,45 @@ __device__ void topk_warp(float* sel, int E, int k, int* out) {
 // e's, above it when it is >, and only the span's own 32 need the id compare.  For E % 32 == 0, E <= blockDim.x and
 // finite scores (a route with a non-finite one is refused - its picks unused; the slots no rank fills stay -1).  sel
 // is left as it was (topk_warp leaves its picks at -inf: nothing reads them)
+// expert e's rank among E selection scores: the scores that beat sel[e] - larger, or equal at a lower id.  A warp's
+// 32 ids are one span: below it a score beats e when it is >=, above it when it is >, and only the span's own ids
+// need the id test (E a multiple of 32, sel 16-byte aligned)
+__device__ __forceinline__ int route_rank(const float* sel, int E, int e) {
+    const int wb = e & ~31;
+    const float v = sel[e];
+    int r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+    const float4* s4 = (const float4*) sel;
+#pragma unroll 4
+    for (int q = 0; q < wb / 4; ++q) {
+        const float4 o = s4[q];
+        r0 += o.x >= v;
+        r1 += o.y >= v;
+        r2 += o.z >= v;
+        r3 += o.w >= v;
+    }
+#pragma unroll
+    for (int j = wb; j < wb + 32; ++j) {
+        const float o = sel[j];
+        r0 += (o > v) | ((o == v) & (j < e));
+    }
+#pragma unroll 4
+    for (int q = (wb + 32) / 4; q < E / 4; ++q) {
+        const float4 o = s4[q];
+        r0 += o.x > v;
+        r1 += o.y > v;
+        r2 += o.z > v;
+        r3 += o.w > v;
+    }
+    return r0 + r1 + r2 + r3;
+}
+
 __device__ void topk_rank(const float* sel, int E, int k, int* out, int n2 = 0, int* out2 = nullptr) {
-    const int e = threadIdx.x, wb = e & ~31;
+    const int e = threadIdx.x;
     if (e < k) out[e] = -1;
     if (e < n2) out2[e] = -1;
     __syncthreads();
     if (e < E) {
-        const float v = sel[e];
-        int r0 = 0, r1 = 0, r2 = 0, r3 = 0;
-        const float4* s4 = (const float4*) sel;
-#pragma unroll 4
-        for (int q = 0; q < wb / 4; ++q) {
-            const float4 o = s4[q];
-            r0 += o.x >= v;
-            r1 += o.y >= v;
-            r2 += o.z >= v;
-            r3 += o.w >= v;
-        }
-#pragma unroll
-        for (int j = wb; j < wb + 32; ++j) {
-            const float o = sel[j];
-            r0 += (o > v) | ((o == v) & (j < e));
-        }
-#pragma unroll 4
-        for (int q = (wb + 32) / 4; q < E / 4; ++q) {
-            const float4 o = s4[q];
-            r0 += o.x > v;
-            r1 += o.y > v;
-            r2 += o.z > v;
-            r3 += o.w > v;
-        }
-        const int r = r0 + r1 + r2 + r3;
+        const int r = route_rank(sel, E, e);
         if (r < k) out[r] = e;
         else if (r - k < n2) out2[r - k] = e;
     }
@@ -3927,6 +3935,8 @@ struct RouteArgs {
     int fast;                   // STRATA_GLM_ROUTE_FAST (on by default; =0: the old order, A/B): the error flag from
                                 // its device copy, the request's x out at the start, the plan's reads in parallel
                                 // into shared memory, the request head a thread a field - the same plan and request
+    int one;                    // STRATA_GLM_ROUTE_ONE: the decode's plain route by moe_route_one_kernel (the host
+                                // checks it applies)
 };
 
 __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_GRID_CONSTANT RouteArgs a) {
@@ -4433,6 +4443,259 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
 #if defined(__HIPCC__)
         // The CPU polls this signal without a stream query. As in Strata #697,
         // publish the signal itself after publishing the request payload.
+        __threadfence_system();
+#endif
+    }
+    ROUTE_MARK(8);   // the sequence published
+    if (a.prof != nullptr && tid == 0) atomicAdd(a.prof + 15, 1ull);
+#undef ROUTE_MARK
+}
+
+// STRATA_GLM_ROUTE_ONE (on by default; =0: moe_route_kernel, A/B): the decode's plain route - no prediction, lookahead,
+// near misses or verify window - in one pass an expert.  Each thread scores its own expert and counts its rank
+// (route_rank); the experts of rank < k load their own table and RAM-tier entries, helper flag and route count; then
+// warp 0 makes the plan, a lane a route entry, and puts the request out.  moe_route_kernel's thread 0 took the entries
+// one after another, each a chain of dependent reads; here the one ordered step, the spares in route order, is the
+// j-th eligible entry taking the j-th free spare (ballots and a popc).  Three block barriers instead of nine: the
+// same experts, weights, plan, table edits and request as moe_route_kernel's (ROUTE_FAST order) - so the CPU lane
+// has its request sooner.
+__global__ void __launch_bounds__(ROUTE_THREADS) moe_route_one_kernel(const STRATA_GRID_CONSTANT RouteArgs a) {
+    const int tid = threadIdx.x, lane = tid & 31;
+    const long long rp_t0 = clock64();
+#define ROUTE_MARK(i) do { if (a.prof != nullptr && tid == 0) atomicAdd(a.prof + (i), (unsigned long long) (clock64() - rp_t0)); } while (0)
+    const bool skipped = a.skip != nullptr && *a.skip;
+    const int skip_from = skipped ? 0 : a.skip_from;
+    if (blockIdx.x > 0) {
+        if (skipped) return;
+        const int i = (blockIdx.x - 1) * ROUTE_THREADS + tid;
+        if (i >= a.n_ff_sh) return;
+        const float g = fminf(a.sh_gate[i], a.sh_limit);
+        const float u = fminf(fmaxf(a.sh_up[i], -a.sh_limit), a.sh_limit);
+        q8_1_store_warp((g / (1.0f + expf(-g))) * u, a.sh_hq + i / 32, lane);
+        return;
+    }
+    const int E = a.n_expert, k = a.k;
+    const size_t lk = (size_t) a.layer * E;
+    __shared__ __align__(16) float s_sel[512];
+    __shared__ int s_ids[8], s_bad0;
+    __shared__ float s_pr[8];
+    __shared__ unsigned long long s_tab[8], s_rtab[8];
+    __shared__ unsigned int s_cnt[8], s_rc[8];
+    __shared__ uint8_t s_ho[8];
+    if (tid == 0)
+        s_bad0 = a.d.route_err_d != nullptr ? *a.d.route_err_d != 0 : a.d.route_error != nullptr && *a.d.route_error != 0;
+    if (tid < 8) s_ids[tid] = -1;
+    // the FFN input out to the request's slot (seq is this kernel's to advance) and the counts' aging - before any use
+    MoeRequest* rq = (MoeRequest*) a.d.ring + ((*a.d.seq + 1) % kRingSize);
+    for (int e = tid; e < a.n_embd; e += ROUTE_THREADS) rq->x[e] = a.x[e];
+    if (a.cpu_plan != 0ull && a.d.dcnt != nullptr && ((*a.d.seq + 1) & 4095u) == 0u)
+        for (int i = tid; i < a.d.n_keys; i += ROUTE_THREADS) a.d.dcnt[i] >>= 1;
+    // the expert's score (its own thread)
+    float p = 0.0f;
+    unsigned long long tb = 0ull;
+    bool tb_read = false, nonfinite = false;
+    if (tid < E) {
+        p = 1.0f / (1.0f + expf(-a.logits[tid]));
+        float sel = a.bias ? p + a.bias[tid] : p;
+        if (a.affinity > 0.0f && a.d.tab != nullptr) {
+            tb = a.d.tab[lk + tid];
+            tb_read = true;
+            if (tb != 0ull) sel += a.affinity;
+        }
+        s_sel[tid] = sel;
+        nonfinite = !isfinite(a.logits[tid]) || !isfinite(sel);
+    }
+    const bool bad1 = __syncthreads_or(nonfinite) != 0 || s_bad0 != 0;
+    ROUTE_MARK(0);   // the sigmoid scores
+    // its rank; the route's experts (rank < k) load their own entries
+    const bool lane_plan = a.cpu_plan != 0ull && skip_from > 0;
+    if (tid < E) {
+        const int r = route_rank(s_sel, E, tid);
+        if (r < k) {
+            const size_t key = lk + tid;
+            s_ids[r] = tid;
+            s_pr[r] = p;
+            if (!bad1) {
+                s_tab[r] = tb_read ? tb : a.d.tab[key];
+                s_rtab[r] = a.d.tab[(size_t) a.d.n_keys + key];
+                s_ho[r] = a.d.helper_owned ? a.d.helper_owned[key] : (uint8_t) 0;
+                const unsigned int c = lane_plan && a.d.dcnt != nullptr ? ++a.d.dcnt[key] : 0u;
+                s_cnt[r] = c;
+                s_rc[r] = a.d.dcnt == nullptr ? 0u : lane_plan ? c : a.d.dcnt[key];
+            }
+        }
+    }
+    __threadfence_system();   // (this thread's x writes, before the request's seq)
+    __syncthreads();
+    ROUTE_MARK(1);   // the top k
+    ROUTE_MARK(2);
+    ROUTE_MARK(3);   // (and their entries and counts, with it)
+    if (tid >= 32) return;
+    const bool on = lane < k;
+    const int id = on ? s_ids[lane] : 0;
+    const int bad = bad1 || __any_sync(0xffffffffu, on && (id < 0 || id >= E)) ? 1 : 0;
+    if (bad != 0) {
+        if (tid == 0) {
+            // No probability/table lookup or DMA for an invalid route. Still publish and retire its sequence.
+            if (a.d.route_error != nullptr && *a.d.route_error == 0) *a.d.route_error = 4 * a.layer + bad;
+            if (a.d.route_err_d != nullptr && *a.d.route_err_d == 0) *a.d.route_err_d = 4 * a.layer + bad;
+            *a.d.wait_seq = 0u;
+            if (a.d.cpu_seq != nullptr) *a.d.cpu_seq = 0u;
+            *a.d.cpu_flag = 0;
+            *a.d.pf_n = 0;
+            for (int i = 0; i < k; ++i) {
+                a.d.plan_ptr[i] = a.d.fetch_src[i] = 0ull;
+                a.d.plan_w[i] = 0.0f;
+                a.d.plan_id[i] = -1;
+            }
+            const unsigned int seq = *a.d.seq + 1;
+            *a.d.seq = seq;
+            rq->layer = a.layer;
+            rq->error = bad;
+            rq->win = a.win;
+            rq->win_n = a.win_n;
+            rq->win_rows = a.win_rows;
+            __threadfence_system();
+            rq->seq = seq;
+            __threadfence_system();
+        }
+        return;
+    }
+    // warp 0: the plan, a lane a route entry.  The weights' sum in route order (moe_route_kernel's bits)
+    const float pv = on ? s_pr[lane] : 0.0f;
+    double sum = 0.0;
+    for (int i = 0; i < k; ++i) sum += (double) __shfl_sync(0xffffffffu, pv, i);
+    const float inv = (float) (a.norm_w ? 1.0 / fmax(sum, 6.103515625e-5) : 1.0);
+    const float share = (float) ((double) pv * inv);
+    const float msw = skipped ? 0.0f : a.miss_skip_w;
+    const bool light = msw > 0.0f && share < msw;
+    const unsigned long long tab = on ? s_tab[lane] : 0ull, rtab = on ? s_rtab[lane] : 0ull;
+    const bool ho = on && s_ho[lane] != 0;
+    // the CPU lane's picks: of the route's RAM-tier experts, the coldest to_cpu by the route counts (ties: the later
+    // in route order) - an expert's rank in that order by shuffles
+    unsigned int host_w = 0;
+    if (lane_plan) {
+        const bool ram = on && lane < skip_from && !light && tab == 0ull && rtab != 0ull && !ho;
+        const unsigned int rm = __ballot_sync(0xffffffffu, ram);
+        const int to_cpu = (int) ((a.cpu_plan >> (4 * __popc(rm))) & 15ull);
+        const unsigned int c = ram ? s_cnt[lane] : 0u;
+        int rank = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const unsigned int cj = __shfl_sync(0xffffffffu, c, j);
+            if (((rm >> j) & 1u) && (cj < c || (cj == c && j > lane))) ++rank;
+        }
+        host_w = __ballot_sync(0xffffffffu, ram && rank < to_cpu);
+    }
+    // the entry: resident, left out, to the host, skipped (disk only), or a slot (a spare or its scratch slot)
+    unsigned long long ptr = tab, src = 0ull, cs = 0ull;
+    bool cpu_b = false, skip_b = false, slot = false, elig = false;
+    if (on && tab == 0ull && !(lane >= skip_from || light)) {
+        if (ho) {
+            cpu_b = true;   // a helper resident: the host resolves it in the helper's own cache
+        } else {
+            src = rtab;
+            if (src != 0ull && ((host_w >> lane) & 1u)) {
+                cpu_b = true;
+                cs = src;
+                src = 0ull;
+            } else if (src == 0ull && (lane >= a.disk_skip_from || share < a.disk_skip_w)) {
+                skip_b = true;
+            } else {
+                slot = true;
+                elig = a.promote_min <= 1 || s_rc[lane] >= (unsigned int) a.promote_min;
+            }
+        }
+    }
+    // the spares in route order: the j-th eligible entry takes the j-th free spare of this layer
+    unsigned long long* spares = a.d.tab + 2 * (size_t) a.d.n_keys + (size_t) a.layer * kSpares;
+    const unsigned int em = __ballot_sync(0xffffffffu, slot && elig);
+    unsigned long long sp = 0ull;
+    if (em != 0u && lane < kSpares) sp = spares[lane];
+    const unsigned int fm = __ballot_sync(0xffffffffu, sp != 0ull);
+    const int j = __popc(em & ((1u << lane) - 1u));
+    const bool took = slot && elig && j < __popc(fm);
+    int si = 0;
+    if (took) {
+        unsigned int m = fm;
+        for (int t = 0; t < j; ++t) m &= m - 1u;
+        si = __ffs(m) - 1;
+    }
+    const unsigned long long spv = __shfl_sync(0xffffffffu, sp, si);
+    unsigned long long pp = 0ull;
+    if (took) {
+        ptr = pp = spv;
+        spares[si] = 0ull;
+        a.d.tab[lk + id] = ptr;
+    } else if (slot) {
+        ptr = a.d.scratch[lane];
+    }
+    const unsigned int mask = __ballot_sync(0xffffffffu, slot && src == 0ull);   // only on disk: the host's source
+    const unsigned int fetch = __ballot_sync(0xffffffffu, slot && src != 0ull);
+    const unsigned int promo = __ballot_sync(0xffffffffu, took);
+    const unsigned int cpu = __ballot_sync(0xffffffffu, cpu_b);
+    const unsigned int skip = __ballot_sync(0xffffffffu, skip_b);
+    const float w = (float) ((double) pv * inv * a.w_scale);
+    const unsigned int seq = *a.d.seq + 1;
+    ROUTE_MARK(4);   // the plan
+    if (lane < 8) {
+        if (on) {
+            a.d.plan_ptr[lane] = ptr;
+            a.d.plan_w[lane] = w;
+            a.d.plan_id[lane] = id;
+        }
+        a.d.fetch_src[lane] = on ? src : 0ull;
+    }
+    if (lane == 0) {
+        *a.d.pf_n = 0;
+        *a.d.seq = seq;
+        *a.d.wait_seq = mask ? seq : 0u;
+        if (a.d.cpu_seq != nullptr) *a.d.cpu_seq = cpu ? seq : 0u;
+        *a.d.cpu_flag = 0;
+    }
+    ROUTE_MARK(5);   // the plan out
+    // the request's head in shared memory, then out over PCIe in 8-byte words (the first word, seq and layer, apart)
+    constexpr int kHeadWords = (int) (offsetof(MoeRequest, x) / 8);
+    static_assert(offsetof(MoeRequest, x) % 8 == 0 && offsetof(MoeRequest, layer) == 4, "MoeRequest's head");
+    __shared__ unsigned long long s_rq[kHeadWords];
+    MoeRequest* q = (MoeRequest*) s_rq;
+    if (lane == 0) {
+        q->layer = a.layer;
+        q->error = 0;
+        q->miss_mask = mask;
+        q->fetch_mask = fetch;
+        q->promo_mask = promo;
+        q->cpu_mask = cpu;
+        q->win = a.win;
+        q->win_n = a.win_n;
+        q->win_rows = a.win_rows;
+        q->pad_ = 0;
+        q->skip_mask = skip;
+        q->pf_n = 0;
+        rq->layer = a.layer;
+    }
+    if (lane < 8) {
+        q->ids[lane] = on ? id : 0;
+        q->w[lane] = on ? w : 0.0f;
+        q->promo_ptr[lane] = pp;
+        q->pred[lane] = on ? -1 : 0;
+        q->cpu_src[lane] = cs;
+        q->pf_ids[lane] = 0;
+        q->pf_ptr[lane] = 0ull;
+    }
+    static_assert(kAhead * 8 <= 32, "the lookahead's entries, a lane each");
+    if (lane < kAhead * 8) q->ahead[lane / 8][lane % 8] = (short) -1;
+    if (lane < 16) q->near_ids[lane] = (short) -1;
+    __syncwarp();
+    ROUTE_MARK(6);   // the request's head put together
+    for (int w8 = 1 + lane; w8 < kHeadWords; w8 += 32) ((unsigned long long*) rq)[w8] = s_rq[w8];
+    __threadfence_system();
+    __syncwarp();
+    ROUTE_MARK(7);   // the head out to host memory and fenced
+    if (lane == 0) {
+        __threadfence_system();
+        rq->seq = seq;
+#if defined(__HIPCC__)
         __threadfence_system();
 #endif
     }
@@ -6535,8 +6798,17 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
         a.n_ahead = std::min(n_ahead, kAhead);
         for (int i = 0; i < a.n_ahead; ++i) a.ahead_bias[i] = ahead_bias[i];
     }
+    // STRATA_GLM_ROUTE_ONE=0: moe_route_kernel for every route again (A/B).  The one pass takes the decode's plain route:
+    // rank selection and ROUTE_FAST's order, no prediction, lookahead, near misses or verify window's scratch claims
+    static const bool one_on = [] {
+        const char* v = getenv("STRATA_GLM_ROUTE_ONE");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    a.one = one_on && a.rank_sel && a.fast && pred_logits == nullptr && a.n_ahead == 0 && a.near_n == 0 &&
+            scr_used == nullptr && d.tab != nullptr ? 1 : 0;
     const int blocks = 1 + (n_ff_sh + ROUTE_THREADS - 1) / ROUTE_THREADS;
-    moe_route_kernel<<<blocks, ROUTE_THREADS, 0, s>>>(a);
+    if (a.one) moe_route_one_kernel<<<blocks, ROUTE_THREADS, 0, s>>>(a);
+    else moe_route_kernel<<<blocks, ROUTE_THREADS, 0, s>>>(a);
     launch_check("moe_route");
 }
 
