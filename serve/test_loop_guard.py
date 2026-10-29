@@ -643,8 +643,9 @@ class ToolBlock(unittest.TestCase):
         # a report of what it found may end the turn
         report = "What I found:\n\n" + "\n".join(f"- Finding {i}: the operator claim at step {i} is read-only, so "
                                                   "the bytes are dropped in on_bytes." for i in range(5))
-        svc, eng, kw, calls, text, done = self.answer(report, call_text(other), rounds=(NMCLI,) * 4)
-        self.assertEqual((calls, len(eng.prompts)), ([], 1))
+        svc, eng, kw, calls, text, done = self.answer(report, report.replace("Finding", "Result"),
+                                                      report.replace("Finding", "Fact"), rounds=(NMCLI,) * 4)
+        self.assertEqual((calls, len(eng.prompts)), ([], 1 + LG.KEEP_MIN))   # (after KEEP_MIN pushes on)
         # the same report once more, what it already said: not something new - it goes on
         from serve.frontend import openai_to_messages
         req = agent(*(NMCLI,) * 4)

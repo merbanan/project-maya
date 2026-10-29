@@ -3243,8 +3243,10 @@ class Service:
                             raw_ids.append(t)
                             key = blocked_call() if blocked else None
                             if key is None and keep is not None and not called and \
-                                    loop_guard.stops_short("".join(said), keep[2]):
-                                # it would end the turn with nothing - talk about its loop, a line: keep it going
+                                    (kept < loop_guard.KEEP_MIN or loop_guard.stops_short("".join(said), keep[2])):
+                                # it would end the turn in a conversation that repeats itself: the first KEEP_MIN
+                                # times, and whenever with nothing new (talk about its loop, a line, what it said
+                                # before), it goes on
                                 kept += 1
                                 self._kept_going(kept, "".join(said))
                                 ids_k, thinks, _ = keep

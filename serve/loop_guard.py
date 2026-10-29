@@ -501,6 +501,7 @@ TALK = re.compile(r"(?i)loop.?guard|break(ing)? out|stop (repeating|re-running|t
                   r"change (approach|something real)|identical (output|result|nc|grep|command|call)|"
                   r"(been|keep|kept|am) (looping|stuck|repeating)|repeating myself|in a (reasoning )?loop")
 KEEP_SHORT = 300        # an answer that ends the turn with less text than this (or only TALK) in a looping conversation
+KEEP_MIN = 2            # ... and any answer that ends the turn there, the first this many times in an answer, goes on
 
 
 def talk(text: str) -> bool:
