@@ -482,7 +482,18 @@ class ToolRepeat(unittest.TestCase):
                                          [{"role": "user", "content": LG.tool_note(rep)}]))
         self.assertIsNone(LG.tool_repeat(self.messages(agent(NMCLI, GREP, NMCLI, GREP))))       # twice: not yet
         # the same command after an edit: another result each time - not a loop
-        self.assertIsNone(LG.tool_repeat(self.messages(agent(*[("make test", f"{n} failed") for n in (5, 4, 3, 2)]))))
+        edits = [r for n in (5, 4, 3, 2) for r in (("make test", f"{n} failed"), (f"sed -i {n}s/x/y/ a.c", ""))]
+        self.assertIsNone(LG.tool_repeat(self.messages(agent(*edits[:-1]))))
+        # in a row with nothing in between, a result that differs only in numbers or garbled bytes is the same one
+        # (GLM-5.3's telnet test: "bytes received: 12 \ufffd\ufffd" then "15 \ufffd\ufffd\ufffd" ...) - not a wait
+        probe = [("python3 probe.py", f"bytes received: {n} REPLY: " + "\ufffd" * n) for n in (12, 15, 12, 15)]
+        self.assertEqual(LG.tool_repeat(self.messages(agent(*probe))), LG.ToolRepeat("bash", 4))
+        self.assertIsNone(LG.tool_repeat(self.messages(agent(*[("sleep 30; tail -1 train.log", f"step {n}00/900")
+                                                               for n in range(1, 6)]))))
+        # the user's "continue" says nothing new: the count goes on
+        req = agent(NMCLI, NMCLI)
+        req["messages"] += [{"role": "user", "content": "Continue."}] + agent(NMCLI)["messages"][1:]
+        self.assertEqual(LG.tool_repeat(self.messages(req)), LG.ToolRepeat("bash", 3))
         # the user spoke since: only the calls after their message count
         req = agent(NMCLI, NMCLI, NMCLI)
         req["messages"] += [{"role": "user", "content": "stop repeating and try a different approach"}]
@@ -538,9 +549,9 @@ class ToolBlock(unittest.TestCase):
     differently" - and the same grep, ten more times): that call is blocked - it never reaches the client, the server
     answers it in the prompt and the model goes on in the same answer."""
 
-    def answer(self, *scripts, rounds=(NMCLI,) * 5):
+    def answer(self, *scripts, rounds=(NMCLI,) * 5, engine=None):
         from serve.frontend import openai_to_messages
-        eng = ScriptEngine(Tok(), *scripts)
+        eng = engine or ScriptEngine(Tok(), *scripts)
         svc = Server().service(eng)
         msgs, tools, kw = openai_to_messages(agent(*rounds))
         ids, thinking, max_new = svc.prepare(msgs, tools, kw, 2000)
@@ -583,12 +594,40 @@ class ToolBlock(unittest.TestCase):
         self.assertEqual((done["finish"], svc.metrics()["loop_guard"]["tool_blocked"]), ("stop", 1))
         self.assertIn("maya:loop_guard_tool_blocked_total 1", svc.prometheus())
 
-    def test_again_and_again_ends_the_answer(self):
-        svc, eng, kw, calls, text, done = self.answer(call_text(NMCLI[0]))
-        self.assertEqual(calls, [])
-        self.assertEqual(len(eng.prompts), LG.BLOCK_TRIES + 1)
-        self.assertIn("loop guard stopped here", text)                  # back to the user
-        self.assertEqual(done["finish"], "stop")
+    def test_again_and_again_it_is_steered_never_stopped(self):
+        other = "cat host/bellhost/bridge.py"
+        eng = ScriptEngine(Tok(), *[call_text(NMCLI[0])] * 3, call_text(other))
+        eng.temps = []
+        gen = eng.generate
+        eng.generate = lambda ids, n, smp, *a, **k: eng.temps.append((smp or {}).get("temperature")) or gen(ids, n, smp,
+                                                                                                         *a, **k)
+        svc, eng2, kw, calls, text, done = self.answer(engine=eng)
+        self.assertEqual(calls, [other])                                # it went on until it did something else
+        self.assertNotIn("stopped", text)
+        self.assertEqual(len(eng.prompts), 4)
+        rep, args = LG.ToolRepeat("bash", 5), LG.args_key({"command": NMCLI[0]})
+        for k in (1, 2, 3):                                             # each time its thinking starts elsewhere
+            said = svc.tok.decode(eng.prompts[k][len(eng.prompts[k - 1]):])
+            self.assertTrue(said.endswith(LG.block_steer(rep, args, k)), said[-200:])
+        self.assertEqual(len({LG.block_steer(rep, args, k) for k in (1, 2, 3)}), 3)
+        self.assertEqual(eng.temps[:2], [None, None])                  # the request's own, then hotter from the 2nd
+        self.assertGreater(eng.temps[3], eng.temps[2])
+        self.assertLessEqual(max(t for t in eng.temps if t), LG.BLOCK_HEAT_MAX)
+        self.assertEqual(svc.metrics()["loop_guard"]["tool_blocked"], 3)
+
+    def test_a_continue_hears_what_is_blocked(self):
+        from serve.frontend import openai_to_messages
+        svc = Server().service(ScriptEngine(Tok(), "x"))
+        seen, render = [], svc.render_ids
+        svc.render_ids = lambda messages, *a, **k: seen.append(messages) or render(messages, *a, **k)
+        req = agent(*(NMCLI,) * 5)
+        req["messages"].append({"role": "user", "content": "continue"})
+        msgs, tools, kw = openai_to_messages(req)
+        svc.prepare(msgs, tools, kw, 100)
+        self.assertTrue(kw["_blocked"])                                 # still blocked after "continue" ...
+        self.assertEqual(seen[-1][-2:], [msgs[-1], {"role": "user", "content": LG.blocked_note(
+            LG.tool_blocked(msgs))}])                                   # ... and the model is told so first
+        self.assertIn(NMCLI[0], seen[-1][-1]["content"])
 
     def test_what_is_not_blocked(self):
         # four runs: notes only, the call goes out
@@ -625,11 +664,22 @@ class Collapse(unittest.TestCase):
         self.assertIsNone(LG.collapse(self.turns(2)))                  # twice: no loop yet, the prompt as it is
         msgs = self.turns(4, new=lambda i: f" Found: claim {i} is read-only." if i == 2 else "")
         c = LG.collapse(msgs)
-        self.assertEqual(len(c.messages), 1 + 2 + 2)                   # the 1st round, and the 3rd (it said something new)
-        self.assertEqual(c.messages[1]["reasoning_content"], msgs[1]["reasoning_content"])   # the first time: whole
-        self.assertEqual(c.messages[3]["reasoning_content"], "Found: claim 2 is read-only.")   # then only what is new
-        self.assertEqual((c.paragraphs, c.rounds), (9, 2))
+        self.assertEqual(len(c.messages), 1 + 2)                       # the 1st round, whole; the rest repeats it -
+        self.assertEqual(c.messages[1]["reasoning_content"], msgs[1]["reasoning_content"])   # its thinking with it
+        self.assertEqual((c.paragraphs, c.rounds), (9, 3))
+        msgs[5]["content"] = "The claim is read-only, so nc's bytes are dropped."   # text for the user stays
+        self.assertEqual(LG.collapse(msgs).messages[3], {"role": "assistant", "content": msgs[5]["content"]})
         self.assertEqual(msgs[3]["reasoning_content"], self.STUCK)      # the request's own messages stay as sent
+
+    def test_a_check_run_again_in_a_row(self):
+        msgs = [{"role": "user", "content": "x"}]
+        for i, n in enumerate((12, 15, 12, 15)):
+            msgs += [{"role": "assistant", "content": "", "reasoning_content": f"Try {i}.", "tool_calls": [
+                         {"id": f"c{i}", "type": "function", "function": {"name": "bash",
+                                                                          "arguments": {"command": "probe"}}}]},
+                     {"role": "tool", "tool_call_id": f"c{i}", "content": f"bytes received: {n}"}]
+        c = LG.collapse(msgs)
+        self.assertEqual(len(c.messages), 3)                           # the first; the rest differ only in numbers
 
     def test_the_next_request_starts_the_same(self):
         msgs = self.turns(8, new=lambda i: f" Step {i}." if i % 3 == 0 else "")

@@ -2523,6 +2523,9 @@ class Service:
         blocked = loop_guard.tool_blocked(messages) if on else {}
         if on:
             noted = self._tool_repeat(messages)
+            if blocked and len(noted) == len(messages) and messages and messages[-1].get("role") == "user" \
+                    and loop_guard.go_on(messages[-1]):     # "continue": which calls stay blocked, said at once
+                noted = messages + [{"role": "user", "content": loop_guard.blocked_note(blocked)}]
             messages = self._collapse(messages) + noted[len(messages):]
         given, force = kwargs, kwargs.get("_force_tool")
         kwargs = {k: v for k, v in kwargs.items() if k != "_force_tool"}
@@ -2790,9 +2793,10 @@ class Service:
         return own if isinstance(own, bool) else bool(self.loop_guard)
 
     def _block_suffixes(self, blocked, tools, kwargs):
-        """{(name, args): (ToolRepeat, ids)}: for each blocked call (loop_guard.tool_blocked) the prompt that follows
-        the model's own `</tool_call>` when the server answers it itself - the template's call close, the tool result
-        loop_guard.block_result, a user message loop_guard.block_note and the next assistant turn's opening.  None for
+        """{(name, args): (ToolRepeat, ids, thinks)}: for each blocked call (loop_guard.tool_blocked) the prompt that
+        follows the model's own `</tool_call>` when the server answers it itself - the template's call close, the tool
+        result loop_guard.block_result, a user message loop_guard.block_note and the next assistant turn's opening
+        (`thinks`: that opening is an open thinking block, which run() starts with loop_guard.block_steer).  None for
         a template that does not end a call with </tool_call> or does not render a turn as a prefix of the next."""
         out = {}
         for key, rep in blocked.items():
@@ -2811,7 +2815,8 @@ class Service:
                 f += "</think>"                     # (as render_ids)
             if not f.startswith(p) or CALL_END not in p:
                 return None
-            out[key] = (rep, self.tok.encode(p[p.rindex(CALL_END) + len(CALL_END):] + f[len(p):], parse_special=True))
+            out[key] = (rep, self.tok.encode(p[p.rindex(CALL_END) + len(CALL_END):] + f[len(p):], parse_special=True),
+                        f.rstrip().endswith("<think>"))
         return out
 
     def _collapse(self, messages):
@@ -2828,9 +2833,9 @@ class Service:
         return c.messages
 
     def _tool_blocked(self, rep, tries):
-        stop = tries > loop_guard.BLOCK_TRIES
         print(f"[maya] loop guard: `{rep.name}` again after {loop_guard.TOOL_NUDGES} notes ({rep.times} runs, the same "
-              f"result): blocked, {'the answer ends there' if stop else 'not run, a note and on'}", flush=True)
+              f"result): blocked ({tries}. time in this answer), not run - a note, the thinking steered away and on",
+              flush=True)
         with self.status_lock:
             self.loop_guard_counts["tool_blocked"] += 1
 
@@ -3011,7 +3016,8 @@ class Service:
         parser = new_parser()
         # calls the loop guard blocks in this answer (prepare, _block_suffixes): {(name, args): (ToolRepeat, ids)}.
         # While there are any, the answer's calls are held back (`pending`) until it ends; one that ends it alone
-        # with a blocked call never goes out - the server answers it in the prompt and the model goes on
+        # with a blocked call never goes out - the server answers it in the prompt and the model goes on, as often as
+        # it takes (only max_tokens ends it, as any answer)
         blocked = (sampling or {}).get("_blocked") or {}
         pending, tries, sent_call = [], {}, False
         seg = {"prompt": ids, "ids": [], "next": None}   # this engine call's prompt and tokens; the next one's
@@ -3156,15 +3162,16 @@ class Service:
                             key = blocked_call() if blocked else None
                             if key is None:
                                 break
-                            rep, suffix = blocked[key]
+                            rep, suffix, thinks = blocked[key]
                             pending.clear()             # the call never goes out
                             tries[key] = tries.get(key, 0) + 1
                             self._tool_blocked(rep, tries[key])
-                            if tries[key] > loop_guard.BLOCK_TRIES:     # again and again: back to the user
-                                yield "event", Event("content", loop_guard.block_stop(rep))
-                                break
-                            # the server answers it: the call's result and a note in the prompt, the model goes on
-                            seg["next"] = list(seg["prompt"]) + seg["ids"] + suffix
+                            # the server answers it: the call's result and a note in the prompt, and the model's next
+                            # thinking starts a step away from it (never the end: it goes on until it does something
+                            # else; from the 2nd time a little hotter)
+                            steer = self.tok.encode(loop_guard.block_steer(rep, key[1], tries[key])) if thinks else []
+                            seg["next"] = list(seg["prompt"]) + seg["ids"] + suffix + steer
+                            sampling = loop_guard.block_sampling(sampling, tries[key])
                             parser, detok, held = new_parser(), Detokenizer(self.tok), ""
                             in_think = bool(thinking) and self.think_end_id is not None and self.think_budget > 0
                             continue
