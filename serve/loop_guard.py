@@ -201,6 +201,9 @@ class LoopGuard:
 # ------------------------------------------------------------------------------------------------ across turns
 TOOL_WINDOW = 12        # the last this many tool calls since the user's last message ...
 TOOL_REPS = 3           # ... hold the last one (name, arguments and result the same) this many times: a loop
+TOOL_NUDGES = 3         # notes (tool_note) before the server stops running it: then the call itself is blocked
+TOOL_BLOCK = TOOL_REPS + TOOL_NUDGES - 1   # (made this many times: TOOL_NUDGES notes went by, unheeded)
+BLOCK_TRIES = 2         # blocked attempts in one answer the model gets a block note for; the one after ends it
 
 
 class ToolRepeat(NamedTuple):
@@ -213,6 +216,32 @@ def _same(v) -> str:
     return json.dumps(v, sort_keys=True, ensure_ascii=False, default=str)
 
 
+def args_key(v) -> str:
+    """A call's arguments in one form: a client's JSON string and the parser's dict compare equal."""
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except ValueError:
+            pass
+    return _same(v)
+
+
+def _tool_calls(messages: list[dict]) -> list[tuple]:
+    """(name, arguments, result) of each tool call since the user's last message, in order."""
+    calls, pending = [], []
+    for m in messages:
+        role = m.get("role")
+        if role == "user":                      # the user spoke: what came before is not this loop
+            calls, pending = [], []
+        elif role == "assistant":
+            pending = [((c.get("function") or c).get("name"), args_key((c.get("function") or c).get("arguments")))
+                       for c in m.get("tool_calls") or []]
+        elif role == "tool" and pending:        # results answer the calls in their order
+            name, args = pending.pop(0)
+            calls.append((name, args, _same(m.get("content"))))
+    return calls
+
+
 def tool_repeat(messages: list[dict]) -> ToolRepeat | None:
     """The template messages (frontend.openai_to_messages / anthropic_to_messages) of a request that ends with tool
     results: is the last call one the model made TOOL_REPS times among its last TOOL_WINDOW since the user's last
@@ -220,26 +249,57 @@ def tool_repeat(messages: list[dict]) -> ToolRepeat | None:
     another result, a poll that finally changes another one too: neither counts."""
     if not messages or messages[-1].get("role") != "tool":
         return None
-    calls, pending = [], []
-    for m in messages:
-        role = m.get("role")
-        if role == "user":                      # the user spoke: what came before is not this loop
-            calls, pending = [], []
-        elif role == "assistant":
-            pending = [((c.get("function") or c).get("name"), _same((c.get("function") or c).get("arguments")))
-                       for c in m.get("tool_calls") or []]
-        elif role == "tool" and pending:        # results answer the calls in their order
-            name, args = pending.pop(0)
-            calls.append((name, args, _same(m.get("content"))))
+    calls = _tool_calls(messages)
     if not calls:
         return None
     times = calls[-TOOL_WINDOW:].count(calls[-1])
     return ToolRepeat(str(calls[-1][0]), times) if times >= TOOL_REPS else None
 
 
+def tool_blocked(messages: list[dict]) -> dict[tuple[str, str], ToolRepeat]:
+    """The calls this request's answer may not make again, by (name, args_key(arguments)): each made TOOL_BLOCK times
+    among the last TOOL_WINDOW since the user's last message with the same arguments and result - the notes after
+    TOOL_REPS of them did not stop it.  The model may still run anything else, these too with other arguments."""
+    window = _tool_calls(messages)[-TOOL_WINDOW:]
+    return {(str(c[0]), c[1]): ToolRepeat(str(c[0]), window.count(c)) for c in set(window)
+            if window.count(c) >= TOOL_BLOCK}
+
+
+def block_result(rep: ToolRepeat) -> str:
+    """The tool result the server writes for a blocked call (the client never sees the call)."""
+    return (f"[Not run. The server's loop guard blocked this call: `{rep.name}` already ran {rep.times} times since "
+            "the user's last message with these same arguments, and gave the same result every time.]")
+
+
+def block_note(rep: ToolRepeat) -> str:
+    """The message after a blocked call's result: firmer than tool_note, since that one went unheeded."""
+    return (f"[The server's loop guard, not the user: you have been told {TOOL_NUDGES} times that `{rep.name}` with "
+            "these arguments gives nothing new, and it is now blocked: it will not run again in this answer. Do not "
+            "write it again. Change something real - other arguments, another command or tool, another part of the "
+            "problem - or stop and tell the user what you found and what is blocking you.]")
+
+
+def block_stop(rep: ToolRepeat) -> str:
+    """The answer's last words when the model wrote a blocked call again and again in one answer: back to the user."""
+    return (f"\n\n[The server's loop guard stopped here: the model kept running `{rep.name}` with the same arguments "
+            f"after it was blocked ({rep.times} runs, all with the same result). Tell it what to do next.]")
+
+
+NOTES = (    # tool_note's wording, one after another: the same words each time are easy to read past
+    "[The server's loop guard, not the user: `{name}` has now run {times} times since the user's last message with "
+    "these same arguments and given this same result. Running it again will not show anything new. Do not repeat it: "
+    "use what you already have, try a different approach, or answer the user.]",
+    "[Loop guard (the server, not the user): that was `{name}` again - {times} runs, identical arguments, identical "
+    "output. The output is not going to change. Pick something else: a different command, a different file, a test "
+    "that can actually fail, or write up what you know for the user.]",
+    "[Server loop guard, last warning: `{name}` with these arguments has given the same result {times} times. One more "
+    "identical call will be blocked and not run. Stop checking this; act on what it already told you, or explain to "
+    "the user where you are stuck.]",
+)
+
+
 def tool_note(rep: ToolRepeat) -> str:
     """The message after the repeated call's result: plain words, as a user would write them, said to be the
-    server's."""
-    return (f"[The server's loop guard, not the user: `{rep.name}` has now run {rep.times} times since the user's last "
-            "message with these same arguments and given this same result. Running it again will not show anything "
-            "new. Do not repeat it: use what you already have, try a different approach, or answer the user.]")
+    server's - worded differently each time (NOTES, by how many runs; the last says a block comes next)."""
+    k = min(max(rep.times - TOOL_REPS, 0), len(NOTES) - 1)
+    return NOTES[k].format(name=rep.name, times=rep.times)

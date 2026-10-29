@@ -330,7 +330,11 @@ model (GLM, DeepSeek, MiniMax) - beside the GLM engine's own check for short pat
   same) is the 3rd of its kind among the last 12 calls since the user's last message, a short message follows that
   result, marked as the server's: the call gave nothing new, so use what is there, try a different approach or answer.
   Only that prompt changes; the model goes on. A command run again after an edit gives another result, so it does not
-  count.
+  count. The note is worded differently at the 3rd, 4th and 5th run; the last one says a block comes next. A call
+  made again after those three notes is **blocked**: it never reaches the client, the server answers it in the prompt
+  ("not run") with a firmer note and the model goes on in the same answer. If it writes the blocked call twice more in
+  that answer, the answer ends there with a line for the user instead. Blocks count in `/metrics`
+  `loop_guard.tool_blocked` and `maya:loop_guard_tool_blocked_total`.
 
 The server window gets a line for each loop broken (`[maya] loop guard: a 19-token block 5 times in the answer at
 token 1,763: repeats dropped, a short repetition penalty`); the dashboard's Monitor marks that request (Loop guard,

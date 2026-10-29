@@ -349,7 +349,7 @@ class Server(unittest.TestCase):
         self.assertLess(done["completion_tokens"], 200)
         self.assertEqual(len(eng.calls), 2)
         self.assertEqual(svc.loop_guard_counts, {"detected": 2, "penalised": 1, "thinking_closed": 0, "stopped": 1,
-                                                 "tool_repeats": 0})
+                                                 "tool_repeats": 0, "tool_blocked": 0})
 
     def test_a_second_loop_in_the_thinking_closes_it(self):
         tok = Tok()
@@ -510,6 +510,98 @@ class ToolRepeat(unittest.TestCase):
         svc.prepare(self.messages(agent(NMCLI, GREP)), tools, dict(kw), 100)
         self.assertEqual(seen[-1][-1], {"role": "tool", "content": GREP[1]})
         self.assertEqual(svc.metrics()["loop_guard"]["tool_repeats"], 1)
+
+
+def call_text(cmd):
+    return f"<tool_call>\n<function=bash>\n<parameter=command>\n{cmd}\n</parameter>\n</function>\n</tool_call>"
+
+
+class ScriptEngine:
+    """Answer k of a request (its k-th engine call) is an empty thinking and scripts[k] (the last one again after
+    that), then the end.  Records every call's prompt."""
+
+    def __init__(self, tok, *scripts):
+        self.tok, self.max_context, self.made = tok, 1 << 20, 0
+        self.end = tok.encode(IM_END, parse_special=True)
+        self.scripts = [tok.encode("</think>\n\n" + s, parse_special=True) for s in scripts]   # (thinking: on)
+        self.prompts: list[list[int]] = []
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        for t in (self.scripts[min(len(self.prompts), len(self.scripts)) - 1] + self.end)[:max_new]:
+            self.made += 1
+            yield t
+
+
+class ToolBlock(unittest.TestCase):
+    """After TOOL_NUDGES notes the model wrote the same call again (GLM-5.3: "the loop guard is right, act
+    differently" - and the same grep, ten more times): that call is blocked - it never reaches the client, the server
+    answers it in the prompt and the model goes on in the same answer."""
+
+    def answer(self, *scripts, rounds=(NMCLI,) * 5):
+        from serve.frontend import openai_to_messages
+        eng = ScriptEngine(Tok(), *scripts)
+        svc = Server().service(eng)
+        msgs, tools, kw = openai_to_messages(agent(*rounds))
+        ids, thinking, max_new = svc.prepare(msgs, tools, kw, 2000)
+        events, done = [], None
+        for kind, x in svc.run(ids, thinking, tools, max_new, {"_blocked": kw.get("_blocked")}, threading.Event()):
+            if kind == "event":
+                events.append(x)
+            elif kind == "done":
+                done = x
+        calls = [e.call.arguments["command"] for e in events if e.kind == "tool_call"]
+        text = "".join(e.text for e in events if e.kind == "content")
+        return svc, eng, kw, calls, text, done
+
+    def test_notes_differ_and_when_it_blocks(self):
+        notes = [LG.tool_note(LG.ToolRepeat("bash", t)) for t in range(LG.TOOL_REPS, LG.TOOL_BLOCK + 1)]
+        self.assertEqual(len(notes), LG.TOOL_NUDGES)
+        self.assertEqual(len(set(notes)), LG.TOOL_NUDGES)               # worded differently each time
+        self.assertIn("blocked", notes[-1])                             # the last one says what comes next
+        msgs = ToolRepeat().messages
+        self.assertEqual(LG.tool_blocked(msgs(agent(NMCLI, GREP, NMCLI, GREP, NMCLI, GREP, NMCLI))), {})   # 4: notes
+        got = LG.tool_blocked(msgs(agent(NMCLI, GREP, NMCLI, GREP, NMCLI, GREP, NMCLI, GREP, NMCLI)))
+        self.assertEqual(list(got.values()), [LG.ToolRepeat("bash", 5)])   # NMCLI 5 times; GREP 4: not yet
+        self.assertEqual(list(got), [("bash", LG.args_key({"command": NMCLI[0]}))])
+        req = agent(*(NMCLI,) * 5)
+        req["messages"].append({"role": "user", "content": "try the band"})
+        self.assertEqual(LG.tool_blocked(msgs(req)), {})                 # the user spoke: free again
+
+    def test_blocked_then_moves_on(self):
+        other = "nmcli -f 802-11-wireless-security.key-mgmt connection show Smulnet"
+        svc, eng, kw, calls, text, done = self.answer(call_text(NMCLI[0]), "Checking the key management.\n" +
+                                                      call_text(other))
+        self.assertEqual(calls, [other])                                # the blocked one never went out
+        self.assertEqual(len(eng.prompts), 2)
+        first, second = eng.prompts
+        said = svc.tok.decode(second[len(first):])
+        self.assertTrue(said.startswith("</think>\n\n" + call_text(NMCLI[0])))   # what the model wrote, kept ...
+        self.assertIn(LG.block_result(LG.ToolRepeat("bash", 5)), said)  # ... the server's answer to it ...
+        self.assertIn(LG.block_note(LG.ToolRepeat("bash", 5)), said)    # ... and the note
+        self.assertTrue(second[:len(first)] == first)                   # (the conversation's cache goes on)
+        self.assertEqual((done["finish"], svc.metrics()["loop_guard"]["tool_blocked"]), ("stop", 1))
+        self.assertIn("maya:loop_guard_tool_blocked_total 1", svc.prometheus())
+
+    def test_again_and_again_ends_the_answer(self):
+        svc, eng, kw, calls, text, done = self.answer(call_text(NMCLI[0]))
+        self.assertEqual(calls, [])
+        self.assertEqual(len(eng.prompts), LG.BLOCK_TRIES + 1)
+        self.assertIn("loop guard stopped here", text)                  # back to the user
+        self.assertEqual(done["finish"], "stop")
+
+    def test_what_is_not_blocked(self):
+        # four runs: notes only, the call goes out
+        self.assertEqual(self.answer(call_text(NMCLI[0]), rounds=(NMCLI,) * 4)[3], [NMCLI[0]])
+        # other arguments, and a blocked call next to another one in the same answer
+        self.assertEqual(self.answer(call_text("nmcli dev wifi"))[3], ["nmcli dev wifi"])
+        self.assertEqual(self.answer(call_text("ls") + "\n" + call_text(NMCLI[0]))[3], ["ls", NMCLI[0]])
+        # the request's "loop_guard": false: nothing blocked
+        from serve.frontend import openai_to_messages
+        svc = Server().service(ScriptEngine(Tok(), "x"))
+        msgs, tools, kw = openai_to_messages(agent(*(NMCLI,) * 5))
+        svc.prepare(msgs, tools, kw, 100, guard=False)
+        self.assertIsNone(kw["_blocked"])
 
 
 class GuardedUsage(unittest.TestCase):
