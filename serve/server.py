@@ -54,7 +54,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, models, savings  # noqa: E402
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
-from serve.frontend import (CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
+from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
                             EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, deepseek_effort_kwargs, deepseek_images,
                             effort_kwargs,
                             effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
@@ -1742,7 +1742,8 @@ class Service:
         # the loop guard (serve/loop_guard.py; MAYA_LOOP_GUARD=0 / "loop_guard": false: off) and what it did since
         # the server started: loops seen, and how each was broken (the Monitor's totals, /metrics, Prometheus)
         self.loop_guard = True
-        self.loop_guard_counts = {"detected": 0, "penalised": 0, "thinking_closed": 0, "stopped": 0, "tool_repeats": 0}
+        self.loop_guard_counts = {"detected": 0, "penalised": 0, "thinking_closed": 0, "stopped": 0, "tool_repeats": 0,
+                                  "tool_blocked": 0}
         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
@@ -2442,6 +2443,8 @@ class Service:
              guard["stopped"]),
             ("maya:loop_guard_tool_repeats_total", "counter",
              "Tool calls made again and again with the same result that got a note after them", guard["tool_repeats"]),
+            ("maya:loop_guard_tool_blocked_total", "counter",
+             "Tool calls the loop guard did not let out (made again after its notes)", guard["tool_blocked"]),
         ]
         rows += [(f"maya:engine_{k}", "counter" if k in self.PROM_STAT_COUNTERS else "gauge", h, stat[k])
                  for k, h in self.PROM_STAT.items()
@@ -2511,8 +2514,11 @@ class Service:
         the rest of the context.  A tool_choice that requires a call ("_force_tool": "" any, else the tool's name)
         starts the answer with the call's opening, thinking off; that text goes back in kwargs["_prefill"] for run().
         With the loop guard (`guard`, else the server's) a tool call the model keeps making with the same result gets
-        a note after that result (_tool_repeat)."""
-        if self.loop_guard if guard is None else guard:
+        a note after that result (_tool_repeat); one it made again after TOOL_NUDGES such notes is blocked in this
+        answer (kwargs["_blocked"] for run(), _block_suffixes)."""
+        on = self.loop_guard if guard is None else guard
+        blocked = loop_guard.tool_blocked(messages) if on else {}
+        if on:
             messages = self._tool_repeat(messages)
         given, force = kwargs, kwargs.get("_force_tool")
         kwargs = {k: v for k, v in kwargs.items() if k != "_force_tool"}
@@ -2532,6 +2538,7 @@ class Service:
             else:
                 prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
         given["_prefill"] = prefill
+        given["_blocked"] = self._block_suffixes(blocked, tools, kwargs) if blocked and force is None else None
         ids = self.render_ids(messages, tools, kwargs, prefill)
         self.embeddings.path = None
         media = media_of(messages)
@@ -2778,6 +2785,38 @@ class Service:
         own = (sampling or {}).get("loop_guard")
         return own if isinstance(own, bool) else bool(self.loop_guard)
 
+    def _block_suffixes(self, blocked, tools, kwargs):
+        """{(name, args): (ToolRepeat, ids)}: for each blocked call (loop_guard.tool_blocked) the prompt that follows
+        the model's own `</tool_call>` when the server answers it itself - the template's call close, the tool result
+        loop_guard.block_result, a user message loop_guard.block_note and the next assistant turn's opening.  None for
+        a template that does not end a call with </tool_call> or does not render a turn as a prefix of the next."""
+        out = {}
+        for key, rep in blocked.items():
+            call = {"id": "call_loop_guard", "type": "function",
+                    "function": {"name": key[0], "arguments": json.loads(key[1])}}
+            head = [{"role": "user", "content": "."}, {"role": "assistant", "content": "", "tool_calls": [call]}]
+            tail = [{"role": "tool", "tool_call_id": "call_loop_guard", "content": loop_guard.block_result(rep)},
+                    {"role": "user", "content": loop_guard.block_note(rep)}]
+            try:
+                p = self.template.render(head, tools=tools, **{**kwargs, "add_generation_prompt": False})
+                f = self.template.render(head + tail, tools=tools, **kwargs)
+            except Exception as e:                  # (a template that wants more than this: notes only)
+                print(f"[maya] loop guard: cannot block `{rep.name}` with this template ({e})", flush=True)
+                return None
+            if kwargs.get("enable_thinking") is False and f.endswith("<think>"):
+                f += "</think>"                     # (as render_ids)
+            if not f.startswith(p) or CALL_END not in p:
+                return None
+            out[key] = (rep, self.tok.encode(p[p.rindex(CALL_END) + len(CALL_END):] + f[len(p):], parse_special=True))
+        return out
+
+    def _tool_blocked(self, rep, tries):
+        stop = tries > loop_guard.BLOCK_TRIES
+        print(f"[maya] loop guard: `{rep.name}` again after {loop_guard.TOOL_NUDGES} notes ({rep.times} runs, the same "
+              f"result): blocked, {'the answer ends there' if stop else 'not run, a note and on'}", flush=True)
+        with self.status_lock:
+            self.loop_guard_counts["tool_blocked"] += 1
+
     def _tool_repeat(self, messages):
         """The loop guard across turns (loop_guard.tool_repeat): the request's last tool call, made again and again
         with the same arguments and the same result - a user message with loop_guard.tool_note() follows its result
@@ -2947,10 +2986,18 @@ class Service:
             sampling = {**defaults, **req_values}
         responses = (sampling or {}).get("_responses") is True
         single_tool = responses and (sampling or {}).get("parallel_tool_calls") is False
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True,
-                              dsml=getattr(self.template, "deepseek", False),
-                              minimax=getattr(self.template, "minimax", False),
-                              strict_tools=responses, single_tool=single_tool)
+        def new_parser():
+            return OutputParser(thinking=thinking, tools=tools, stream_tools=True,
+                                dsml=getattr(self.template, "deepseek", False),
+                                minimax=getattr(self.template, "minimax", False),
+                                strict_tools=responses, single_tool=single_tool)
+        parser = new_parser()
+        # calls the loop guard blocks in this answer (prepare, _block_suffixes): {(name, args): (ToolRepeat, ids)}.
+        # While there are any, the answer's calls are held back (`pending`) until it ends; one that ends it alone
+        # with a blocked call never goes out - the server answers it in the prompt and the model goes on
+        blocked = (sampling or {}).get("_blocked") or {}
+        pending, tries, sent_call = [], {}, False
+        seg = {"prompt": ids, "ids": [], "next": None}   # this engine call's prompt and tokens; the next one's
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
         pre_events = parser.feed(prefill) if prefill else []
         detok, n, finish = Detokenizer(self.tok), 0, "length"
@@ -3018,7 +3065,7 @@ class Service:
                 if in_think:
                     sampling = {**(sampling or {}), "_think_budget": think_budget, "_think_end": self.think_end_id}
 
-                def attempts():
+                def attempts(prompt, left):
                     """The engine's tokens.  When its numbers went non-finite (a NaN or an infinity in a route: the
                     engine's ERR says "non-finite") before the first token, the engine has dropped that conversation's
                     state and the request runs once more, its prompt read from token 0."""
@@ -3026,7 +3073,7 @@ class Service:
                         guard = loop_guard.LoopGuard(self.think_end_id, parser.state == "reasoning") \
                             if guard_on else None       # (serve/loop_guard.py; a fresh one for a run again)
                         guards[:] = [guard] if guard is not None else []
-                        sliced, got = self._sliced(ids, max_new, sampling, cancel, emb, hold, stat, guard), 0
+                        sliced, got = self._sliced(prompt, left, sampling, cancel, emb, hold, stat, guard), 0
                         try:
                             for t in sliced:
                                 got += t is not None
@@ -3039,8 +3086,32 @@ class Service:
                                   "running the request again from token 0", flush=True)
                         finally:
                             sliced.close()
+                def segments():
+                    """attempts(), and after a blocked call (seg["next"]) the engine again on that prompt."""
+                    while True:
+                        yield from attempts(seg["prompt"], max(1, max_new - n))
+                        if seg["next"] is None or cancel.is_set() or self.stopping:
+                            return
+                        seg["prompt"], seg["next"], seg["ids"] = seg["next"], None, []
+
+                def flush():
+                    nonlocal sent_call
+                    for ev in pending:
+                        sent_call = sent_call or ev.kind == "tool_call"
+                        yield "event", ev
+                    pending.clear()
+
+                def blocked_call():
+                    """The key of the blocked call that alone ends what this engine call wrote, else None."""
+                    calls = [ev for ev in pending if ev.kind == "tool_call"]
+                    if sent_call or len(calls) != 1 or not calls[0].complete or \
+                            any(ev.kind == "content" and ev.text.strip() for ev in pending):
+                        return None
+                    key = (calls[0].call.name, loop_guard.args_key(calls[0].call.arguments))
+                    return key if key in blocked else None
+
                 guard_on = self._loop_guard_on(sampling)
-                gen = attempts()
+                gen = segments()
                 for ev in pre_events:                   # a required call's opening (prepare put it in the prompt)
                     yield "event", ev
                 try:
@@ -3065,7 +3136,22 @@ class Service:
                         if t in self.stop_ids:
                             finish = "stop"
                             raw_ids.append(t)
-                            break
+                            key = blocked_call() if blocked else None
+                            if key is None:
+                                break
+                            rep, suffix = blocked[key]
+                            pending.clear()             # the call never goes out
+                            tries[key] = tries.get(key, 0) + 1
+                            self._tool_blocked(rep, tries[key])
+                            if tries[key] > loop_guard.BLOCK_TRIES:     # again and again: back to the user
+                                yield "event", Event("content", loop_guard.block_stop(rep))
+                                break
+                            # the server answers it: the call's result and a note in the prompt, the model goes on
+                            seg["next"] = list(seg["prompt"]) + seg["ids"] + suffix
+                            parser, detok, held = new_parser(), Detokenizer(self.tok), ""
+                            in_think = bool(thinking) and self.think_end_id is not None and self.think_budget > 0
+                            continue
+                        seg["ids"].append(t)
                         if parser.state == "reasoning":
                             reasoning_tokens += 1
                         raw_ids.append(t)
@@ -3086,13 +3172,17 @@ class Service:
                         self._note(n, evs, stat)
                         last_print = self._progress(last_print)
                         for ev in evs:
-                            yield "event", ev
+                            if blocked and (pending or ev.kind.startswith("tool")):
+                                pending.append(ev)      # (a call: held back until the answer ends)
+                            else:
+                                yield "event", ev
                             if single_tool and ev.kind == "tool_call" and ev.complete:
                                 stopped = True
                                 break
                         if stopped:
                             finish = "stop"
                             break
+                    yield from flush()
                     if held:                    # the run ended on what only looked like a marker's start
                         for ev in parser.feed(held):
                             yield "event", ev
@@ -3113,6 +3203,7 @@ class Service:
                         finish = "length"
                         print(f"[maya] the engine's numbers went non-finite after {n} tokens ({e}): the answer ends "
                               "there", flush=True)
+                        yield from flush()
                         if held:
                             for ev in parser.feed(held):
                                 yield "event", ev
@@ -3330,9 +3421,10 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                                         for c in calls]})
         messages += [{"role": "tool", "tool_call_id": c.id, "content": r} for c, r in zip(calls, results)]
         # a required tool call applies to the first answer only: after the tools ran, the model answers freely
-        kw = {k: v for k, v in kw.items() if k not in ("_force_tool", "_prefill")}
+        kw = {k: v for k, v in kw.items() if k not in ("_force_tool", "_prefill", "_blocked")}
         sampling = {k: v for k, v in (sampling or {}).items() if k != "_prefill"}
         ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, guard=svc._loop_guard_on(sampling))
+        sampling["_blocked"] = kw.get("_blocked")
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
@@ -4374,6 +4466,7 @@ def make_handler(svc: Service):
                                                      guard=svc._loop_guard_on(sampling))
                 if kw.get("_prefill"):
                     sampling["_prefill"] = kw["_prefill"]
+                sampling["_blocked"] = kw.get("_blocked")
                 effective = {**svc.sampling_defaults, **svc.shared, **sampling}
                 config = {**req, **{k: effective[k] for k in ("temperature", "top_p") if k in effective}}
                 run = svc.run(ids, thinking, tools, max_new, sampling, cancel)
@@ -4407,6 +4500,7 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(req))
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
+            req = {**req, "_blocked": kw.get("_blocked")}      # calls the loop guard blocks (Service.prepare)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             if not (req.get("stream") and req.get("strata_resume") is True):   # (the web app's runs on, by design)
@@ -4500,6 +4594,7 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(req))
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
+            req = {**req, "_blocked": kw.get("_blocked")}      # calls the loop guard blocks (Service.prepare)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             watch_client(self, cancel)
