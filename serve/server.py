@@ -2526,6 +2526,7 @@ class Service:
         on = self.loop_guard if guard is None else guard
         blocked = loop_guard.tool_blocked(messages) if on else {}
         looping = bool(blocked) or bool(on and loop_guard.echoes(messages))
+        asked = messages                            # (the request's own, before the prompt leaves anything out)
         if on:
             noted = self._tool_repeat(messages)
             if blocked and len(noted) == len(messages) and messages and messages[-1].get("role") == "user" \
@@ -2553,8 +2554,8 @@ class Service:
         given["_blocked"] = self._block_suffixes(blocked, tools, kwargs) if blocked and force is None else None
         if looping and tools and force is None:
             keep = self._keep_suffix(tools, kwargs)
-            if keep is not None:
-                given["_blocked"] = {**(given["_blocked"] or {}), "_keep": keep}
+            if keep is not None:                     # (+ what the model said before: stops_short's `seen`)
+                given["_blocked"] = {**(given["_blocked"] or {}), "_keep": keep + (loop_guard.said_before(asked),)}
         ids = self.render_ids(messages, tools, kwargs, prefill)
         self.embeddings.path = None
         media = media_of(messages)
@@ -3053,7 +3054,7 @@ class Service:
         # with a blocked call never goes out - the server answers it in the prompt and the model goes on, as often as
         # it takes (only max_tokens ends it, as any answer)
         blocked = dict((sampling or {}).get("_blocked") or {})
-        keep = blocked.pop("_keep", None)           # (ids, thinks): the answer may not end the turn short
+        keep = blocked.pop("_keep", None)           # (ids, thinks, seen): the answer may not end the turn short
         said = []                                   # this engine call's text for the user (stops_short)
         kept = 0                                    # times it was kept going in this answer
         called = False                              # it wrote a tool call (then its turn does not end here)
@@ -3199,11 +3200,11 @@ class Service:
                             raw_ids.append(t)
                             key = blocked_call() if blocked else None
                             if key is None and keep is not None and not called and \
-                                    loop_guard.stops_short("".join(said)):
+                                    loop_guard.stops_short("".join(said), keep[2]):
                                 # it would end the turn with nothing - talk about its loop, a line: keep it going
                                 kept += 1
                                 self._kept_going(kept, "".join(said))
-                                ids_k, thinks = keep
+                                ids_k, thinks, _ = keep
                                 steer = self.tok.encode(loop_guard.keep_steer(kept)) if thinks else []
                                 seg["next"] = list(seg["prompt"]) + seg["ids"] + ids_k + steer
                                 sampling = loop_guard.block_sampling(sampling, kept)

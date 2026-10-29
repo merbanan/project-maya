@@ -645,6 +645,19 @@ class ToolBlock(unittest.TestCase):
                                                   "the bytes are dropped in on_bytes." for i in range(5))
         svc, eng, kw, calls, text, done = self.answer(report, call_text(other), rounds=(NMCLI,) * 4)
         self.assertEqual((calls, len(eng.prompts)), ([], 1))
+        # the same report once more, what it already said: not something new - it goes on
+        from serve.frontend import openai_to_messages
+        req = agent(*(NMCLI,) * 4)
+        req["messages"].insert(1, {"role": "assistant", "content": report})
+        req["messages"].insert(2, {"role": "user", "content": "continue"})
+        eng = ScriptEngine(Tok(), report, call_text(other))
+        svc = Server().service(eng)
+        msgs, tools, kw = openai_to_messages(req)
+        ids, thinking, max_new = svc.prepare(msgs, tools, kw, 2000)
+        got = [x.call.arguments["command"] for k, x in svc.run(ids, thinking, tools, max_new,
+                                                              {"_blocked": kw.get("_blocked")}, threading.Event())
+               if k == "event" and x.kind == "tool_call"]
+        self.assertEqual(got, [other])
         # a conversation that does not repeat itself: a short answer ends the turn as always
         svc, eng, kw, calls, text, done = self.answer("Done.", call_text(other), rounds=(NMCLI, GREP))
         self.assertEqual((calls, len(eng.prompts), text), ([], 1, "Done."))
