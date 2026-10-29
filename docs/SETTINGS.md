@@ -335,6 +335,13 @@ model (GLM, DeepSeek, MiniMax) - beside the GLM engine's own check for short pat
   ("not run") with a firmer note and the model goes on in the same answer. If it writes the blocked call twice more in
   that answer, the answer ends there with a line for the user instead. Blocks count in `/metrics`
   `loop_guard.tool_blocked` and `maya:loop_guard_tool_blocked_total`.
+- **A conversation that repeats itself:** once one piece of the model's own text turns up in 3 of its messages (or
+  one call with the same result has run 3 times), the prompt leaves out what the model already wrote: a sentence of
+  its reasoning or a paragraph of its answer text that it wrote before, and a tool round whose calls and results all
+  repeat earlier ones with nothing new said. The model then reads what it found once, not dozens of copies of the
+  same thoughts to go on from (GLM-5.3 had one sentence 543 times in an 88K prompt). Only the prompt changes, and each
+  message depends only on the ones before it, so the next request's prompt starts the same and the cache holds.
+  Counted in `loop_guard.collapsed` and `maya:loop_guard_collapsed_total`.
 
 The server window gets a line for each loop broken (`[maya] loop guard: a 19-token block 5 times in the answer at
 token 1,763: repeats dropped, a short repetition penalty`); the dashboard's Monitor marks that request (Loop guard,

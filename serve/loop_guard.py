@@ -34,6 +34,8 @@ it on for that request when the server has it off).
 from __future__ import annotations
 
 import json
+import re
+from collections import Counter
 from typing import NamedTuple
 
 P_MIN = 8               # the shortest block: shorter loops (one token, "0, 0, 0") repeat a multiple of it in 8..15
@@ -303,3 +305,99 @@ def tool_note(rep: ToolRepeat) -> str:
     server's - worded differently each time (NOTES, by how many runs; the last says a block comes next)."""
     k = min(max(rep.times - TOOL_REPS, 0), len(NOTES) - 1)
     return NOTES[k].format(name=rep.name, times=rep.times)
+
+
+# ------------------------------------------------------------------------------------------------ what it already wrote
+ECHO_TURNS = 3          # a paragraph in this many of the model's messages (or a call + result made this many times) ...
+ECHO_MIN = {"reasoning_content": 6, "content": 12}   # ... (pieces this long or longer: in the answer's text
+#                         shorter ones - "}", "Done." - are left alone; in the reasoning only "OK." and the like) ...
+#                         the conversation carries a loop: the prompt leaves out what the model already wrote (collapse)
+
+
+class Collapse(NamedTuple):
+    """collapse()'s prompt and what it left out of it."""
+    messages: list[dict]
+    paragraphs: int     # sentences of its reasoning and paragraphs of its text the model had already written
+    rounds: int         # tool rounds whose calls and results all repeat earlier ones
+
+
+def _units(text, field: str) -> list[tuple[str, str]]:
+    """(piece, the separator after it): the reasoning by sentence and line (prose; GLM-5.3 also runs its sentences
+    together, "Hmm - hmm.Now let me ..."), the answer's text by paragraph (it may hold code)."""
+    if not isinstance(text, str):
+        return []
+    sep = r"(\n+|(?<=[.!?])\s*(?=[A-Z*`\[(]))" if field == "reasoning_content" else r"(\n[ \t]*\n)"
+    parts = re.split(sep, text)
+    return [(parts[k], parts[k + 1] if k + 1 < len(parts) else "") for k in range(0, len(parts), 2)]
+
+
+def _key(paragraph: str) -> str:
+    return " ".join(paragraph.split())
+
+
+def _round_keys(messages: list[dict], i: int) -> tuple[list[tuple], int]:
+    """The (name, arguments, result) of messages[i]'s calls and the index after its results."""
+    calls = [((c.get("function") or c).get("name"), args_key((c.get("function") or c).get("arguments")))
+             for c in messages[i].get("tool_calls") or []]
+    j, keys = i + 1, []
+    while j < len(messages) and messages[j].get("role") == "tool" and len(keys) < len(calls):
+        keys.append(calls[len(keys)] + (_same(messages[j].get("content")),))
+        j += 1
+    return keys, j
+
+
+def echoes(messages: list[dict]) -> bool:
+    """Does the conversation carry a loop across turns: one paragraph in ECHO_TURNS of the model's messages, or one
+    call made ECHO_TURNS times with the same arguments and result?  (It only grows as the conversation does: once
+    true it stays true, so the prompt collapse() makes stays the same prefix from one request to the next.)"""
+    para, calls = Counter(), Counter()
+    for i, m in enumerate(messages):
+        if m.get("role") != "assistant":
+            continue
+        para.update({_key(p) for f in ("reasoning_content", "content") for p, _ in _units(m.get(f), f)
+                     if len(_key(p)) >= ECHO_MIN[f]})
+        calls.update(_round_keys(messages, i)[0])
+    return any(n >= ECHO_TURNS for n in para.values()) or any(n >= ECHO_TURNS for n in calls.values())
+
+
+def collapse(messages: list[dict]) -> Collapse | None:
+    """The prompt of a conversation that carries a loop (echoes()) without what the model already wrote: a paragraph
+    of its reasoning or text that it wrote before (an earlier message, or earlier in the same one) is left out, and
+    a round whose calls and results all repeat earlier ones, with nothing new said, goes with its results.  What the
+    model sees is then what it found, once - not dozens of copies of the same thoughts to go on from (GLM-5.3 had
+    "Hmm - hold on: I realize something important." 543 times in an 88K prompt, 89% of its own text repeats).  Each
+    message depends only on the ones before it, so the next request's prompt starts the same.  None: no loop, or
+    nothing to leave out."""
+    if not echoes(messages):
+        return None
+    out, seen, made, paras, rounds, i = [], set(), set(), 0, 0, 0
+    while i < len(messages):
+        m = messages[i]
+        if m.get("role") != "assistant":
+            out.append(m)
+            i += 1
+            continue
+        m = dict(m)
+        for f in ("reasoning_content", "content"):
+            if not isinstance(m.get(f), str):
+                continue
+            kept = []
+            for p, sep in _units(m[f], f):
+                k = _key(p)
+                if len(k) >= ECHO_MIN[f] and k in seen:
+                    paras += 1
+                    continue
+                seen.add(k)
+                kept.append(p + sep)
+            m[f] = "".join(kept).strip()
+        keys, j = _round_keys(messages, i)
+        said = (m.get("content") or "").strip() or (m.get("reasoning_content") or "").strip()
+        if keys and len(keys) == len(m.get("tool_calls") or []) and all(k in made for k in keys) and not said:
+            rounds += 1
+            i = j                                   # the round and its results
+            continue
+        made.update(keys)
+        if said or m.get("tool_calls"):
+            out.append(m)
+        i += 1
+    return Collapse(out, paras, rounds) if paras or rounds else None

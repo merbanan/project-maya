@@ -349,7 +349,7 @@ class Server(unittest.TestCase):
         self.assertLess(done["completion_tokens"], 200)
         self.assertEqual(len(eng.calls), 2)
         self.assertEqual(svc.loop_guard_counts, {"detected": 2, "penalised": 1, "thinking_closed": 0, "stopped": 1,
-                                                 "tool_repeats": 0, "tool_blocked": 0})
+                                                 "tool_repeats": 0, "tool_blocked": 0, "collapsed": 0})
 
     def test_a_second_loop_in_the_thinking_closes_it(self):
         tok = Tok()
@@ -500,8 +500,8 @@ class ToolRepeat(unittest.TestCase):
         req = agent(NMCLI, GREP, NMCLI, GREP, NMCLI)
         msgs, tools, kw = __import__("serve.frontend", fromlist=["x"]).openai_to_messages(req)
         svc.prepare(msgs, tools, dict(kw), 100)
-        self.assertEqual(seen[-1][-2:], [msgs[-1], {"role": "user", "content": LG.tool_note(LG.ToolRepeat("bash", 3))}])
-        self.assertEqual(len(seen[-1]), len(msgs) + 1)
+        self.assertEqual(seen[-1][-1], {"role": "user", "content": LG.tool_note(LG.ToolRepeat("bash", 3))})
+        self.assertEqual(seen[-1][:-1], LG.collapse(msgs).messages)     # (the repeated rounds: left out, below)
         self.assertEqual(msgs[-1]["content"], NMCLI[1])                 # the request's own messages stay as sent
         self.assertEqual(svc.metrics()["loop_guard"]["tool_repeats"], 1)
         self.assertIn("maya:loop_guard_tool_repeats_total 1", svc.prometheus())
@@ -602,6 +602,56 @@ class ToolBlock(unittest.TestCase):
         msgs, tools, kw = openai_to_messages(agent(*(NMCLI,) * 5))
         svc.prepare(msgs, tools, kw, 100, guard=False)
         self.assertIsNone(kw["_blocked"])
+
+
+class Collapse(unittest.TestCase):
+    """A conversation that repeats itself: the prompt leaves out what the model already wrote (GLM-5.3 had "Hmm -
+    hold on: I realize something important." 543 times in an 88K prompt and went on writing it)."""
+
+    STUCK = ("Hmm \u2014 hold on: I realize something important. Hmm \u2014 hmm.\n\n"
+             "OK let me stop theorizing and go empirical: check the slot log.")
+
+    def turns(self, n, new=lambda i: ""):
+        """The user's question, then n rounds of the same thinking and the same grep (round i's own thinking new(i))."""
+        msgs = [{"role": "user", "content": "why do nc bytes never reach the device?"}]
+        for i in range(n):
+            msgs += [{"role": "assistant", "content": "", "reasoning_content": self.STUCK + new(i),
+                      "tool_calls": [{"id": f"c{i}", "type": "function", "function": {
+                          "name": "bash", "arguments": {"command": NMCLI[0]}}}]},
+                     {"role": "tool", "tool_call_id": f"c{i}", "content": NMCLI[1]}]
+        return msgs
+
+    def test_what_is_left_out(self):
+        self.assertIsNone(LG.collapse(self.turns(2)))                  # twice: no loop yet, the prompt as it is
+        msgs = self.turns(4, new=lambda i: f" Found: claim {i} is read-only." if i == 2 else "")
+        c = LG.collapse(msgs)
+        self.assertEqual(len(c.messages), 1 + 2 + 2)                   # the 1st round, and the 3rd (it said something new)
+        self.assertEqual(c.messages[1]["reasoning_content"], msgs[1]["reasoning_content"])   # the first time: whole
+        self.assertEqual(c.messages[3]["reasoning_content"], "Found: claim 2 is read-only.")   # then only what is new
+        self.assertEqual((c.paragraphs, c.rounds), (9, 2))
+        self.assertEqual(msgs[3]["reasoning_content"], self.STUCK)      # the request's own messages stay as sent
+
+    def test_the_next_request_starts_the_same(self):
+        msgs = self.turns(8, new=lambda i: f" Step {i}." if i % 3 == 0 else "")
+        whole = LG.collapse(msgs).messages
+        for cut in range(3, len(msgs) + 1, 2):                         # (every request ends with a tool result)
+            part = LG.collapse(msgs[:cut])
+            if part is not None:
+                self.assertEqual(part.messages, whole[:len(part.messages)])
+
+    def test_the_answer_text_by_paragraph_and_short_ones_stay(self):
+        code = "```\n}\n```"
+        msgs = [{"role": "user", "content": "x"}] + [{"role": "assistant", "content": f"Done.\n\n{code}\n\nThe fix "
+                                                      "is in uplink.cpp, line 13."} for _ in range(3)]
+        c = LG.collapse(msgs)
+        self.assertEqual([m["content"] for m in c.messages[2:]], [f"Done.\n\n{code}"] * 2)
+
+    def test_a_conversation_without_a_loop_is_untouched(self):
+        msgs = [{"role": "user", "content": "x"}]
+        for i in range(6):
+            msgs += [{"role": "assistant", "content": f"Step {i}: reading part {i}.", "reasoning_content": f"Part {i}."},
+                     {"role": "user", "content": f"ok {i}"}]
+        self.assertIsNone(LG.collapse(msgs))
 
 
 class GuardedUsage(unittest.TestCase):
