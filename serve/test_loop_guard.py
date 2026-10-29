@@ -349,7 +349,7 @@ class Server(unittest.TestCase):
         self.assertLess(done["completion_tokens"], 200)
         self.assertEqual(len(eng.calls), 2)
         self.assertEqual(svc.loop_guard_counts, {"detected": 2, "penalised": 1, "thinking_closed": 0, "stopped": 1,
-                                                 "tool_repeats": 0, "tool_blocked": 0, "collapsed": 0})
+                                                 "tool_repeats": 0, "tool_blocked": 0, "collapsed": 0, "kept_going": 0})
 
     def test_a_second_loop_in_the_thinking_closes_it(self):
         tok = Tok()
@@ -629,6 +629,26 @@ class ToolBlock(unittest.TestCase):
             LG.tool_blocked(msgs))}])                                   # ... and the model is told so first
         self.assertIn(NMCLI[0], seen[-1][-1]["content"])
 
+    def test_it_does_not_end_its_turn_with_nothing(self):
+        # GLM-5.3 ended its turn with "OK - the loop guard is right. ... Break out: use what I have or answer the
+        # user." and the agent stopped: in a conversation that repeats itself, that answer goes on
+        other = "grep -n on_bytes host/bellhost/bridge.py"
+        talk = "OK \u2014 the loop guard is right. Stop repeating identical greps. Break out: use what I have."
+        svc, eng, kw, calls, text, done = self.answer(talk, call_text(other), rounds=(NMCLI,) * 4)
+        self.assertEqual(calls, [other])
+        said = svc.tok.decode(eng.prompts[1][len(eng.prompts[0]):])
+        self.assertIn(LG.KEEP_NOTE, said)
+        self.assertTrue(said.endswith(LG.keep_steer(1)))
+        self.assertEqual(svc.metrics()["loop_guard"]["kept_going"], 1)
+        # a report of what it found may end the turn
+        report = "What I found:\n\n" + "\n".join(f"- Finding {i}: the operator claim at step {i} is read-only, so "
+                                                  "the bytes are dropped in on_bytes." for i in range(5))
+        svc, eng, kw, calls, text, done = self.answer(report, call_text(other), rounds=(NMCLI,) * 4)
+        self.assertEqual((calls, len(eng.prompts)), ([], 1))
+        # a conversation that does not repeat itself: a short answer ends the turn as always
+        svc, eng, kw, calls, text, done = self.answer("Done.", call_text(other), rounds=(NMCLI, GREP))
+        self.assertEqual((calls, len(eng.prompts), text), ([], 1, "Done."))
+
     def test_what_is_not_blocked(self):
         # four runs: notes only, the call goes out
         self.assertEqual(self.answer(call_text(NMCLI[0]), rounds=(NMCLI,) * 4)[3], [NMCLI[0]])
@@ -665,8 +685,9 @@ class Collapse(unittest.TestCase):
         msgs = self.turns(4, new=lambda i: f" Found: claim {i} is read-only." if i == 2 else "")
         c = LG.collapse(msgs)
         self.assertEqual(len(c.messages), 1 + 2)                       # the 1st round, whole; the rest repeats it -
-        self.assertEqual(c.messages[1]["reasoning_content"], msgs[1]["reasoning_content"])   # its thinking with it
-        self.assertEqual((c.paragraphs, c.rounds), (9, 3))
+        self.assertEqual(c.messages[1]["reasoning_content"],          # its thinking with it, less the talk about
+                         "Hmm \u2014 hold on: I realize something important. Hmm \u2014 hmm.")   # the loop
+        self.assertEqual(c.rounds, 3)
         msgs[5]["content"] = "The claim is read-only, so nc's bytes are dropped."   # text for the user stays
         self.assertEqual(LG.collapse(msgs).messages[3], {"role": "assistant", "content": msgs[5]["content"]})
         self.assertEqual(msgs[3]["reasoning_content"], self.STUCK)      # the request's own messages stay as sent

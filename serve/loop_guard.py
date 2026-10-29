@@ -312,8 +312,8 @@ def blocked_note(blocked: dict) -> str:
     """The message after a user's "continue" when calls are blocked: which ones, before the model writes them."""
     names = "; ".join(f"`{k[0]}` {_short(k[1])} ({v.times} runs, the same result)" for k, v in blocked.items())
     return (f"[The server's loop guard, not the user: these calls are blocked and will not run, they keep giving the "
-            f"same result: {names}. Continue with something else - another command, another part of the problem - "
-            "or tell the user what you found and what is blocking you.]")
+            f"same result: {names}. Keep working on the task with something else - another command, another file, "
+            "another part of the problem.]")
 
 
 def _short(args: str, n: int = 120) -> str:
@@ -330,8 +330,8 @@ def block_note(rep: ToolRepeat) -> str:
     """The message after a blocked call's result: firmer than tool_note, since that one went unheeded."""
     return (f"[The server's loop guard, not the user: you have been told {TOOL_NUDGES} times that `{rep.name}` with "
             "these arguments gives nothing new, and it is now blocked: it will not run again in this answer. Do not "
-            "write it again. Change something real - other arguments, another command or tool, another part of the "
-            "problem - or stop and tell the user what you found and what is blocking you.]")
+            "write it again. Keep working on the task, but change something real - other arguments, another command or "
+            "tool, another file, another part of the problem.]")
 
 
 STEERS = (   # the start of the model's own thinking after a blocked call (block_steer), one after another
@@ -365,13 +365,13 @@ def block_sampling(sampling: dict | None, tries: int) -> dict:
 NOTES = (    # tool_note's wording, one after another: the same words each time are easy to read past
     "[The server's loop guard, not the user: `{name}` has now run {times} times since the user's last message with "
     "these same arguments and given this same result. Running it again will not show anything new. Do not repeat it: "
-    "use what you already have, try a different approach, or answer the user.]",
+    "use what you already have and keep working on the task with a different step.]",
     "[Loop guard (the server, not the user): that was `{name}` again - {times} runs, identical arguments, identical "
     "output. The output is not going to change. Pick something else: a different command, a different file, a test "
-    "that can actually fail, or write up what you know for the user.]",
+    "that can actually fail, a part of the code you have not read yet.]",
     "[Server loop guard, last warning: `{name}` with these arguments has given the same result {times} times. One more "
-    "identical call will be blocked and not run. Stop checking this; act on what it already told you, or explain to "
-    "the user where you are stuck.]",
+    "identical call will be blocked and not run. Stop checking this; act on what it already told you and keep "
+    "working on the task.]",
 )
 
 
@@ -401,8 +401,12 @@ def _units(text, field: str) -> list[tuple[str, str]]:
     together, "Hmm - hmm.Now let me ..."), the answer's text by paragraph (it may hold code)."""
     if not isinstance(text, str):
         return []
-    sep = r"(\n+|(?<=[.!?])\s*(?=[A-Z*`\[(]))" if field == "reasoning_content" else r"(\n[ \t]*\n)"
-    parts = re.split(sep, text)
+    if field != "reasoning_content":            # the answer's text: code blocks whole, the prose as the reasoning
+        out = []
+        for k, piece in enumerate(re.split(r"(```.*?(?:```|$))", text, flags=re.S)):
+            out += [(piece, "")] if k % 2 else _units(piece, "reasoning_content")
+        return [u for u in out if u[0] or u[1]]
+    parts = re.split(r"(\n+|(?<=[.!?])\s*(?=[A-Z*`\[(]))", text)
     return [(parts[k], parts[k + 1] if k + 1 < len(parts) else "") for k in range(0, len(parts), 2)]
 
 
@@ -466,7 +470,7 @@ def collapse(messages: list[dict]) -> Collapse | None:
             kept = []
             for p, sep in _units(m[f], f):
                 k = _key(p)
-                if len(k) >= ECHO_MIN[f] and k in seen:
+                if len(k) >= ECHO_MIN[f] and (k in seen or talk(k)):   # (and its talk about the loop: no work)
                     paras += 1
                     continue
                 seen.add(k)
@@ -490,3 +494,38 @@ def collapse(messages: list[dict]) -> Collapse | None:
             out.append(m)
         i += 1
     return Collapse(out, paras, rounds) if paras or rounds else None
+
+
+# ------------------------------------------------------------------------------------------------ keep going
+TALK = re.compile(r"(?i)loop.?guard|break(ing)? out|stop (repeating|re-running|theorizing)|act differently|"
+                  r"change (approach|something real)|identical (output|result|nc|grep|command|call)")
+KEEP_SHORT = 300        # an answer that ends the turn with less text than this (or only TALK) in a looping conversation
+
+
+def talk(text: str) -> bool:
+    """The model's own words about its loop ("OK - the loop guard is right. Break out ...") - no work in them."""
+    return bool(TALK.search(text))
+
+
+def stops_short(text: str) -> bool:
+    """Does an answer that ends the turn (no tool call) in a conversation that repeats itself end it with nothing:
+    talk about its loop, or a line or two?  GLM-5.3 ended its turn with "OK - the loop guard is right. Stop
+    repeating identical greps. Break out: use what I have or answer the user." - and the agent stopped.  A report
+    of what it found is longer and may end the turn."""
+    kept = [u for u, _ in _units(text, "reasoning_content") if u.strip() and not talk(u)]
+    return len(" ".join(kept).strip()) < KEEP_SHORT
+
+
+KEEP_NOTE = ("[The server's loop guard, not the user: do not stop here, the task is not done. Keep working on it: "
+             "take the next concrete step - a command, a file to read or change, a test - one you have not run yet.]")
+KEEP_STEERS = (
+    "The task is not done, so I keep going. The next concrete step I have not taken yet:",
+    "Still not done. Something concrete I can do right now that I have not done:",
+    "I keep working. Concretely, I will now",
+)
+
+
+def keep_steer(tries: int) -> str:
+    """The first words of the model's thinking after it tried to end its turn short (stops_short), worded
+    differently each time."""
+    return KEEP_STEERS[min(tries, len(KEEP_STEERS)) - 1] + " "

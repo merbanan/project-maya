@@ -474,6 +474,7 @@ function totalsLine(t, lg = {}) {
   // (and across turns: a tool call made again and again with the same result, a note after it)
   const tools = [lg.tool_repeats ? `${fmt(lg.tool_repeats)} repeated tool call${lg.tool_repeats === 1 ? "" : "s"} noted` : "",
                  lg.tool_blocked ? `${fmt(lg.tool_blocked)} blocked` : "",
+                 lg.kept_going ? `${fmt(lg.kept_going)} kept going` : "",
                  lg.collapsed ? `${fmt(lg.collapsed)} prompt${lg.collapsed === 1 ? "" : "s"} without the repeats` : ""]
     .filter(Boolean).join(", ");
   const loops = lg.detected ? ` · loop guard: ${fmt(lg.detected)} loop${lg.detected === 1 ? "" : "s"} seen${did.length ? ` (${did.join(", ")})` : ""}${tools ? `, ${tools}` : ""}`
