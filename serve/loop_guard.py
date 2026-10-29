@@ -205,7 +205,8 @@ TOOL_WINDOW = 12        # the last this many tool calls since the user's last me
 TOOL_REPS = 3           # ... hold the last one (name, arguments and result the same) this many times: a loop
 TOOL_NUDGES = 3         # notes (tool_note) before the server stops running it: then the call itself is blocked
 TOOL_BLOCK = TOOL_REPS + TOOL_NUDGES - 1   # (made this many times: TOOL_NUDGES notes went by, unheeded)
-BLOCK_TRIES = 2         # blocked attempts in one answer the model gets a block note for; the one after ends it
+BLOCK_HEAT = 0.15       # each blocked attempt in one answer after the first: the temperature this much higher ...
+BLOCK_HEAT_MAX = 1.5    # ... up to this (off its track: the same call again and again is the model's surest path)
 
 
 class ToolRepeat(NamedTuple):
@@ -228,43 +229,95 @@ def args_key(v) -> str:
     return _same(v)
 
 
+GO_ON = re.compile(r"(?i)\s*(please\s+)?(continue|proceed|go on|go ahead|keep going|carry on|resume|next|ok(ay)?|"
+                   r"yes|y|sure|do it)\s*[.!]*\s*")
+
+
+def go_on(m: dict) -> bool:
+    """A user message that only says to go on ("continue", "proceed", "ok"): it says nothing new, so it does not
+    start the count over (a user's "continue" set GLM-5.3 off on the same loop again, twice)."""
+    c = m.get("content")
+    text = c if isinstance(c, str) else " ".join(p.get("text", "") for p in c or [] if isinstance(p, dict))
+    return bool(GO_ON.fullmatch(text))
+
+
+def _gist(result: str) -> str:
+    """A result without its numbers, white space and anything outside printable ASCII: "bytes received: 12 ..."
+    and "bytes received: 15 ..." the same."""
+    return re.sub(r"\d+|[^\x21-\x7e]+", "", result)
+
+
 def _tool_calls(messages: list[dict]) -> list[tuple]:
-    """(name, arguments, result) of each tool call since the user's last message, in order."""
+    """(name, arguments, result, gist) of each tool call since the user's last message (one that says more than
+    "continue"), in order."""
     calls, pending = [], []
     for m in messages:
         role = m.get("role")
-        if role == "user":                      # the user spoke: what came before is not this loop
+        if role == "user" and not go_on(m):    # the user spoke: what came before is not this loop
             calls, pending = [], []
         elif role == "assistant":
             pending = [((c.get("function") or c).get("name"), args_key((c.get("function") or c).get("arguments")))
                        for c in m.get("tool_calls") or []]
         elif role == "tool" and pending:        # results answer the calls in their order
             name, args = pending.pop(0)
-            calls.append((name, args, _same(m.get("content"))))
+            result = _same(m.get("content"))
+            calls.append((name, args, result, _gist(result)))
     return calls
+
+
+def _times(window: list[tuple], c: tuple) -> int:
+    """How often call c counts as made among `window`: with the same result - or, the calls just before it in a row
+    (nothing else in between), with a result that differs only in numbers or garbled bytes (a check run again and
+    again with no change in between; a command run again after an edit has that edit in between, a poll that
+    waits - `sleep` - for a job's progress is not counted that way)."""
+    exact = sum(1 for x in window if x[:3] == c[:3])
+    if "sleep" in c[1]:                         # a wait for something to change: only the same result counts
+        return exact
+    run = 0
+    for x in reversed(window[:len(window) - window[::-1].index(c)]):
+        if x[:2] != c[:2] or x[3] != c[3]:
+            break
+        run += 1
+    return max(exact, run)
 
 
 def tool_repeat(messages: list[dict]) -> ToolRepeat | None:
     """The template messages (frontend.openai_to_messages / anthropic_to_messages) of a request that ends with tool
     results: is the last call one the model made TOOL_REPS times among its last TOOL_WINDOW since the user's last
-    message, with the same arguments, and got the same result each time?  A command run again after an edit gives
-    another result, a poll that finally changes another one too: neither counts."""
+    message, with the same arguments, and got the same result each time (_times)?  A command run again after an edit
+    gives another result, a poll that finally changes another one too: neither counts."""
     if not messages or messages[-1].get("role") != "tool":
         return None
     calls = _tool_calls(messages)
     if not calls:
         return None
-    times = calls[-TOOL_WINDOW:].count(calls[-1])
+    times = _times(calls[-TOOL_WINDOW:], calls[-1])
     return ToolRepeat(str(calls[-1][0]), times) if times >= TOOL_REPS else None
 
 
 def tool_blocked(messages: list[dict]) -> dict[tuple[str, str], ToolRepeat]:
     """The calls this request's answer may not make again, by (name, args_key(arguments)): each made TOOL_BLOCK times
-    among the last TOOL_WINDOW since the user's last message with the same arguments and result - the notes after
-    TOOL_REPS of them did not stop it.  The model may still run anything else, these too with other arguments."""
+    among the last TOOL_WINDOW since the user's last message with the same arguments and result (_times) - the notes
+    after TOOL_REPS of them did not stop it.  The model may still run anything else, these too with other arguments."""
     window = _tool_calls(messages)[-TOOL_WINDOW:]
-    return {(str(c[0]), c[1]): ToolRepeat(str(c[0]), window.count(c)) for c in set(window)
-            if window.count(c) >= TOOL_BLOCK}
+    out = {}
+    for c in window:
+        t = _times(window, c)
+        if t >= TOOL_BLOCK and t > out.get(c[:2], ToolRepeat("", 0)).times:
+            out[c[:2]] = ToolRepeat(str(c[0]), t)
+    return {(str(k[0]), k[1]): v for k, v in out.items()}
+
+
+def blocked_note(blocked: dict) -> str:
+    """The message after a user's "continue" when calls are blocked: which ones, before the model writes them."""
+    names = "; ".join(f"`{k[0]}` {_short(k[1])} ({v.times} runs, the same result)" for k, v in blocked.items())
+    return (f"[The server's loop guard, not the user: these calls are blocked and will not run, they keep giving the "
+            f"same result: {names}. Continue with something else - another command, another part of the problem - "
+            "or tell the user what you found and what is blocking you.]")
+
+
+def _short(args: str, n: int = 120) -> str:
+    return args if len(args) <= n else args[:n] + "...}"
 
 
 def block_result(rep: ToolRepeat) -> str:
@@ -281,10 +334,32 @@ def block_note(rep: ToolRepeat) -> str:
             "problem - or stop and tell the user what you found and what is blocking you.]")
 
 
-def block_stop(rep: ToolRepeat) -> str:
-    """The answer's last words when the model wrote a blocked call again and again in one answer: back to the user."""
-    return (f"\n\n[The server's loop guard stopped here: the model kept running `{rep.name}` with the same arguments "
-            f"after it was blocked ({rep.times} runs, all with the same result). Tell it what to do next.]")
+STEERS = (   # the start of the model's own thinking after a blocked call (block_steer), one after another
+    "The server blocked `{name}` {args}: it already ran {times} times with the same result, so running it again "
+    "cannot show anything new. I will not write that call again. A different next step:",
+    "Blocked again - that exact call will never run, however I write it. I have to change what I do, not repeat it. "
+    "Something I have not tried yet:",
+    "That call is blocked for good. Concretely, instead of it I will now",
+    "Not that call. Looking at the problem from another side, the next thing to check is",
+)
+
+
+def block_steer(rep: ToolRepeat, args: str, tries: int) -> str:
+    """The first words of the model's thinking after its `tries`-th blocked attempt in this answer: written for it in
+    the prompt (the client never sees them), so it goes on from a step away from the call, not back to it - worded
+    differently each time.  The model is never stopped: it goes on until it does something else."""
+    return STEERS[min(tries, len(STEERS)) - 1].format(name=rep.name, times=rep.times, args=_short(args, 160)) + " "
+
+
+def block_sampling(sampling: dict | None, tries: int) -> dict:
+    """The sampling after the `tries`-th blocked attempt in one answer: from the 2nd on, a little hotter each time
+    (BLOCK_HEAT, at most BLOCK_HEAT_MAX), so the next attempt can leave the track that leads to the same call."""
+    smp = dict(sampling or {})
+    if tries >= 2:
+        t = smp.get("temperature")
+        t = float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) else 1.0
+        smp["temperature"] = min(BLOCK_HEAT_MAX, max(t, 1.0) + BLOCK_HEAT * (tries - 1))
+    return smp
 
 
 NOTES = (    # tool_note's wording, one after another: the same words each time are easy to read past
@@ -348,29 +423,36 @@ def _round_keys(messages: list[dict], i: int) -> tuple[list[tuple], int]:
 
 def echoes(messages: list[dict]) -> bool:
     """Does the conversation carry a loop across turns: one paragraph in ECHO_TURNS of the model's messages, or one
-    call made ECHO_TURNS times with the same arguments and result?  (It only grows as the conversation does: once
+    call made ECHO_TURNS times with the same arguments and result (or in a row, but for numbers and garbled bytes)?  (It only grows as the conversation does: once
     true it stays true, so the prompt collapse() makes stays the same prefix from one request to the next.)"""
-    para, calls = Counter(), Counter()
+    para, calls, prev, run, longest = Counter(), Counter(), None, 0, 0
     for i, m in enumerate(messages):
         if m.get("role") != "assistant":
             continue
         para.update({_key(p) for f in ("reasoning_content", "content") for p, _ in _units(m.get(f), f)
                      if len(_key(p)) >= ECHO_MIN[f]})
-        calls.update(_round_keys(messages, i)[0])
-    return any(n >= ECHO_TURNS for n in para.values()) or any(n >= ECHO_TURNS for n in calls.values())
+        keys = _round_keys(messages, i)[0]
+        calls.update(keys)
+        if keys:                                # (in a row, but for numbers and garbled bytes: as _times)
+            gists = [k[:2] + (_gist(k[2]),) for k in keys]
+            run = run + 1 if gists == prev and not any("sleep" in k[1] for k in keys) else 1
+            prev, longest = gists, max(longest, run)
+    return any(n >= ECHO_TURNS for n in para.values()) or any(n >= ECHO_TURNS for n in calls.values()) or \
+        longest >= ECHO_TURNS
 
 
 def collapse(messages: list[dict]) -> Collapse | None:
     """The prompt of a conversation that carries a loop (echoes()) without what the model already wrote: a paragraph
     of its reasoning or text that it wrote before (an earlier message, or earlier in the same one) is left out, and
-    a round whose calls and results all repeat earlier ones, with nothing new said, goes with its results.  What the
+    a round whose calls and results all repeat earlier ones (or the round just before, but for numbers and garbled
+    bytes) goes with its results and its thinking.  What the
     model sees is then what it found, once - not dozens of copies of the same thoughts to go on from (GLM-5.3 had
     "Hmm - hold on: I realize something important." 543 times in an 88K prompt, 89% of its own text repeats).  Each
     message depends only on the ones before it, so the next request's prompt starts the same.  None: no loop, or
     nothing to leave out."""
     if not echoes(messages):
         return None
-    out, seen, made, paras, rounds, i = [], set(), set(), 0, 0, 0
+    out, seen, made, paras, rounds, i, last = [], set(), set(), 0, 0, 0, None
     while i < len(messages):
         m = messages[i]
         if m.get("role") != "assistant":
@@ -391,13 +473,20 @@ def collapse(messages: list[dict]) -> Collapse | None:
                 kept.append(p + sep)
             m[f] = "".join(kept).strip()
         keys, j = _round_keys(messages, i)
-        said = (m.get("content") or "").strip() or (m.get("reasoning_content") or "").strip()
-        if keys and len(keys) == len(m.get("tool_calls") or []) and all(k in made for k in keys) and not said:
+        gists = [k[:2] + (_gist(k[2]),) for k in keys]
+        again = all(k in made for k in keys) or gists == last and "sleep" not in str(keys)
+        if keys and len(keys) == len(m.get("tool_calls") or []) and again:
+            # a round that repeats: the call and its result go, and the thinking around them (the loop's own
+            # talk); text the model wrote to the user, if new, stays
             rounds += 1
-            i = j                                   # the round and its results
+            if (m.get("content") or "").strip():
+                out.append({"role": "assistant", "content": m["content"]})
+            i = j
             continue
         made.update(keys)
-        if said or m.get("tool_calls"):
+        if keys:
+            last = gists
+        if (m.get("content") or "").strip() or (m.get("reasoning_content") or "").strip() or m.get("tool_calls"):
             out.append(m)
         i += 1
     return Collapse(out, paras, rounds) if paras or rounds else None

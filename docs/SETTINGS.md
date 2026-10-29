@@ -332,8 +332,12 @@ model (GLM, DeepSeek, MiniMax) - beside the GLM engine's own check for short pat
   Only that prompt changes; the model goes on. A command run again after an edit gives another result, so it does not
   count. The note is worded differently at the 3rd, 4th and 5th run; the last one says a block comes next. A call
   made again after those three notes is **blocked**: it never reaches the client, the server answers it in the prompt
-  ("not run") with a firmer note and the model goes on in the same answer. If it writes the blocked call twice more in
-  that answer, the answer ends there with a line for the user instead. Blocks count in `/metrics`
+  ("not run") with a firmer note and the model goes on in the same answer, its thinking started for it a step away from
+  the call (worded differently each time). It is never stopped: if it writes the blocked call again, the same happens,
+  a little hotter (temperature +0.15 a time from the 2nd, at most 1.5), until it does something else. A user's bare
+  "continue" / "proceed" / "ok" does not start the count over, and the model is told at once which calls stay blocked.
+  Within a row of the same call, a result that differs only in numbers or garbled bytes counts as the same (not for a
+  wait with `sleep`). Blocks count in `/metrics`
   `loop_guard.tool_blocked` and `maya:loop_guard_tool_blocked_total`.
 - **A conversation that repeats itself:** once one piece of the model's own text turns up in 3 of its messages (or
   one call with the same result has run 3 times), the prompt leaves out what the model already wrote: a sentence of
