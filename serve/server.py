@@ -1743,7 +1743,7 @@ class Service:
         # the server started: loops seen, and how each was broken (the Monitor's totals, /metrics, Prometheus)
         self.loop_guard = True
         self.loop_guard_counts = {"detected": 0, "penalised": 0, "thinking_closed": 0, "stopped": 0, "tool_repeats": 0,
-                                  "tool_blocked": 0}
+                                  "tool_blocked": 0, "collapsed": 0}
         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
@@ -2445,6 +2445,9 @@ class Service:
              "Tool calls made again and again with the same result that got a note after them", guard["tool_repeats"]),
             ("maya:loop_guard_tool_blocked_total", "counter",
              "Tool calls the loop guard did not let out (made again after its notes)", guard["tool_blocked"]),
+            ("maya:loop_guard_collapsed_total", "counter",
+             "Prompts the loop guard left the model's repeats out of (a conversation that repeats itself)",
+             guard["collapsed"]),
         ]
         rows += [(f"maya:engine_{k}", "counter" if k in self.PROM_STAT_COUNTERS else "gauge", h, stat[k])
                  for k, h in self.PROM_STAT.items()
@@ -2519,7 +2522,8 @@ class Service:
         on = self.loop_guard if guard is None else guard
         blocked = loop_guard.tool_blocked(messages) if on else {}
         if on:
-            messages = self._tool_repeat(messages)
+            noted = self._tool_repeat(messages)
+            messages = self._collapse(messages) + noted[len(messages):]
         given, force = kwargs, kwargs.get("_force_tool")
         kwargs = {k: v for k, v in kwargs.items() if k != "_force_tool"}
         if force is not None and tools:
@@ -2809,6 +2813,19 @@ class Service:
                 return None
             out[key] = (rep, self.tok.encode(p[p.rindex(CALL_END) + len(CALL_END):] + f[len(p):], parse_special=True))
         return out
+
+    def _collapse(self, messages):
+        """A conversation that carries a loop across turns (loop_guard.collapse): its prompt without what the model
+        already wrote - only that prompt changes."""
+        c = loop_guard.collapse(messages)
+        if c is None:
+            return messages
+        print(f"[maya] loop guard: the conversation repeats itself - left out of the prompt: {c.paragraphs} pieces "
+              f"of the model's own text it had written before, {c.rounds} tool rounds that repeat earlier ones",
+              flush=True)
+        with self.status_lock:
+            self.loop_guard_counts["collapsed"] += 1
+        return c.messages
 
     def _tool_blocked(self, rep, tries):
         stop = tries > loop_guard.BLOCK_TRIES
