@@ -498,7 +498,8 @@ def collapse(messages: list[dict]) -> Collapse | None:
 
 # ------------------------------------------------------------------------------------------------ keep going
 TALK = re.compile(r"(?i)loop.?guard|break(ing)? out|stop (repeating|re-running|theorizing)|act differently|"
-                  r"change (approach|something real)|identical (output|result|nc|grep|command|call)")
+                  r"change (approach|something real)|identical (output|result|nc|grep|command|call)|"
+                  r"(been|keep|kept|am) (looping|stuck|repeating)|repeating myself|in a (reasoning )?loop")
 KEEP_SHORT = 300        # an answer that ends the turn with less text than this (or only TALK) in a looping conversation
 
 
@@ -507,12 +508,18 @@ def talk(text: str) -> bool:
     return bool(TALK.search(text))
 
 
-def stops_short(text: str) -> bool:
-    """Does an answer that ends the turn (no tool call) in a conversation that repeats itself end it with nothing:
-    talk about its loop, or a line or two?  GLM-5.3 ended its turn with "OK - the loop guard is right. Stop
-    repeating identical greps. Break out: use what I have or answer the user." - and the agent stopped.  A report
-    of what it found is longer and may end the turn."""
-    kept = [u for u, _ in _units(text, "reasoning_content") if u.strip() and not talk(u)]
+def said_before(messages: list[dict]) -> set[str]:
+    """Every piece of the model's reasoning and text in the conversation (stops_short's `seen`)."""
+    return {_key(u) for m in messages if m.get("role") == "assistant"
+            for f in ("reasoning_content", "content") for u, _ in _units(m.get(f), f)}
+
+
+def stops_short(text: str, seen: set[str] = frozenset()) -> bool:
+    """Does an answer that ends the turn (no tool call) in a conversation that repeats itself end it with nothing new:
+    talk about its loop, what it already said (`seen`), or a line or two?  GLM-5.3 ended its turn with "OK - the
+    loop guard is right. ... Break out: use what I have or answer the user." - and the agent stopped; then with its
+    "What I actually know" list once more.  A report that says something new may end the turn."""
+    kept = [u for u, _ in _units(text, "content") if u.strip() and not talk(u) and _key(u) not in seen]
     return len(" ".join(kept).strip()) < KEEP_SHORT
 
 
