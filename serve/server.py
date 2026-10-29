@@ -1743,7 +1743,7 @@ class Service:
         # the server started: loops seen, and how each was broken (the Monitor's totals, /metrics, Prometheus)
         self.loop_guard = True
         self.loop_guard_counts = {"detected": 0, "penalised": 0, "thinking_closed": 0, "stopped": 0, "tool_repeats": 0,
-                                  "tool_blocked": 0, "collapsed": 0}
+                                  "tool_blocked": 0, "collapsed": 0, "kept_going": 0}
         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
@@ -2445,6 +2445,9 @@ class Service:
              "Tool calls made again and again with the same result that got a note after them", guard["tool_repeats"]),
             ("maya:loop_guard_tool_blocked_total", "counter",
              "Tool calls the loop guard did not let out (made again after its notes)", guard["tool_blocked"]),
+            ("maya:loop_guard_kept_going_total", "counter",
+             "Answers that would have ended the turn with nothing in a conversation that repeats itself, kept going",
+             guard["kept_going"]),
             ("maya:loop_guard_collapsed_total", "counter",
              "Prompts the loop guard left the model's repeats out of (a conversation that repeats itself)",
              guard["collapsed"]),
@@ -2518,9 +2521,11 @@ class Service:
         starts the answer with the call's opening, thinking off; that text goes back in kwargs["_prefill"] for run().
         With the loop guard (`guard`, else the server's) a tool call the model keeps making with the same result gets
         a note after that result (_tool_repeat); one it made again after TOOL_NUDGES such notes is blocked in this
-        answer (kwargs["_blocked"] for run(), _block_suffixes)."""
+        answer (kwargs["_blocked"] for run(), _block_suffixes); and in a conversation that repeats itself an answer
+        may not end the turn short (kwargs["_blocked"]["_keep"], _keep_suffix)."""
         on = self.loop_guard if guard is None else guard
         blocked = loop_guard.tool_blocked(messages) if on else {}
+        looping = bool(blocked) or bool(on and loop_guard.echoes(messages))
         if on:
             noted = self._tool_repeat(messages)
             if blocked and len(noted) == len(messages) and messages and messages[-1].get("role") == "user" \
@@ -2546,6 +2551,10 @@ class Service:
                 prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
         given["_prefill"] = prefill
         given["_blocked"] = self._block_suffixes(blocked, tools, kwargs) if blocked and force is None else None
+        if looping and tools and force is None:
+            keep = self._keep_suffix(tools, kwargs)
+            if keep is not None:
+                given["_blocked"] = {**(given["_blocked"] or {}), "_keep": keep}
         ids = self.render_ids(messages, tools, kwargs, prefill)
         self.embeddings.path = None
         media = media_of(messages)
@@ -2819,6 +2828,25 @@ class Service:
                         f.rstrip().endswith("<think>"))
         return out
 
+    def _keep_suffix(self, tools, kwargs):
+        """(ids, thinks): the prompt that follows the model's own last words when it would end its turn short in a
+        conversation that repeats itself (loop_guard.stops_short) - the template's turn end, a user message
+        loop_guard.KEEP_NOTE and the next assistant turn's opening (`thinks`: an open thinking block).  None for a
+        template that does not render a turn as a prefix of the next."""
+        mark = "\u2063keep\u2063"                  # (the model's words, wherever the template puts them)
+        head = [{"role": "user", "content": "."}, {"role": "assistant", "content": mark}]
+        try:
+            p = self.template.render(head, tools=tools, **{**kwargs, "add_generation_prompt": False})
+            f = self.template.render(head + [{"role": "user", "content": loop_guard.KEEP_NOTE}], tools=tools, **kwargs)
+        except Exception:
+            return None
+        if kwargs.get("enable_thinking") is False and f.endswith("<think>"):
+            f += "</think>"
+        if not f.startswith(p) or mark not in p:
+            return None
+        return (self.tok.encode(p[p.rindex(mark) + len(mark):] + f[len(p):], parse_special=True),
+                f.rstrip().endswith("<think>"))
+
     def _collapse(self, messages):
         """A conversation that carries a loop across turns (loop_guard.collapse): its prompt without what the model
         already wrote - only that prompt changes."""
@@ -2831,6 +2859,12 @@ class Service:
         with self.status_lock:
             self.loop_guard_counts["collapsed"] += 1
         return c.messages
+
+    def _kept_going(self, kept, text):
+        print(f"[maya] loop guard: the model would end its turn with nothing ({' '.join(text.split())[:80]!r}): "
+              f"kept going ({kept}. time in this answer)", flush=True)
+        with self.status_lock:
+            self.loop_guard_counts["kept_going"] += 1
 
     def _tool_blocked(self, rep, tries):
         print(f"[maya] loop guard: `{rep.name}` again after {loop_guard.TOOL_NUDGES} notes ({rep.times} runs, the same "
@@ -3018,7 +3052,11 @@ class Service:
         # While there are any, the answer's calls are held back (`pending`) until it ends; one that ends it alone
         # with a blocked call never goes out - the server answers it in the prompt and the model goes on, as often as
         # it takes (only max_tokens ends it, as any answer)
-        blocked = (sampling or {}).get("_blocked") or {}
+        blocked = dict((sampling or {}).get("_blocked") or {})
+        keep = blocked.pop("_keep", None)           # (ids, thinks): the answer may not end the turn short
+        said = []                                   # this engine call's text for the user (stops_short)
+        kept = 0                                    # times it was kept going in this answer
+        called = False                              # it wrote a tool call (then its turn does not end here)
         pending, tries, sent_call = [], {}, False
         seg = {"prompt": ids, "ids": [], "next": None}   # this engine call's prompt and tokens; the next one's
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
@@ -3160,10 +3198,23 @@ class Service:
                             finish = "stop"
                             raw_ids.append(t)
                             key = blocked_call() if blocked else None
+                            if key is None and keep is not None and not called and \
+                                    loop_guard.stops_short("".join(said)):
+                                # it would end the turn with nothing - talk about its loop, a line: keep it going
+                                kept += 1
+                                self._kept_going(kept, "".join(said))
+                                ids_k, thinks = keep
+                                steer = self.tok.encode(loop_guard.keep_steer(kept)) if thinks else []
+                                seg["next"] = list(seg["prompt"]) + seg["ids"] + ids_k + steer
+                                sampling = loop_guard.block_sampling(sampling, kept)
+                                parser, detok, held, said[:] = new_parser(), Detokenizer(self.tok), "", []
+                                in_think = bool(thinking) and self.think_end_id is not None and self.think_budget > 0
+                                continue
                             if key is None:
                                 break
                             rep, suffix, thinks = blocked[key]
                             pending.clear()             # the call never goes out
+                            called = False
                             tries[key] = tries.get(key, 0) + 1
                             self._tool_blocked(rep, tries[key])
                             # the server answers it: the call's result and a note in the prompt, and the model's next
@@ -3172,7 +3223,7 @@ class Service:
                             steer = self.tok.encode(loop_guard.block_steer(rep, key[1], tries[key])) if thinks else []
                             seg["next"] = list(seg["prompt"]) + seg["ids"] + suffix + steer
                             sampling = loop_guard.block_sampling(sampling, tries[key])
-                            parser, detok, held = new_parser(), Detokenizer(self.tok), ""
+                            parser, detok, held, said[:] = new_parser(), Detokenizer(self.tok), "", []
                             in_think = bool(thinking) and self.think_end_id is not None and self.think_budget > 0
                             continue
                         seg["ids"].append(t)
@@ -3196,6 +3247,10 @@ class Service:
                         self._note(n, evs, stat)
                         last_print = self._progress(last_print)
                         for ev in evs:
+                            if ev.kind == "content":
+                                said.append(ev.text)
+                            elif ev.kind == "tool_call":
+                                called = True
                             if blocked and (pending or ev.kind.startswith("tool")):
                                 pending.append(ev)      # (a call: held back until the answer ends)
                             else:
