@@ -51,7 +51,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, models, savings  # noqa: E402
+from serve import compaction, ds4_vision, gpu_map, loop_guard, mm3_vision, models, savings  # noqa: E402
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
@@ -2600,6 +2600,7 @@ class Service:
             if keep is not None:                     # (+ what the model said before: stops_short's `seen`)
                 given["_blocked"] = {**(given["_blocked"] or {}), "_keep": keep + (loop_guard.said_before(asked),)}
         ids = self.render_ids(messages, tools, kwargs, prefill)
+        ids, messages = self._fit_compaction(ids, messages, tools, kwargs, prefill, max_new)
         self.embeddings.path = None
         media = media_of(messages)
         images = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
@@ -2903,6 +2904,31 @@ class Service:
         with self.status_lock:
             self.loop_guard_counts["collapsed"] += 1
         return c.messages
+
+    def _fit_compaction(self, ids, messages, tools, kwargs, prefill, max_new):
+        """-> (ids, messages): a request to compact the conversation (compaction.quoted) that is too long for the
+        context, with the oldest part of the conversation it quotes left out until it fits with room for the summary
+        - the client's last way out of a full context. Any other request goes on as it is (and is rejected)."""
+        limit = self.engine.max_context - CTX_SLACK
+        want = max_new if max_new is not None and max_new > 0 else compaction.ROOM
+        at = compaction.quoted(messages) if len(ids) + want > limit else None
+        if at is None or want >= limit:
+            return ids, messages
+        whole, n0, cut = messages, len(ids), 0
+        per = max(1.0, compaction.size(whole, at) / n0)             # characters per token: at first, at least
+        for _ in range(8):
+            over = len(ids) + want - limit
+            if over <= 0 or cut >= compaction.size(whole, at):
+                break
+            cut += int(over * per * 1.02) + 64
+            messages = compaction.shorten(whole, at, cut)
+            ids = self.render_ids(messages, tools, kwargs, prefill)
+            if n0 > len(ids):
+                per = max(1.0, cut / (n0 - len(ids)))     # characters per token of what went
+        print(f"[maya] compaction: the request was {n0:,} tokens + {want:,} for the summary, over the context "
+              f"({self.engine.max_context:,}): the oldest {cut:,} characters of the conversation left out "
+              f"(now {len(ids):,} tokens)", flush=True)
+        return ids, messages
 
     def _kept_going(self, kept, text):
         print(f"[maya] loop guard: the model would end its turn with nothing ({' '.join(text.split())[:80]!r}): "
