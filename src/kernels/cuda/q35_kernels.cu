@@ -720,42 +720,47 @@ __global__ void __launch_bounds__(128, MINB) attn_dec_kernel(const float* __rest
     }
 }
 
-// ---- the streaming kernel (STRATA_DENSE_ATTN_STREAM): 1-5 tokens (rows R = T G <= 16 RT) over a split of the keys,
+// ---- the streaming kernel (STRATA_DENSE_ATTN_STREAM): 1-8 tokens (rows R = T G <= 16 RT) over a split of the keys,
 // one block of 8 warps a (kv head, split).  K / V tiles of SK keys read with 16-byte loads - the next tile's issued
 // into registers before this tile's math - and stored to shared memory; S = Q K^T and O += P V on the tensor cores
 // (wmma 16x16x16, FP16 in, F32 sums), O in each warp's accumulator fragments.  The softmax a warp a row, a lane a key
 // (or two): each row keeps a reference max m; P = exp(s - m) in FP16 (<= e^8 while no score passes m + 8), so O and l
 // stay unscaled - a tile whose max passes m + 8 (rare after the first) moves m up and rescales O through a warp's
-// shared scratch first.  Partials in attn_dec_kernel's layout (the merge folds them, the gate there).  FP16 cache.
+// shared scratch first.  Partials in attn_dec_kernel's layout (the merge folds them, the gate there).  FP16 cache, or
+// K8V4 (MODE 1) unpacked to FP16 as a tile is stored - its output still rotated, unrotate_gate_kernel after the merge.
 constexpr int SNT = 256, SLD = AD + 8, SRES = 8;   // threads, K / V / Q row pitch (halves), the rescale threshold
 // one tile buffer: K stored for S, then V over it for O (the next tile's K and V loads issued separately, each after its
-// own store, so both stay in flight)
+// own store, so both stay in flight).  P is written over its own row of S (a warp owns its rows); the rare rescale and
+// the final write go through the tile buffer (between K's use and V's store / after the last tile) - so a 16-row block
+// of 64-key tiles fits 2 a SM.
 template <int RT, int SK_> struct StreamGeo {
     static constexpr int SK = SK_;                              // keys a tile
-    static constexpr int SSLD = SK + 4, SPLD = SK + 8;
+    static constexpr int SSLD = SK + 4;                         // S row pitch (floats); P (halves) over it
     static constexpr int NF = RT * 16 / 8;                      // O fragments a warp (RT x 16 over 8 warps)
     static constexpr size_t smem = (size_t) RT * 16 * SLD * 2 + (size_t) SK * SLD * 2 + (size_t) RT * 16 * SSLD * 4 +
-                                   (size_t) RT * 16 * SPLD * 2 + 3 * (size_t) RT * 16 * 4 + 8 * 256 * 4 + 16;
-    static constexpr int per_sm = smem <= 48 * 1024 ? 2 : 1;
+                                   3 * (size_t) RT * 16 * 4 + 16;
+    // (2 a SM only for 32-key tiles: 16 rows x 64 keys also fits, but its register cap made it slower - 706 vs 762 GB/s)
+    static constexpr int per_sm = SK == 32 && smem <= 48 * 1024 ? 2 : 1;
 };
-template <int RT, int SK_>
-__global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream_kernel(const float* __restrict__ q, Q35Kv kv, int p0, int T, int G,
+template <int RT, int SK_, int MODE = 0>
+__global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream_kernel(const float* __restrict__ q,
+                                                              Q35Kv kv, int p0, int T, int G,
                                                               int n_head, int max_ctx, int split_len, float scale,
                                                               float* __restrict__ part_o, float* __restrict__ part_ml) {
     using namespace nvcuda;
     using GE = StreamGeo<RT, SK_>;
-    constexpr int RR = RT * 16, SK = GE::SK, SSLD = GE::SSLD, SPLD = GE::SPLD, NF = GE::NF;
+    constexpr int RR = RT * 16, SK = GE::SK, SSLD = GE::SSLD, NF = GE::NF;
+    constexpr int PLD = SSLD * 2;   // P's row pitch in halves (over its S row)
     extern __shared__ __align__(16) unsigned char smem[];
     __half* Qs = (__half*) smem;
-    __half* Ks = Qs + RR * SLD;
-    __half* Vs = Ks;   // (the same buffer: V after S is done)
-    float* Ss = (float*) (Ks + SK * SLD);
-    __half* Ps = (__half*) (Ss + RR * SSLD);
-    float* ms = (float*) (Ps + RR * SPLD);
+    __half* KV = Qs + RR * SLD;               // the tile: K, then V
+    float* Ss = (float*) (KV + SK * SLD);
+    __half* Ps = (__half*) Ss;
+    float* ms = Ss + RR * SSLD;
     float* ls = ms + RR;
-    float* cs = ls + RR;                       // a row's rescale factor this tile (1: none)
-    float* scr = cs + RR;                      // [8 warps][16 x 16] the rescale's scratch
-    int* any = (int*) (scr + 8 * 256);         // whether this tile rescales a row
+    float* cs = ls + RR;
+    int* any = (int*) (cs + RR);
+    float* scr = (float*) KV;                  // [8 warps][16 x 16] when the tile holds neither K in use nor V
     const int kvh = blockIdx.x, split = blockIdx.y, n_kv = gridDim.x, tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
     const int R = T * G, qld = n_head * AD;
     const int ks = split * split_len, ke = min(ks + split_len, p0 + T);
@@ -769,34 +774,94 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
         ms[tid] = -INFINITY;
         ls[tid] = 0.0f;
     }
-    constexpr int NU = SK * 32 / SNT;
-    const __half* kb = (const __half*) kv.k + (size_t) kvh * max_ctx * AD;
-    const __half* vb = (const __half*) kv.v + (size_t) kvh * max_ctx * AD;
-    uint4 rk[NU], rv[NU];
-    auto issue = [&](int k0, const __half* base, uint4* r) {
+    // the tile's loads: FP16 - 16-byte chunks of K / V rows (32 a row); K8V4 - K: 16 INT8 codes a chunk (16 a row) with
+    // their group's scale, V: 32 4-bit codes a chunk (8 a row) with theirs - unpacked to FP16 when stored
+    constexpr int NUK = MODE == 0 ? SK * 32 / SNT : SK * 16 / SNT, NUV = MODE == 0 ? SK * 32 / SNT : SK * 8 / SNT;
+    const size_t cell0 = (size_t) kvh * max_ctx;
+    uint4 rk[NUK], rv[NUV];
+    unsigned short sk_[MODE == 0 ? 1 : NUK], sv_[MODE == 0 ? 1 : NUV];
+    auto issue_k = [&](int k0) {
 #pragma unroll
-        for (int i = 0; i < NU; ++i) {
-            const int u = tid + SNT * i, key = k0 + u / 32, c = u % 32;
-            r[i] = key < ke ? __ldg((const uint4*) (base + (size_t) key * AD) + c) : make_uint4(0, 0, 0, 0);
+        for (int i = 0; i < NUK; ++i) {
+            const int u = tid + SNT * i;
+            if (MODE == 0) {
+                const int key = k0 + u / 32, c = u % 32;
+                rk[i] = key < ke ? __ldg((const uint4*) ((const __half*) kv.k + (cell0 + key) * AD) + c) : make_uint4(0, 0, 0, 0);
+            } else {
+                const int key = k0 + u / 16, c = u % 16;
+                if (key < ke) {
+                    rk[i] = __ldg((const uint4*) ((const int8_t*) kv.k + (cell0 + key) * AD) + c);
+                    sk_[i] = __ldg((const unsigned short*) kv.ks + (cell0 + key) * (AD / 32) + c / 2);
+                } else {
+                    rk[i] = make_uint4(0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u);   // (codes 0)
+                    sk_[i] = 0;
+                }
+            }
         }
     };
+    auto issue_v = [&](int k0) {
+#pragma unroll
+        for (int i = 0; i < NUV; ++i) {
+            const int u = tid + SNT * i;
+            if (MODE == 0) {
+                const int key = k0 + u / 32, c = u % 32;
+                rv[i] = key < ke ? __ldg((const uint4*) ((const __half*) kv.v + (cell0 + key) * AD) + c) : make_uint4(0, 0, 0, 0);
+            } else {
+                const int key = k0 + u / 8, c = u % 8;
+                if (key < ke) {
+                    rv[i] = __ldg((const uint4*) ((const uint8_t*) kv.v + (cell0 + key) * (AD / 2)) + c);
+                    sv_[i] = __ldg((const unsigned short*) kv.vs + (cell0 + key) * (AD / 32) + c);
+                } else {
+                    rv[i] = make_uint4(0x88888888u, 0x88888888u, 0x88888888u, 0x88888888u);   // (codes 0)
+                    sv_[i] = 0;
+                }
+            }
+        }
+    };
+    auto store_k = [&]() {
+#pragma unroll
+        for (int i = 0; i < NUK; ++i) {
+            const int u = tid + SNT * i;
+            if (MODE == 0) {
+                *(uint4*) (KV + (u / 32) * SLD + (u % 32) * 8) = rk[i];
+            } else {
+                const __half sc = __ushort_as_half(sk_[i]);
+                __half* dst = KV + (u / 16) * SLD + (u % 16) * 16;
+                *(uint4*) dst = deq_k8(make_uint2(rk[i].x, rk[i].y), sc);
+                *(uint4*) (dst + 8) = deq_k8(make_uint2(rk[i].z, rk[i].w), sc);
+            }
+        }
+    };
+    auto store_v = [&]() {
+#pragma unroll
+        for (int i = 0; i < NUV; ++i) {
+            const int u = tid + SNT * i;
+            if (MODE == 0) {
+                *(uint4*) (KV + (u / 32) * SLD + (u % 32) * 8) = rv[i];
+            } else {
+                const __half sc = __ushort_as_half(sv_[i]);
+                __half* dst = KV + (u / 8) * SLD + (u % 8) * 32;
+                *(uint4*) dst = deq_v4(rv[i].x, sc);
+                *(uint4*) (dst + 8) = deq_v4(rv[i].y, sc);
+                *(uint4*) (dst + 16) = deq_v4(rv[i].z, sc);
+                *(uint4*) (dst + 24) = deq_v4(rv[i].w, sc);
+            }
+        }
+    };
+    // O fragments: warp w the row tile mi = i / 2 ... as (mi, ni) = (j, w) and (j, w + 8) for j < RT
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> fo[NF];
 #pragma unroll
     for (int f = 0; f < NF; ++f) wmma::fill_fragment(fo[f], 0.0f);
     if (ks < ke) {
-        issue(ks, kb, rk);
-        issue(ks, vb, rv);
+        issue_k(ks);
+        issue_v(ks);
     }
     __syncthreads();
     for (int k0 = ks; k0 < ke; k0 += SK) {
-#pragma unroll
-        for (int i = 0; i < NU; ++i) {
-            const int u = tid + SNT * i, key = u / 32, c = u % 32;
-            *(uint4*) (Ks + key * SLD + c * 8) = rk[i];
-        }
+        store_k();
         if (tid == 0) *any = 0;
         __syncthreads();
-        if (k0 + SK < ke) issue(k0 + SK, kb, rk);   // (the next tile's K in flight during S, the softmax and O)
+        if (k0 + SK < ke) issue_k(k0 + SK);
         // S = Q K^T: RT x SK / 16 fragments over the warps
         for (int f = w; f < RT * (SK / 16); f += SNT / 32) {
             const int mi = f / (SK / 16), ni = f % (SK / 16);
@@ -807,13 +872,13 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
                 wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
                 wmma::load_matrix_sync(fa, Qs + mi * 16 * SLD + kk * 16, SLD);
-                wmma::load_matrix_sync(fb, Ks + ni * 16 * SLD + kk * 16, SLD);
+                wmma::load_matrix_sync(fb, KV + ni * 16 * SLD + kk * 16, SLD);
                 wmma::mma_sync(fs, fa, fb, fs);
             }
             wmma::store_matrix_sync(Ss + mi * 16 * SSLD + ni * 16, fs, SSLD, wmma::mem_row_major);
         }
         __syncthreads();
-        // the softmax: warp w the rows w, w + 8, ..; lane the keys lane, lane + 32
+        // the softmax: warp w the rows w, w + 8, ..; lane the keys lane, lane + 32; P over the row's own S
         for (int r = w; r < RR; r += SNT / 32) {
             const int last = r < R ? p0 + r / G : -1;
             float sv[SK / 32];
@@ -827,17 +892,21 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
             float m = ms[r], corr = 1.0f;
-            if (mx > m + SRES || (m == -INFINITY && mx != -INFINITY)) {   // a new reference max (O rescaled below)
+            if (mx > m + SRES || (m == -INFINITY && mx != -INFINITY)) {
                 corr = m == -INFINITY ? 0.0f : __expf(m - mx);
                 m = mx;
             }
             float sum = 0.0f;
+            __half pv[SK / 32];
 #pragma unroll
             for (int j = 0; j < SK / 32; ++j) {
                 const float p = sv[j] == -INFINITY ? 0.0f : __expf(sv[j] - m);
-                Ps[r * SPLD + lane + 32 * j] = __float2half_rn(p);
+                pv[j] = __float2half_rn(p);
                 sum += p;
             }
+            __syncwarp();   // (the row's S read by every lane before P goes over it)
+#pragma unroll
+            for (int j = 0; j < SK / 32; ++j) Ps[r * PLD + lane + 32 * j] = pv[j];
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
             if (lane == 0) {
@@ -847,42 +916,45 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
                 if (corr != 1.0f) *any = 1;
             }
         }
-        // V over K (S is done: the softmax's sync), then the next tile's V in flight during O and the next S
-#pragma unroll
-        for (int i = 0; i < NU; ++i) {
-            const int u = tid + SNT * i, key = u / 32, c = u % 32;
-            *(uint4*) (Vs + key * SLD + c * 8) = rv[i];
-        }
         __syncthreads();
-        if (k0 + SK < ke) issue(k0 + SK, vb, rv);
-        const bool resc = *any != 0;
-        // O += P V: warp w the fragments f = w + 8 i (row tile f / 16, columns 16 (f % 16))
+        if (*any != 0) {   // (rare: a row's reference max moved - its O rows scaled through the tile buffer, K done)
 #pragma unroll
-        for (int i = 0; i < NF; ++i) {
-            const int f = w + 8 * i, mi = f / 16, ni = f % 16;
-            if (resc) {   // (rare: some row's reference max moved - its O rows scaled through the scratch)
+            for (int i = 0; i < NF; ++i) {
+                const int mi = i / 2, ni = w + 8 * (i % 2);
                 float* sc = scr + w * 256;
                 wmma::store_matrix_sync(sc, fo[i], 16, wmma::mem_row_major);
                 __syncwarp();
                 for (int e = lane; e < 256; e += 32) sc[e] *= cs[mi * 16 + e / 16];
                 __syncwarp();
                 wmma::load_matrix_sync(fo[i], sc, 16, wmma::mem_row_major);
+                __syncwarp();
             }
+            __syncthreads();
+        }
+        store_v();   // V over K
+        __syncthreads();
+        if (k0 + SK < ke) issue_v(k0 + SK);
+        // O += P V: each V fragment loaded once for the warp's RT row tiles
 #pragma unroll
-            for (int kk = 0; kk < SK / 16; ++kk) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fp;
+        for (int kk = 0; kk < SK / 16; ++kk) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> fv;
-                wmma::load_matrix_sync(fp, Ps + mi * 16 * SPLD + kk * 16, SPLD);
-                wmma::load_matrix_sync(fv, Vs + kk * 16 * SLD + ni * 16, SLD);
-                wmma::mma_sync(fo[i], fp, fv, fo[i]);
+                wmma::load_matrix_sync(fv, KV + kk * 16 * SLD + (w + 8 * h) * 16, SLD);
+#pragma unroll
+                for (int mi = 0; mi < RT; ++mi) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fp;
+                    wmma::load_matrix_sync(fp, Ps + mi * 16 * PLD + kk * 16, PLD);
+                    wmma::mma_sync(fo[mi * 2 + h], fp, fv, fo[mi * 2 + h]);
+                }
             }
         }
         __syncthreads();
     }
-    // the partials (unnormalised O, its reference max and total)
+    // the partials (unnormalised O, its reference max and total) through the tile buffer
 #pragma unroll
     for (int i = 0; i < NF; ++i) {
-        const int f = w + 8 * i, mi = f / 16, ni = f % 16;
+        const int mi = i / 2, ni = w + 8 * (i % 2);
         float* sc = scr + w * 256;
         wmma::store_matrix_sync(sc, fo[i], 16, wmma::mem_row_major);
         __syncwarp();
@@ -1191,24 +1263,32 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
     const int AR_v = v ? 32 : AR, AK_v = v == 2 ? 16 : AK, AW_v = v ? 2 : AW;
     const int tiles = (rows + AR_v - 1) / AR_v;
     const int n_keys = p0 + T;
-    static const int stream_env = std::getenv("STRATA_DENSE_ATTN_STREAM") ? std::atoi(std::getenv("STRATA_DENSE_ATTN_STREAM")) : 0;
-    const bool stream_on = (g_attn_stream >= 0 ? g_attn_stream : stream_env) != 0;
-    if (stream_on && kv.mode == 0 && splits <= 0 && rows <= 32) {
-        const int rt = rows <= 16 ? 1 : 2;
-        static const int sk_env = std::getenv("STRATA_DENSE_ATTN_STREAM_SK") ? std::atoi(std::getenv("STRATA_DENSE_ATTN_STREAM_SK")) : 64;
-        const int skv = g_stream_sk > 0 ? g_stream_sk : sk_env;
+    // on by default for the FP16 cache (chain205, 512 greedy tokens: MTP 57.3 -> 61.2 tok/s at 35K, plain decode
+    // 16.7 -> 17.0 at 68K, the same tokens); K8V4 only when asked for until its end-to-end A/B
+    static const int stream_env = std::getenv("STRATA_DENSE_ATTN_STREAM") ? std::atoi(std::getenv("STRATA_DENSE_ATTN_STREAM")) : -1;
+    const int stream_sel = g_attn_stream >= 0 ? g_attn_stream : stream_env;
+    const bool stream_on = stream_sel > 0 || (stream_sel < 0 && kv.mode == 0);
+    if (stream_on && splits <= 0 && rows <= 48) {
+        const int rt = rows <= 16 ? 1 : rows <= 32 ? 2 : 3;
+        // keys a tile by rows (attn_bench, V100, 68K / 131K): 16 rows 64 (762 / 820 GB/s), 32 rows 32 at 2 blocks a SM
+        // (540 / 644), 48 rows 64 (411 / 443)
+        static const int sk_env = std::getenv("STRATA_DENSE_ATTN_STREAM_SK") ? std::atoi(std::getenv("STRATA_DENSE_ATTN_STREAM_SK")) : 0;
+        const int skv = g_stream_sk > 0 ? g_stream_sk : sk_env > 0 ? sk_env : rt == 2 ? 32 : 64;
         static int sms = 0;
         static bool attr = false;
         if (!attr) {
             cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
-#define Q35_SATTR(RTV, SKV) cudaFuncSetAttribute(attn_stream_kernel<RTV, SKV>, cudaFuncAttributeMaxDynamicSharedMemorySize, \
+#define Q35_SATTR(RTV, SKV) cudaFuncSetAttribute(attn_stream_kernel<RTV, SKV, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, \
+                                                 (int) StreamGeo<RTV, SKV>::smem);                                       \
+                            cudaFuncSetAttribute(attn_stream_kernel<RTV, SKV, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, \
                                                  (int) StreamGeo<RTV, SKV>::smem)
-            Q35_SATTR(1, 32); Q35_SATTR(1, 64); Q35_SATTR(2, 32); Q35_SATTR(2, 64);
+            Q35_SATTR(1, 32); Q35_SATTR(1, 64); Q35_SATTR(2, 32); Q35_SATTR(2, 64); Q35_SATTR(3, 32); Q35_SATTR(3, 64);
 #undef Q35_SATTR
             attr = true;
         }
         const int per_sm = rt == 1 ? (skv == 32 ? StreamGeo<1, 32>::per_sm : StreamGeo<1, 64>::per_sm)
-                                   : (skv == 32 ? StreamGeo<2, 32>::per_sm : StreamGeo<2, 64>::per_sm);
+                         : rt == 2 ? (skv == 32 ? StreamGeo<2, 32>::per_sm : StreamGeo<2, 64>::per_sm)
+                                   : (skv == 32 ? StreamGeo<3, 32>::per_sm : StreamGeo<3, 64>::per_sm);
         const int target = g_stream_blocks > 0 ? g_stream_blocks : sms * per_sm;   // (one wave: the blocks that fit)
         const int cap = (int) (q35_attn_scratch_floats(T, n_head, D, max_ctx) / ((int64_t) rows * n_kv * (D + 2)));
         const int SKr = skv == 32 ? 32 : 64;
@@ -1221,15 +1301,26 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
         const dim3 grid(n_kv, n_split);
         const float sc = 1.0f / sqrtf((float) D);
 #define Q35_STREAM(RTV, SKV)                                                                                     \
-        attn_stream_kernel<RTV, SKV><<<grid, SNT, StreamGeo<RTV, SKV>::smem, (cudaStream_t) stream>>>(                   \
-            q, kv, p0, T, G, n_head, max_ctx, split_len, sc, part_o, part_ml)
+        do {                                                                                                         \
+            if (kv.mode == 0)                                                                                        \
+                attn_stream_kernel<RTV, SKV, 0><<<grid, SNT, StreamGeo<RTV, SKV>::smem, (cudaStream_t) stream>>>(     \
+                    q, kv, p0, T, G, n_head, max_ctx, split_len, sc, part_o, part_ml);                               \
+            else                                                                                                     \
+                attn_stream_kernel<RTV, SKV, 1><<<grid, SNT, StreamGeo<RTV, SKV>::smem, (cudaStream_t) stream>>>(     \
+                    q, kv, p0, T, G, n_head, max_ctx, split_len, sc, part_o, part_ml);                               \
+        } while (0)
         if (rt == 1) { if (skv == 32) Q35_STREAM(1, 32); else Q35_STREAM(1, 64); }
-        else { if (skv == 32) Q35_STREAM(2, 32); else Q35_STREAM(2, 64); }
+        else if (rt == 2) { if (skv == 32) Q35_STREAM(2, 32); else Q35_STREAM(2, 64); }
+        else { if (skv == 32) Q35_STREAM(3, 32); else Q35_STREAM(3, 64); }
 #undef Q35_STREAM
         check("q35_attn_stream");
         attn_merge_kernel<<<dim3(rows, n_kv), D, 0, (cudaStream_t) stream>>>(part_o, part_ml, rows, n_split, G, n_head,
-                                                                             q_full, ldq, out, p0, split_len, 1);
+                                                                             q_full, ldq, out, p0, split_len, kv.mode == 0);
         check("q35_attn_merge");
+        if (kv.mode != 0) {   // (K8V4: the output still rotated - back by H, then the gate)
+            unrotate_gate_kernel<<<dim3(T, n_head), 256, 0, (cudaStream_t) stream>>>(out, n_head, q_full, ldq);
+            check("q35_attn_unrotate");
+        }
         return;
     }
     if (G == 6 && splits <= 0 && T <= q35_attn_dec_max_tokens()) {

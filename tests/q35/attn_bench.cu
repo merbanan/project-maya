@@ -81,34 +81,36 @@ int main(int argc, char** argv) {
         printf("streaming read (the ceiling): K cache %.0f GB/s, V cache %.0f GB/s (%.0f MB each)\n", read_gbs(kv[0].k, kb, s),
                read_gbs(kv[0].v, kb, s), kb / 1e6);
     }
-    // the streaming kernel (FP16): blocks, against the tile kernel's output
-    for (int T : {1, 2, 4, 5}) {
+    // the streaming kernel (FP16 and K8V4): its tile choices, against the tile kernel's output in the same format
+    for (int T : {1, 2, 4, 5, 8}) {
         const int p0 = N - T;
-        q35_set_attn_stream(0, 0, 0);
-        q35_set_attn_dec_max_tokens(0);
-        q35_set_attn_var(0);
-        q35_attn_prep(qf, H * 2 * D, kk, vv, HK * D, nw, nw, 1e-6f, 1e7f, 64, p0, T, H, HK, D, qo, kv[0], s);
-        q35_attn(qo, kv[0], p0, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
-        std::vector<float> ref((size_t) T * H * D), o2(ref.size());
-        cudaMemcpy(ref.data(), out, ref.size() * 4, cudaMemcpyDeviceToHost);
-        for (int cfg = 0; cfg < 6; ++cfg) {
-            const int sk = cfg < 3 ? 64 : 32, bl = (cfg % 3 == 0) ? 0 : (cfg % 3 == 1 ? 160 : 320);
-            q35_set_attn_stream(1, bl, sk);
-            cudaMemset(out, 0, ref.size() * 4);
-            q35_attn(qo, kv[0], p0, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
-            cudaMemcpy(o2.data(), out, o2.size() * 4, cudaMemcpyDeviceToHost);
-            double e = 0, r = 0;
-            for (size_t i = 0; i < ref.size(); ++i) { e += pow(o2[i] - ref[i], 2); r += ref[i] * ref[i]; }
-            cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
-            cudaEventRecord(a, s);
-            for (int rep = 0; rep < 20; ++rep) q35_attn(qo, kv[0], p0, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
-            cudaEventRecord(b, s); cudaEventSynchronize(b);
-            float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= 20;
-            const double gb16 = (double) N * HK * D * 2 * 2 / 1e9;
-            printf("N %d T %d stream sk %d blocks %3d: fp16 %.3f ms (%.0f GB/s)  vs tile rel err %.2e  %s\n", N, T, sk, bl, ms,
-                   gb16 / ms * 1e3, sqrt(e / r), cudaGetErrorString(cudaGetLastError()));
+        for (int m = 0; m < 2; ++m) {
+            q35_set_attn_stream(0, 0, 0);
+            q35_set_attn_dec_max_tokens(0);
+            q35_set_attn_var(0);
+            q35_attn_prep(qf, H * 2 * D, kk, vv, HK * D, nw, nw, 1e-6f, 1e7f, 64, p0, T, H, HK, D, qo, kv[m], s);
+            q35_attn(qo, kv[m], p0, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
+            std::vector<float> ref((size_t) T * H * D), o2(ref.size());
+            cudaMemcpy(ref.data(), out, ref.size() * 4, cudaMemcpyDeviceToHost);
+            for (int cfg = 0; cfg < 3; ++cfg) {
+                const int sk = cfg == 0 ? 0 : cfg == 1 ? 64 : 32;   // (0: the dispatch's choice)
+                q35_set_attn_stream(1, 0, sk);
+                cudaMemset(out, 0, ref.size() * 4);
+                q35_attn(qo, kv[m], p0, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
+                cudaMemcpy(o2.data(), out, o2.size() * 4, cudaMemcpyDeviceToHost);
+                double e = 0, r = 0;
+                for (size_t i = 0; i < ref.size(); ++i) { e += pow(o2[i] - ref[i], 2); r += ref[i] * ref[i]; }
+                cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+                cudaEventRecord(a, s);
+                for (int rep = 0; rep < 20; ++rep) q35_attn(qo, kv[m], p0, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
+                cudaEventRecord(b, s); cudaEventSynchronize(b);
+                float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= 20;
+                const double gb = m == 0 ? (double) N * HK * D * 2 * 2 / 1e9 : (double) N * HK * (D + D / 2 + 32) / 1e9;
+                printf("N %d T %d stream %s sk %d: %.3f ms (%.0f GB/s)  vs tile rel err %.2e  %s\n", N, T, m ? "k8v4" : "fp16",
+                       sk, ms, gb / ms * 1e3, sqrt(e / r), cudaGetErrorString(cudaGetLastError()));
+            }
+            q35_set_attn_stream(0, 0, 0);
         }
-        q35_set_attn_stream(0, 0, 0);
     }
     // the decode kernel's tuning: keys in flight a warp x target blocks, at T 1 and 2
     for (int T : {1}) {
