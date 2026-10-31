@@ -110,6 +110,20 @@ MINIMAX_PATTERN = (
     r"|\s+"
 )
 
+# The `nemotron` pre-tokenizer: NVIDIA-Nemotron-3.5's tokenizer.json (Mistral's Tekken split) verbatim - no normalizer,
+# one Split with behavior "Isolated" (the text between matches stays a piece of its own), digits one at a time, no
+# contractions; then the byte-level map (use_regex false) and the merges by rank.
+NEMOTRON_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+
 class _IsolatedSplits:
     """findall() over a sequence of "Isolated" splits (see DEEPSEEK3_PATTERNS)."""
 
@@ -141,9 +155,9 @@ class Tokenizer:
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax"):
-            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax"
-                             % pre)
+        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax", "nemotron"):
+            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax, "
+                             "nemotron" % pre)
         # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
         self.ignore_merges = pre in ("glm4", "glm5")
         self.token_types = token_types
@@ -164,6 +178,7 @@ class Tokenizer:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
         self._re = (_IsolatedSplits(DEEPSEEK3_PATTERNS) if pre == "deepseek3" else
+                    _IsolatedSplits((NEMOTRON_PATTERN,)) if pre == "nemotron" else
                     regex.compile(MINIMAX_PATTERN) if pre == "minimax" else
                     regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN))
         self._nfc = pre == "minimax"
