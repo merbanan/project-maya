@@ -368,12 +368,13 @@ int main(int argc, char** argv) {
 
     int* d_next = nullptr;
     int* d_hist = nullptr;
+    float* d_conf = nullptr;   // (a draft's top-1 probability: STRATA_DENSE_P_CUM)
     float* d_hrows = nullptr;                      // the trunk's hidden rows the MTP block has yet to read
     int* d_tki = nullptr;                          // sampled drafts: rows' top-k ids / logits and the selection scratch
     float* d_tkv = nullptr;
     void* d_tks = nullptr;
     constexpr int kMaxHist = 4096;
-    if (cudaMalloc((void**) &d_next, 16 * sizeof(int)) != cudaSuccess ||
+    if (cudaMalloc((void**) &d_next, 16 * sizeof(int)) != cudaSuccess || cudaMalloc((void**) &d_conf, sizeof(float)) != cudaSuccess ||
         cudaMalloc((void**) &d_hist, kMaxHist * sizeof(int)) != cudaSuccess ||
         cudaMalloc((void**) &d_hrows, (size_t) 16 * cfg.n_embd * sizeof(float)) != cudaSuccess ||
         cudaMalloc((void**) &d_tki, 16 * 32 * sizeof(int)) != cudaSuccess || cudaMalloc((void**) &d_tkv, 16 * 32 * sizeof(float)) != cudaSuccess ||
@@ -676,6 +677,11 @@ int main(int argc, char** argv) {
         static const bool spec_env = std::getenv("STRATA_DENSE_SPEC_SAMPLE") ? std::atoi(std::getenv("STRATA_DENSE_SPEC_SAMPLE")) != 0
                                                                               : cfg.n_expert > 0;
         const bool spec_s = spec_env && !sp.greedy && !use_df && K > 0 && sp.top_k >= 1 && sp.top_k <= 32;
+        // STRATA_DENSE_BLOCK_VERIFY=0: sampled drafts tested token by token instead of as a block
+        static const bool block_verify = !(std::getenv("STRATA_DENSE_BLOCK_VERIFY") && std::atoi(std::getenv("STRATA_DENSE_BLOCK_VERIFY")) == 0);
+        static const double p_cum_env = std::getenv("STRATA_DENSE_P_CUM") ? std::atof(std::getenv("STRATA_DENSE_P_CUM")) : -1.0;
+        static const bool spec_pad = std::getenv("STRATA_DENSE_SPEC_PAD") && std::atoi(std::getenv("STRATA_DENSE_SPEC_PAD")) != 0;
+        long long conf_stops = 0;
         std::mt19937_64 srng(sp.seed * 0x9E3779B97F4A7C15ull + draw_counter + 1);
         std::vector<SparseDist> qd;
         auto topk_rows = [&](const float* logits, int ld, int rows, std::vector<SparseDist>& out) -> bool {
@@ -786,6 +792,13 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str()); failed = true; break;
                 }
                 qd.clear();
+                // STRATA_DENSE_P_CUM: greedy MTP drafts stop once the product of their top-1 probabilities falls below
+                // this (the draft head is well calibrated: a cheap verify loses more by a short draft than it saves, a
+                // long context's verify gains - Kmic-68/llama.cpp's P100 fork, +10-16% at 260K); unset: 0 below 16K of
+                // context, 0.3 from 48K, a ramp between; 0: off
+                const double p_cut = p_cum_env >= 0.0 ? p_cum_env
+                                     : pos < 16384 ? 0.0 : pos >= 49152 ? 0.3 : 0.3 * (double) (pos - 16384) / 32768.0;
+                double p_prod = 1.0;
                 for (int j = 0; j < k; ++j) {
                     int d = 0;
                     if (spec_s) {   // a draw from the draft head's own (filtered) distribution, kept for the accept test
@@ -808,15 +821,28 @@ int main(int argc, char** argv) {
                     } else {
                         strata::kernels::q35_argmax_rows(model.mtp_logits(), model.draft_vocab(), model.draft_vocab(), 1, d_next, cs);
                         cudaMemcpyAsync(&d, d_next, sizeof(int), cudaMemcpyDeviceToHost, cs);
+                        float pc = 1.0f;
+                        if (p_cut > 0.0) {
+                            strata::kernels::q35_top1_prob(model.mtp_logits(), model.draft_vocab(), d_next, d_conf, cs);
+                            cudaMemcpyAsync(&pc, d_conf, sizeof(float), cudaMemcpyDeviceToHost, cs);
+                        }
                         if (!model.sync(err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
+                        p_prod *= pc;
                     }
                     win.push_back(d);
+                    if (p_cut > 0.0 && p_prod < p_cut) { ++conf_stops; break; }   // (the next drafts would rarely be kept)
                     if (j + 1 < k && !model.mtp_forward(&d, model.mtp_hidden(), pos + j, 1, false, err)) {
                         std::printf("ERR %s\n", err.c_str()); failed = true; break;
                     }
                 }
                 if (failed) break;
             }
+            // STRATA_DENSE_SPEC_PAD=1: a short draft padded to K drafts (the last token repeated) so every verify pass has
+            // one width; only the real drafts can be kept (Kmic-68/llama.cpp's fixed-width verify: there a width change
+            // rebuilt the graph - here graphs are kept per width, so this is opt-in, for measuring)
+            const int W_real = (int) win.size();
+            if (spec_pad && K > 0 && W_real > 1 && W_real < K + 1 && lookup_rounds_before == lookup_rounds)
+                while ((int) win.size() < K + 1) win.push_back(win.back());
             const int W = (int) win.size();
             rp_mark(0, t_rp);
             if (!model.forward(win.data(), W, K > 0, K > 0 ? strata::core::DenseModel::kAll : strata::core::DenseModel::kLast, err)) {
@@ -825,7 +851,42 @@ int main(int argc, char** argv) {
             rp_mark(1, t_rp);
             int picks[16];
             int acc = 0;
-            if (spec_s && (int) qd.size() == W - 1 && lookup_rounds_before == lookup_rounds) {
+            if (spec_s && block_verify && (int) qd.size() == W - 1 && lookup_rounds_before == lookup_rounds) {
+                // block verification (Sun et al., arXiv:2403.10444, Algorithm 2): every prefix of the drafts tested, the
+                // longest one accepted kept, the token after it from max(0, p_tau P - Q) - the target's distribution
+                // exactly, at least as many drafts kept as the token test (Kmic-68/llama.cpp: +1.8%)
+                std::vector<SparseDist> pd;
+                if (!topk_rows(model.logits(), cfg.n_vocab, W, pd)) { failed = true; break; }
+                const int G = W - 1;
+                std::vector<double> pw((size_t) G + 1, 1.0);
+                int tau = 0;
+                for (int i = 1; i <= G; ++i) {
+                    const int x = win[i];
+                    const double q = qd[(size_t) i - 1].of(x), pb = pd[(size_t) i - 1].of(x);
+                    pw[(size_t) i] = q > 0.0 ? std::min(pw[(size_t) i - 1] * pb / q, 1.0) : 0.0;
+                    double h = pw[(size_t) i];
+                    if (i < G) {   // the residual mass at the next position over its total with the rest of the block
+                        double res = 0.0;
+                        const SparseDist& P = pd[(size_t) i];
+                        const SparseDist& Q = qd[(size_t) i];
+                        for (int a = 0; a < P.n; ++a) res += std::max(pw[(size_t) i] * P.p[a] - Q.of(P.ids[a]), 0.0);
+                        h = res + 1.0 - pw[(size_t) i] > 0.0 ? res / (res + 1.0 - pw[(size_t) i]) : 1.0;
+                    }
+                    if (std::uniform_real_distribution<double>(0.0, 1.0)(srng) <= h) tau = i;
+                }
+                if (tau == G) {
+                    picks[tau] = draw(pd[(size_t) tau], srng);
+                } else {
+                    SparseDist r = pd[(size_t) tau];
+                    const SparseDist& Q = qd[(size_t) tau];
+                    double tot = 0.0;
+                    for (int a = 0; a < r.n; ++a) { r.p[a] = std::max(0.0, pw[(size_t) tau] * r.p[a] - Q.of(r.ids[a])); tot += r.p[a]; }
+                    if (tot > 0.0) { for (int a = 0; a < r.n; ++a) r.p[a] /= tot; picks[tau] = draw(r, srng); }
+                    else picks[tau] = draw(pd[(size_t) tau], srng);
+                }
+                acc = tau;
+                draw_counter += W;
+            } else if (spec_s && (int) qd.size() == W - 1 && lookup_rounds_before == lookup_rounds) {
                 // the exact test: draft j kept with min(1, p_j / q_j); at the first rejection a draw from
                 // max(0, p_j - q_j); all kept: a draw from p after the last
                 std::vector<SparseDist> pd;
@@ -848,7 +909,7 @@ int main(int argc, char** argv) {
                 draw_counter += W;
             } else {
                 if (!sample_rows(model.logits(), W, picks)) { failed = true; break; }
-                while (acc + 1 < W && win[acc + 1] == picks[acc]) ++acc;
+                while (acc + 1 < W_real && win[acc + 1] == picks[acc]) ++acc;
                 if (acc_hist && lookup_rounds_before == lookup_rounds && W - 1 <= 16) ++ah[W - 1][acc];
             }
             if (ksel) {   // (this round's commits; a lookup round's not counted)
@@ -911,6 +972,8 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "%s\n", line.c_str());
             }
         }
+        if (conf_stops > 0)
+            std::fprintf(stderr, "strata-dense: %lld rounds drafted fewer by the drafts' confidence (STRATA_DENSE_P_CUM)\n", conf_stops);
         if (rprof && rounds > 0)
             std::fprintf(stderr, "strata-dense: round phases (ms a round): draft %.2f, verify %.2f, accept %.2f, commit %.2f\n",
                          rp[0] / rounds, rp[1] / rounds, rp[2] / rounds, rp[3] / rounds);
@@ -928,6 +991,7 @@ int main(int argc, char** argv) {
                      rounds > lookup_rounds ? draft_ms / (rounds - lookup_rounds) : 0.0);
     }
     cudaFree(d_next);
+    cudaFree(d_conf);
     cudaFree(d_hist);
     // (exit()'s teardown waits on std::cin, which the reader thread still holds in getline while the server keeps
     // the pipe open: the engine sat there until the server killed it 50 s later.  The OS frees the GPU memory.)

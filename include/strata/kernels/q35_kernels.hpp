@@ -110,6 +110,8 @@ void q35_gemv_f32_cols(const float* W, const float* x, int ldx, float* y, int n_
 
 /// out[t] = argmax of row t (n wide, stride ld), ties to the lower id.
 void q35_argmax_rows(const float* x, int64_t ld, int n, int T, int32_t* out, void* stream);
+/// *out = the softmax probability of x[*best] in the row x [n] (a draft's confidence: its top-1, *best its argmax).
+void q35_top1_prob(const float* x, int n, const int32_t* best, float* out, void* stream);
 
 /// y += x, n values
 void q35_add(float* y, const float* x, int64_t n, void* stream);

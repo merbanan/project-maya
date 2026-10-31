@@ -1079,6 +1079,29 @@ void q35_gemv_f32_cols(const float* W, const float* x, int ldx, float* y, int n_
     check("q35_gemv_f32_cols");
 }
 
+namespace {
+// softmax probability of the row's argmax: 1 / sum_j exp(x_j - x_best) (one block of 1024)
+__global__ void top1_prob_kernel(const float* x, int n, const int32_t* best, float* out) {
+    __shared__ float red[32];
+    const float xb = x[*best];
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s += __expf(x[i] - xb);
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = s;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : 0.0f;
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+        if (threadIdx.x == 0) *out = 1.0f / v;
+    }
+}
+}  // namespace
+
+void q35_top1_prob(const float* x, int n, const int32_t* best, float* out, void* stream) {
+    top1_prob_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, n, best, out);
+    check("q35_top1_prob");
+}
+
 void q35_argmax_rows(const float* x, int64_t ld, int n, int T, int32_t* out, void* stream) {
     // (two steps over a long row - STRATA_DENSE_ARGMAX_MB=0: one block of 1024 a row)
     static const bool mb = !(std::getenv("STRATA_DENSE_ARGMAX_MB") && std::atoi(std::getenv("STRATA_DENSE_ARGMAX_MB")) == 0);
