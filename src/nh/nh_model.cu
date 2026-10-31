@@ -486,8 +486,8 @@ struct Model::Impl {
             !dalloc(rowidx, R, err) || !dalloc(invrow, R, err) || !dalloc(ident, (size_t) g.k_exp, err) ||
             !dalloc(lg, (size_t) head_rows * g.vocab, err))
             return false;
-        if (mtp_on && (!dalloc(hn, C * g.dim, err) || !dalloc(m_cat, (size_t) kMvRows * 2 * g.dim, err) ||
-                       !dalloc(m_cat16, (size_t) kMvRows * 2 * g.dim, err) || !dalloc(m_pend, (size_t) g.dim, err) ||
+        if (mtp_on && (!dalloc(hn, C * g.dim, err) || !dalloc(m_cat, C * 2 * g.dim, err) ||
+                       !dalloc(m_cat16, C * 2 * g.dim, err) || !dalloc(m_pend, (size_t) g.dim, err) ||
                        !dalloc(m_hid, (size_t) g.dim, err) || !dalloc(m_best, 1, err) || !dalloc(m_conf, 1, err)))
             return false;
         {
