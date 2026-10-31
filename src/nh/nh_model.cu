@@ -572,8 +572,8 @@ struct Model::Impl {
             j.xf = xf;
             j.y = dst;
             j.ncol = T;
-            j.xf_cs = (size_t) m.k * 4;
-            j.y_cs = (size_t) m.n * 4;
+            j.xf_cs = (size_t) m.k;   // (floats)
+            j.y_cs = (size_t) m.n;
             if (!x3::mv(&j, 1, s)) {
                 err = "exl3 mv failed (k " + std::to_string(m.k) + ", n " + std::to_string(m.n) + ")";
                 return false;
