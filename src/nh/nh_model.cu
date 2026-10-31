@@ -125,12 +125,14 @@ struct Geo {
 
 struct Layer {
     char type = 'M';
+    std::string pre;   // its tensors' prefix ("language_model.backbone.layers.N." or the MTP block's)
     float* norm = nullptr;
     // M
     x3::Mat in, out;
     float *conv_w = nullptr, *conv_b = nullptr, *A = nullptr, *D = nullptr, *dt_bias = nullptr, *gnorm = nullptr;
     float *tail = nullptr, *ssm = nullptr;   // the sequence's state
     float *tail_s = nullptr, *ssm_s = nullptr;   // (snapshot)
+    float *tail_v = nullptr, *ssm_v = nullptr, *zv = nullptr;   // (a verify pass: the state before it, its in_proj rows)
     // A
     x3::Mat q, k, v, o;
     uint16_t *kc = nullptr, *vc = nullptr;
@@ -175,6 +177,17 @@ struct Model::Impl {
     float *q = nullptr, *kk = nullptr, *vv = nullptr, *att = nullptr, *part = nullptr;
     float *logit = nullptr, *w = nullptr, *lat = nullptr, *lacc = nullptr, *su = nullptr, *eh = nullptr, *ey = nullptr;
     float* lg = nullptr;
+    // the MTP block (Options::mtp, the pack's mtp 1): its fusion and norms; the final hidden rows of the last forward
+    // (norm_f applied: what the block reads), the waiting row (the last one whose next token is not known yet)
+    bool mtp_on = false;
+    x3::Mat eh_proj;
+    float *m_enorm = nullptr, *m_hnorm = nullptr, *m_fnorm = nullptr;
+    float *hn = nullptr, *m_cat = nullptr, *m_pend = nullptr, *m_hid = nullptr, *m_conf = nullptr;
+    uint16_t* m_cat16 = nullptr;
+    int* m_best = nullptr;
+    int64_t m_pend_pos = -1;
+    int hn_rows = 0;           // (rows of hn the last forward left)
+    int verify_T = 0;          // a verify pass's rows waiting for commit()
     uint16_t *xn16 = nullptr, *y16 = nullptr, *att16 = nullptr, *su16 = nullptr, *lat16 = nullptr, *eh16 = nullptr;
     int *pos = nullptr, *top = nullptr, *kept = nullptr, *rowidx = nullptr, *invrow = nullptr, *ident = nullptr;
     float* emb_h = nullptr;   // pinned [chunk][dim]
@@ -306,7 +319,7 @@ struct Model::Impl {
 
     // one expert's blob (the layout above) assembled from the mapped files into dst
     void assemble(int li, int e, uint8_t* dst) const {
-        const std::string m = P + "layers." + std::to_string(li) + ".mixer.experts." + std::to_string(e) + ".";
+        const std::string m = L[(size_t) li].pre + "mixer.experts." + std::to_string(e) + ".";
         const auto put = [&](const std::string& n, size_t off) {
             const mm3::Tensor* t = pk.get(m + n);
             std::memcpy(dst + off, pk.data(*t), t->bytes);
@@ -367,13 +380,17 @@ struct Model::Impl {
             o_dv = o_ds + up((size_t) g.ff * 2);
             blob = o_dv + up((size_t) g.lat * 2);
         }
-        // the layers' dense parts
-        L.resize((size_t) g.n_layers);
+        // the layers' dense parts (and the MTP block's two layers after them: attention, then MoE)
+        mtp_on = o.mtp && pk.num("mtp", 0) > 0;
+        L.resize((size_t) g.n_layers + (mtp_on ? 2 : 0));
         const auto softneg = [](float v) { return -std::exp(v); };   // A = -exp(A_log)
-        for (int li = 0; li < g.n_layers; ++li) {
+        for (int li = 0; li < (int) L.size(); ++li) {
             Layer& l = L[(size_t) li];
-            l.type = g.types[(size_t) li];
-            const std::string pre = P + "layers." + std::to_string(li) + ".";
+            const bool mt = li >= g.n_layers;
+            l.type = mt ? (li == g.n_layers ? 'A' : 'E') : g.types[(size_t) li];
+            l.pre = mt ? "language_model.mtp.layers." + std::to_string(li - g.n_layers) + "."
+                       : P + "layers." + std::to_string(li) + ".";
+            const std::string& pre = l.pre;
             const std::string m = pre + "mixer.";
             if (!(l.norm = upload_f32(pre + "norm.weight", (size_t) g.dim, err))) return false;
             if (l.type == 'M') {
@@ -396,6 +413,10 @@ struct Model::Impl {
                     !dalloc(l.ssm, (size_t) g.mh * g.mp * g.mn, err) ||
                     !dalloc(l.tail_s, (size_t) g.conv_dim() * k::kConvTail, err) ||
                     !dalloc(l.ssm_s, (size_t) g.mh * g.mp * g.mn, err))
+                    return false;
+                if (mtp_on && (!dalloc(l.tail_v, (size_t) g.conv_dim() * k::kConvTail, err) ||
+                               !dalloc(l.ssm_v, (size_t) g.mh * g.mp * g.mn, err) ||
+                               !dalloc(l.zv, (size_t) kMvRows * g.proj(), err)))
                     return false;
             } else if (l.type == 'A') {
                 const std::pair<x3::Mat*, const char*> mats[] = {{&l.q, "q_proj"}, {&l.k, "k_proj"},
@@ -432,6 +453,19 @@ struct Model::Impl {
         head = upload_mat("language_model.lm_head", err);
         if (!err.empty()) return false;
         if (!(norm_f = upload_f32(P + "norm_f.weight", (size_t) g.dim, err))) return false;
+        if (mtp_on) {   // the MTP block's fusion and final norm
+            const std::string M = "language_model.mtp.layers.";
+            eh_proj = upload_mat(M + "0.eh_proj", err);
+            if (!err.empty()) return false;
+            if (eh_proj.k != 2 * g.dim || eh_proj.n != g.dim) {
+                err = "mtp eh_proj: not 2 x hidden -> hidden";
+                return false;
+            }
+            if (!(m_enorm = upload_f32(M + "0.enorm.weight", (size_t) g.dim, err)) ||
+                !(m_hnorm = upload_f32(M + "0.hnorm.weight", (size_t) g.dim, err)) ||
+                !(m_fnorm = upload_f32(M + "1.final_layernorm.weight", (size_t) g.dim, err)))
+                return false;
+        }
         // scratch
         const size_t C = (size_t) o.chunk, R = C * g.k_exp;
         nblk_max = (o.max_ctx + kBlk - 1) / kBlk;
@@ -451,6 +485,10 @@ struct Model::Impl {
             !dalloc(eh, R * g.ff, err) || !dalloc(eh16, R * g.ff, err) || !dalloc(ey, R * g.lat, err) ||
             !dalloc(rowidx, R, err) || !dalloc(invrow, R, err) || !dalloc(ident, (size_t) g.k_exp, err) ||
             !dalloc(lg, (size_t) head_rows * g.vocab, err))
+            return false;
+        if (mtp_on && (!dalloc(hn, C * g.dim, err) || !dalloc(m_cat, (size_t) kMvRows * 2 * g.dim, err) ||
+                       !dalloc(m_cat16, (size_t) kMvRows * 2 * g.dim, err) || !dalloc(m_pend, (size_t) g.dim, err) ||
+                       !dalloc(m_hid, (size_t) g.dim, err) || !dalloc(m_best, 1, err) || !dalloc(m_conf, 1, err)))
             return false;
         {
             std::vector<int> id((size_t) g.k_exp);
@@ -490,7 +528,7 @@ struct Model::Impl {
     bool place_experts(std::string& err) {
         int n_moe = 0;
         for (const Layer& l : L) n_moe += l.type == 'E';
-        prof.assign((size_t) g.n_layers * g.n_exp, 0);
+        prof.assign(L.size() * g.n_exp, 0);
         std::vector<unsigned> pr;
         if (!o.profile.empty()) {
             std::ifstream f(o.profile, std::ios::binary);
@@ -588,18 +626,25 @@ struct Model::Impl {
     bool mamba(Layer& l, int T, std::string& err) {
         if (!mat(l.in, xn, xn16, T, zx, false, err)) return false;
         const int P_ = g.proj(), DI = g.d_in(), CD = g.conv_dim();
+        if (verify_T > 0) {   // (a verify pass: the state before it and its in_proj rows, for commit()'s replay)
+            CK(cudaMemcpyAsync(l.tail_v, l.tail, (size_t) CD * k::kConvTail * 4, cudaMemcpyDeviceToDevice, s));
+            CK(cudaMemcpyAsync(l.ssm_v, l.ssm, (size_t) g.mh * g.mp * g.mn * 4, cudaMemcpyDeviceToDevice, s));
+            CK(cudaMemcpyAsync(l.zv, zx, (size_t) T * P_ * 4, cudaMemcpyDeviceToDevice, s));
+        }
         k::conv_silu(zx + DI, P_, T, CD, l.conv_w, l.conv_b, l.tail, xbc, s);
         k::ssm_scan(xbc, T, g.mh, g.mp, g.mg, g.mn, zx + DI + CD, P_, l.dt_bias, l.A, l.D, l.ssm, y, s);
         k::gated_norm(y, zx, P_, T, DI, DI / g.mg, l.gnorm, g.eps, y, y16, s);
         return mat(l.out, y, y16, T, h, true, err);
     }
 
-    bool attention(Layer& l, int T, std::string& err) {
+    bool attention(Layer& l, int T, std::string& err) { return attention_at(l, T, cur, err); }
+    // T rows at positions p0 .. p0 + T - 1 (pos holds them)
+    bool attention_at(Layer& l, int T, int64_t p0, std::string& err) {
         if (!mat(l.q, xn, xn16, T, q, false, err) || !mat(l.k, xn, xn16, T, kk, false, err) ||
             !mat(l.v, xn, xn16, T, vv, false, err))
             return false;
         k::kv_store(kk, vv, pos, T, g.hkv, l.kc, l.vc, s);
-        const int nblk = (cur + T - 1) / kBlk + 1;
+        const int nblk = (int) ((p0 + T - 1) / kBlk + 1);
         k::kept_all(pos, T, g.hkv, nblk, kBlk, kept, s);
         const bool split = T <= kMvRows;
         mk::sparse_attn(q, l.kc, l.vc, kept, pos, T, g.hq, g.hkv, nblk, kBlk, 1.0f / std::sqrt((float) g.hd), att, s,
@@ -812,6 +857,48 @@ struct Model::Impl {
     }
 
     bool chunk(const int* ids, int T, int want, float* logits, std::string& err) {
+        if (!embed_rows(ids, T, err)) return false;
+        mk::iota(pos, T, cur, s);
+        ++fwd;
+        for (int li = 0; li < g.n_layers; ++li) {
+            Layer& l = L[(size_t) li];
+            mk::rms(h, l.norm, T, g.dim, g.eps, xn, xn16, s);
+            const bool ok = l.type == 'M' ? mamba(l, T, err) : l.type == 'A' ? attention(l, T, err) : moe(l, li, T, err);
+            if (!ok) return false;
+        }
+        if (verify_T == 0) cur += T;
+        // the final norm: every row's when the MTP block reads them, else the wanted rows'
+        const float* hrows = nullptr;
+        if (mtp_on) {
+            mk::rms(h, norm_f, T, g.dim, g.eps, hn, nullptr, s);
+            hn_rows = T;
+            hrows = hn + (size_t) (T - want) * g.dim;
+        }
+        if (want > 0) {
+            for (int r0 = 0; r0 < want; r0 += head_rows) {
+                const int n = std::min(head_rows, want - r0);
+                if (hrows) {
+                    mk::to_f16(hrows + (size_t) r0 * g.dim, n, g.dim, g.dim, xn16, g.dim, s);
+                    if (!mat(head, hrows + (size_t) r0 * g.dim, xn16, n, lg, false, err)) return false;
+                } else {
+                    mk::rms(h + (size_t) (T - want + r0) * g.dim, norm_f, n, g.dim, g.eps, xn, xn16, s);
+                    if (!mat(head, xn, xn16, n, lg, false, err)) return false;
+                }
+                CK(cudaMemcpyAsync(lg_h, lg, (size_t) n * g.vocab * 4, cudaMemcpyDeviceToHost, s));
+                CK(cudaStreamSynchronize(s));
+                std::memcpy(logits + (size_t) r0 * g.vocab, lg_h, (size_t) n * g.vocab * 4);
+            }
+        }
+        CK(cudaStreamSynchronize(s));
+        if (x3::launch_errors() != 0) {
+            err = "an EXL3 kernel did not launch (see stderr)";
+            return false;
+        }
+        return true;
+    }
+
+    // the embeddings (BF16 rows of the mapped file) as F32 into h
+    bool embed_rows(const int* ids, int T, std::string& err) {
         // the embeddings (BF16 rows of the mapped file) as F32
         const mm3::Tensor* et = pk.get(P + "embeddings.weight");
         const uint16_t* E = (const uint16_t*) pk.data(*et);
@@ -828,36 +915,25 @@ struct Model::Impl {
             }
         }
         CK(cudaMemcpyAsync(h, emb_h, (size_t) T * g.dim * 4, cudaMemcpyHostToDevice, s));
-        mk::iota(pos, T, cur, s);
-        ++fwd;
-        for (int li = 0; li < g.n_layers; ++li) {
-            Layer& l = L[(size_t) li];
-            mk::rms(h, l.norm, T, g.dim, g.eps, xn, xn16, s);
-            const bool ok = l.type == 'M' ? mamba(l, T, err) : l.type == 'A' ? attention(l, T, err) : moe(l, li, T, err);
-            if (!ok) return false;
-        }
-        cur += T;
-        if (want > 0) {
-            for (int r0 = 0; r0 < want; r0 += head_rows) {
-                const int n = std::min(head_rows, want - r0);
-                const float* hr = h + (size_t) (T - want + r0) * g.dim;
-                mk::rms(hr, norm_f, n, g.dim, g.eps, xn, xn16, s);
-                if (!mat(head, xn, xn16, n, lg, false, err)) return false;
-                CK(cudaMemcpyAsync(lg_h, lg, (size_t) n * g.vocab * 4, cudaMemcpyDeviceToHost, s));
-                CK(cudaStreamSynchronize(s));
-                std::memcpy(logits + (size_t) r0 * g.vocab, lg_h, (size_t) n * g.vocab * 4);
-            }
-        }
-        CK(cudaStreamSynchronize(s));
-        if (x3::launch_errors() != 0) {
-            err = "an EXL3 kernel did not launch (see stderr)";
-            return false;
-        }
         return true;
     }
 
-    bool forward(const int* ids, int n, int pos0, int want, float* logits, std::string& err) {
+    bool forward(const int* ids, int n, int pos0, int want, float* logits, std::string& err, bool verify = false) {
         CK(cudaSetDevice(dev));
+        if (verify_T > 0) {
+            err = "forward: a verify pass waits for commit()";
+            return false;
+        }
+        if (verify) {   // (one pass of at most kMvRows tokens, the state kept for commit)
+            if (!mtp_on || n > kMvRows || pos0 != cur || pos0 + n > o.max_ctx) {
+                err = "verify: at most " + std::to_string(kMvRows) + " tokens at the state's position, with --mtp";
+                return false;
+            }
+            verify_T = n;
+            const bool ok = chunk(ids, n, std::min(want, n), logits, err);
+            if (!ok) verify_T = 0;
+            return ok;
+        }
         if (pos0 == 0 && cur != 0) reset();
         if (pos0 != cur) {
             err = "forward at " + std::to_string(pos0) + ": the state is at " + std::to_string(cur);
@@ -868,6 +944,13 @@ struct Model::Impl {
             return false;
         }
         want = std::min(want, n);
+        // (the MTP block's waiting row: its next token is this call's first)
+        if (mtp_on && pos0 > 0 && m_pend_pos == (int64_t) pos0 - 1) {
+            int b;
+            float c;
+            if (!mtp_rows(ids, m_pend, m_pend_pos, 1, false, &b, &c, err)) return false;
+            m_pend_pos = -1;
+        }
         for (int i = 0; i < n;) {
             const int T = std::min(o.chunk, n - i);
             // this chunk's rows among the call's last `want`: [max(i, n - want), i + T)
@@ -875,7 +958,114 @@ struct Model::Impl {
             const int w_here = std::max(0, i + T - first);
             float* dst = logits && w_here > 0 ? logits + (size_t) (first - (n - want)) * g.vocab : nullptr;
             if (!chunk(ids + i, T, dst ? w_here : 0, dst, err)) return false;
+            // the chunk's rows into the MTP block (each with its next token; the call's last row waits)
+            if (mtp_on && !mtp_inject(T, pos0 + i, ids + i + 1, i + T < n ? T : T - 1, err)) return false;
             i += T;
+        }
+        return true;
+    }
+
+    // keep the first n rows of the verify pass: the Mamba layers back to their state before it, their recurrence run
+    // again over the n rows from its stashed in_proj rows (all kept: nothing to do); the KV rows stay by position
+    bool commit(int n, std::string& err) {
+        const int T = verify_T;
+        if (T == 0 || n < 1 || n > T) {
+            err = "commit: no verify pass of that many rows";
+            return false;
+        }
+        if (n < T) {
+            const int P_ = g.proj(), DI = g.d_in(), CD = g.conv_dim();
+            for (Layer& l : L) {
+                if (l.type != 'M') continue;
+                CK(cudaMemcpyAsync(l.tail, l.tail_v, (size_t) CD * k::kConvTail * 4, cudaMemcpyDeviceToDevice, s));
+                CK(cudaMemcpyAsync(l.ssm, l.ssm_v, (size_t) g.mh * g.mp * g.mn * 4, cudaMemcpyDeviceToDevice, s));
+                k::conv_silu(l.zv + DI, P_, n, CD, l.conv_w, l.conv_b, l.tail, xbc, s);
+                k::ssm_scan(xbc, n, g.mh, g.mp, g.mg, g.mn, l.zv + DI + CD, P_, l.dt_bias, l.A, l.D, l.ssm, y, s);
+            }
+        }
+        verify_T = 0;
+        cur += n;
+        CK(cudaStreamSynchronize(s));
+        return true;
+    }
+
+    // ---- the MTP block: rows of (the token at p + 1, the trunk's normed hidden row at p) at positions p0 ..; its own
+    // KV cache gets their rows; the last row's draft (argmax of its logits) and confidence (softmax probability) when
+    // `draft`, and its normed output row into m_hid (the next draft step's hidden)
+    bool mtp_rows(const int* toks, const float* hid, int64_t p0, int n, bool draft, int* best, float* conf,
+                  std::string& err) {
+        if (!embed_rows(toks, n, err)) return false;
+        const int D = g.dim;
+        mk::rms(h, m_enorm, n, D, g.eps, xn, nullptr, s);
+        CK(cudaMemcpy2DAsync(m_cat, (size_t) 2 * D * 4, xn, (size_t) D * 4, (size_t) D * 4, n, cudaMemcpyDeviceToDevice, s));
+        mk::rms(hid, m_hnorm, n, D, g.eps, xn, nullptr, s);
+        CK(cudaMemcpy2DAsync(m_cat + D, (size_t) 2 * D * 4, xn, (size_t) D * 4, (size_t) D * 4, n, cudaMemcpyDeviceToDevice, s));
+        mk::to_f16(m_cat, n, 2 * D, 2 * D, m_cat16, 2 * D, s);
+        if (!mat(eh_proj, m_cat, m_cat16, n, h, false, err)) return false;
+        mk::iota(pos, n, (int) p0, s);
+        Layer& la = L[(size_t) g.n_layers];
+        mk::rms(h, la.norm, n, D, g.eps, xn, xn16, s);
+        if (!attention_at(la, n, p0, err)) return false;
+        Layer& le = L[(size_t) g.n_layers + 1];
+        mk::rms(h, le.norm, n, D, g.eps, xn, xn16, s);
+        if (!moe(le, g.n_layers + 1, n, err)) return false;
+        k::layer_norm(h + (size_t) (n - 1) * D, m_fnorm, 1, D, g.eps, m_hid, s);
+        if (draft) {
+            if (!mat(head, m_hid, nullptr, 1, lg, false, err)) return false;
+            k::argmax_prob(lg, g.vocab, m_best, m_conf, s);
+            CK(cudaMemcpyAsync(best, m_best, 4, cudaMemcpyDeviceToHost, s));
+            CK(cudaMemcpyAsync(conf, m_conf, 4, cudaMemcpyDeviceToHost, s));
+        }
+        CK(cudaStreamSynchronize(s));
+        return true;
+    }
+
+    // the last forward's rows 0 .. n - 1 (positions p0 ..) into the MTP block: row j with next[j] for j < known; the last
+    // row, when its next token is not known yet (known = n - 1), waits for mtp_draft's anchor
+    bool mtp_inject(int n, int64_t p0, const int* next, int known, std::string& err) {
+        if (!mtp_on || n <= 0) return true;
+        if (n > hn_rows) {
+            err = "mtp_inject: the last forward left " + std::to_string(hn_rows) + " hidden rows";
+            return false;
+        }
+        known = std::max(0, std::min(known, n));
+        if (known < n) {   // (before the block runs: it rewrites hn's neighbours' buffers, not hn)
+            CK(cudaMemcpyAsync(m_pend, hn + (size_t) (n - 1) * g.dim, (size_t) g.dim * 4, cudaMemcpyDeviceToDevice, s));
+            m_pend_pos = p0 + n - 1;
+        } else {
+            m_pend_pos = -1;
+        }
+        for (int r = 0; r < known;) {   // (the block's rows in runs of at most a chunk)
+            const int m = std::min(o.chunk, known - r);
+            int b;
+            float c;
+            if (!mtp_rows(next + r, hn + (size_t) r * g.dim, p0 + r, m, false, &b, &c, err)) return false;
+            r += m;
+        }
+        return true;
+    }
+
+    // up to K drafts after `anchor` (the token at pos(), the waiting row's): a chain of the block, each step's draft
+    // its argmax; stops after a draft whose running product of confidences is below p_cut (> 0); conf gets each one's
+    bool mtp_draft(int anchor, int K, double p_cut, std::vector<int>& out, std::vector<float>& conf, std::string& err) {
+        out.clear();
+        conf.clear();
+        if (!mtp_on || K < 1 || m_pend_pos != (int64_t) cur - 1) return true;   // (no waiting row: no drafts)
+        int tok = anchor;
+        const float* hid = m_pend;
+        const int64_t p0 = m_pend_pos;
+        double prod = 1.0;
+        for (int k = 0; k < K; ++k) {
+            int b = 0;
+            float c = 0.0f;
+            if (!mtp_rows(&tok, hid, p0 + k, 1, true, &b, &c, err)) return false;
+            m_pend_pos = -1;   // (the waiting row is the block's now: its K / V at p0)
+            out.push_back(b);
+            conf.push_back(c);
+            prod *= c;
+            if (p_cut > 0.0 && prod < p_cut) break;
+            tok = b;
+            hid = m_hid;   // (the block's own output: the next step's hidden)
         }
         return true;
     }
@@ -913,6 +1103,18 @@ Model::~Model() { delete p; }
 bool Model::load(const Options& o, std::string& err) { return p->load(o, err); }
 bool Model::forward(const int* ids, int n, int pos0, int want, float* logits_out, std::string& err) {
     return p->forward(ids, n, pos0, want, logits_out, err);
+}
+bool Model::verify(const int* ids, int n, int want, float* logits_out, std::string& err) {
+    return p->forward(ids, n, p->cur, want, logits_out, err, true);
+}
+bool Model::commit(int k, std::string& err) { return p->commit(k, err); }
+bool Model::has_mtp() const { return p->mtp_on; }
+bool Model::mtp_inject(int n, int p0, const int* next, int known, std::string& err) {
+    return p->mtp_inject(n, p0, next, known, err);
+}
+bool Model::mtp_draft(int anchor, int K, double p_cut, std::vector<int>& out, std::vector<float>& conf,
+                      std::string& err) {
+    return p->mtp_draft(anchor, K, p_cut, out, conf, err);
 }
 int Model::pos() const { return p->cur; }
 bool Model::snapshot(std::string& err) { return p->snapshot(err); }

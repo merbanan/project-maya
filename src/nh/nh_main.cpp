@@ -297,7 +297,8 @@ int usage() {
 int main(int argc, char** argv) {
     nh::Options o;
     std::string ids_arg, dump, prof_out;
-    int gen = 0, last = 1, split = 0;
+    int gen = 0, last = 1, split = 0, spec = 0;
+    double p_cut = 0.0;
     bool serve_mode = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -319,6 +320,8 @@ int main(int argc, char** argv) {
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(next()) - 1;   // (N threads: N - 1 workers)
         else if (a == "--split") split = std::atoi(next());
         else if (a == "--serve") serve_mode = true;
+        else if (a == "--mtp") { spec = std::atoi(next()); o.mtp = spec > 0; }   // (drafts a round, the MTP block's)
+        else if (a == "--p-cum") p_cut = std::atof(next());
         else if (a == "-v" || a == "--verbose") o.verbose = true;
         else return usage();
     }
@@ -379,7 +382,51 @@ int main(int argc, char** argv) {
         std::fwrite(lg.data(), 4, lg.size(), f);
         std::fclose(f);
     }
-    if (gen > 0) {
+    if (gen > 0 && spec > 0 && m.has_mtp()) {   // greedy, speculative: MTP drafts verified in one pass a round
+        const auto argmax = [&](const float* r) { return (int) (std::max_element(r, r + V) - r); };
+        std::vector<float> lw((size_t) 9 * V);
+        int anchor = argmax(lg.data() + (size_t) (last - 1) * V);
+        std::vector<int> out, d;
+        std::vector<float> cf;
+        long long rounds = 0, drafted = 0, kept = 0;
+        const std::vector<int> eos = m.eos();
+        const double g0 = now();
+        while ((int) out.size() < gen) {
+            out.push_back(anchor);
+            if (std::find(eos.begin(), eos.end(), anchor) != eos.end() || (int) out.size() >= gen) break;
+            const int pos = m.pos();
+            if (!m.mtp_draft(anchor, std::min(spec, 7), p_cut, d, cf, err)) {
+                std::fprintf(stderr, "maya-nh: draft: %s\n", err.c_str());
+                return 1;
+            }
+            std::vector<int> win(1, anchor);
+            win.insert(win.end(), d.begin(), d.end());
+            const int W = (int) win.size();
+            if (!m.verify(win.data(), W, W, lw.data(), err)) {
+                std::fprintf(stderr, "maya-nh: verify: %s\n", err.c_str());
+                return 1;
+            }
+            int acc = 0;
+            while (acc + 1 < W && win[acc + 1] == argmax(lw.data() + (size_t) acc * V)) ++acc;
+            const int next_tok = argmax(lw.data() + (size_t) acc * V);
+            if (!m.commit(acc + 1, err) || !m.mtp_inject(acc + 1, pos, win.data() + 1, acc, err)) {
+                std::fprintf(stderr, "maya-nh: commit: %s\n", err.c_str());
+                return 1;
+            }
+            ++rounds;
+            drafted += W - 1;
+            kept += acc;
+            for (int j = 1; j <= acc && (int) out.size() < gen; ++j) out.push_back(win[j]);
+            anchor = next_tok;
+        }
+        const double g1 = now();
+        std::printf("gen:");
+        for (int t : out) std::printf(" %d", t);
+        std::printf("\n");
+        std::fprintf(stderr, "decode (MTP %d): %zu tokens in %.2f s (%.2f tok/s), %lld rounds, %lld of %lld drafts kept "
+                     "(%.2f tokens a round)\n", spec, out.size(), g1 - g0, out.size() / std::max(1e-9, g1 - g0), rounds,
+                     kept, drafted, rounds ? (double) (kept + rounds) / rounds : 0.0);
+    } else if (gen > 0) {
         std::vector<float> one((size_t) V);
         int nxt = (int) (std::max_element(lg.end() - V, lg.end()) - (lg.end() - V));
         const double g0 = now();

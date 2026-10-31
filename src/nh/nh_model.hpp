@@ -26,6 +26,7 @@ struct Options {
     bool pin_pool = true;       // the experts not in VRAM in pinned host memory (else assembled from the files a miss)
     int cpu_threads = -2;       // the CPU lane's workers besides the caller (-1: none - a decode's misses are staged;
                                 // -2: this host's, CpuLane::auto_workers)
+    bool mtp = false;           // load the MTP block (the pack's): speculative decoding with forward(verify) / commit
     bool verbose = false;
 };
 
@@ -52,6 +53,17 @@ public:
     /// of at most Options::chunk; logits_out (if given) gets the logits of the last `want` positions of this call,
     /// [want][vocab] F32.
     bool forward(const int* ids, int n, int pos0, int want, float* logits_out, std::string& err);
+    /// A verify pass (Options::mtp): n <= 8 tokens at pos(), their logits (want of them); the position stays and the
+    /// Mamba state is kept as it was until commit(k) keeps the first k (1 <= k <= n) - the KV rows stay by position.
+    bool verify(const int* ids, int n, int want, float* logits_out, std::string& err);
+    bool commit(int k, std::string& err);
+    /// The MTP block (Options::mtp): the last forward's rows 0 .. n - 1 (positions p0 ..) into it - row j with its next
+    /// token next[j] for j < known; a last row whose next token is not known yet (known = n - 1) waits for the anchor.
+    bool has_mtp() const;
+    bool mtp_inject(int n, int p0, const int* next, int known, std::string& err);
+    /// Up to K greedy drafts after `anchor` (the token at pos()): stops after the draft whose running product of
+    /// confidences (each its softmax probability) falls below p_cut (0: never); conf gets each draft's.
+    bool mtp_draft(int anchor, int K, double p_cut, std::vector<int>& out, std::vector<float>& conf, std::string& err);
     /// The positions the state holds (the next token's).
     int pos() const;
     /// Keeps the Mamba state at pos() (the KV cache keeps its rows by position: nothing to copy) - restore() goes back

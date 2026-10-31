@@ -203,7 +203,105 @@ __global__ void relu2_kernel(const float* u, size_t n, float* hf, uint16_t* h16)
     if (h16) h16[i] = __half_as_ushort(__float2half_rn(v));
 }
 
+__global__ void __launch_bounds__(256) layer_norm_kernel(const float* x, const float* w, int D, float eps, float* out) {
+    const float* r = x + (size_t) blockIdx.x * D;
+    __shared__ float red[8];
+    __shared__ float stat;
+    float a = 0.0f;
+    for (int i = threadIdx.x; i < D; i += 256) a += r[i];
+    for (int m = 16; m > 0; m >>= 1) a += __shfl_xor_sync(0xffffffffu, a, m);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = a;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.0f;
+        for (int i = 0; i < 8; ++i) t += red[i];
+        stat = t / (float) D;
+    }
+    __syncthreads();
+    const float mean = stat;
+    float v = 0.0f;
+    for (int i = threadIdx.x; i < D; i += 256) v = fmaf(r[i] - mean, r[i] - mean, v);
+    for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+    __syncthreads();
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = v;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.0f;
+        for (int i = 0; i < 8; ++i) t += red[i];
+        stat = rsqrtf(t / (float) D + eps);
+    }
+    __syncthreads();
+    const float inv = stat;
+    for (int i = threadIdx.x; i < D; i += 256) out[(size_t) blockIdx.x * D + i] = (r[i] - mean) * inv * w[i];
+}
+
+__global__ void __launch_bounds__(1024) argmax_prob_kernel(const float* x, int n, int* best, float* prob) {
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    __shared__ float tot[32];
+    float v = -INFINITY;
+    int id = 0x7fffffff;
+    for (int i = threadIdx.x; i < n; i += 1024)
+        if (better(x[i], i, v, id)) {
+            v = x[i];
+            id = i;
+        }
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, v, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, id, o);
+        if (better(ov, oi, v, id)) {
+            v = ov;
+            id = oi;
+        }
+    }
+    if ((threadIdx.x & 31) == 0) {
+        bv[threadIdx.x >> 5] = v;
+        bi[threadIdx.x >> 5] = id;
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        v = bv[threadIdx.x];
+        id = bi[threadIdx.x];
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, v, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, id, o);
+            if (better(ov, oi, v, id)) {
+                v = ov;
+                id = oi;
+            }
+        }
+        if (threadIdx.x == 0) {
+            bv[0] = v;
+            bi[0] = id;
+        }
+    }
+    __syncthreads();
+    const float m = bv[0];
+    float z = 0.0f;
+    for (int i = threadIdx.x; i < n; i += 1024) z += expf(x[i] - m);
+    for (int o = 16; o > 0; o >>= 1) z += __shfl_xor_sync(0xffffffffu, z, o);
+    if ((threadIdx.x & 31) == 0) tot[threadIdx.x >> 5] = z;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.0f;
+        for (int i = 0; i < 32; ++i) t += tot[i];
+        *best = bi[0];
+        *prob = 1.0f / t;
+    }
+}
+
 }  // namespace
+
+void layer_norm(const float* x, const float* w, int rows, int D, float eps, float* out, cudaStream_t s) {
+    if (rows <= 0) return;
+    layer_norm_kernel<<<rows, 256, 0, s>>>(x, w, D, eps, out);
+    check("layer_norm");
+}
+
+void argmax_prob(const float* x, int n, int* best, float* prob, cudaStream_t s) {
+    argmax_prob_kernel<<<1, 1024, 0, s>>>(x, n, best, prob);
+    check("argmax_prob");
+}
 
 void conv_silu(const float* x, int ldx, int T, int C, const float* w, const float* bias, float* tail, float* out,
                cudaStream_t s) {

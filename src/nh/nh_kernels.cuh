@@ -45,6 +45,13 @@ void kv_store(const float* k, const float* v, const int* pos, int T, int Hkv, ui
 /// over them is exact causal attention.
 void kept_all(const int* pos, int T, int Hkv, int nblk, int blk, int* kept, cudaStream_t s);
 
+/// LayerNorm (no bias): out = (x - mean) / sqrt(var + eps) * w per row of D (the MTP block's final norm, llama.cpp's
+/// LLM_NORM for Nemotron-H's MTP head).
+void layer_norm(const float* x, const float* w, int rows, int D, float eps, float* out, cudaStream_t s);
+
+/// *best = the argmax of x [n] (ties: the lower id), *prob = its softmax probability (one block).
+void argmax_prob(const float* x, int n, int* best, float* prob, cudaStream_t s);
+
 /// h = relu(u)^2 over n values: F32 into hf and / or FP16 into h16 (either may be null).
 void relu2(const float* u, size_t n, float* hf, uint16_t* h16, cudaStream_t s);
 
