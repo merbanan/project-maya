@@ -18,12 +18,14 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <numeric>
 #include <sstream>
 
 #include "mm3_exl3.hpp"
 #include "mm3_kernels.cuh"
 #include "mm3_pack.hpp"
+#include "nh_cpu.hpp"
 #include "nh_kernels.cuh"
 
 namespace nh {
@@ -176,6 +178,11 @@ struct Model::Impl {
     uint16_t *xn16 = nullptr, *y16 = nullptr, *att16 = nullptr, *su16 = nullptr, *lat16 = nullptr, *eh16 = nullptr;
     int *pos = nullptr, *top = nullptr, *kept = nullptr, *rowidx = nullptr, *invrow = nullptr, *ident = nullptr;
     float* emb_h = nullptr;   // pinned [chunk][dim]
+    // the CPU lane (a few tokens' experts not in VRAM): the tokens' latent inputs and weights back on the host, its
+    // part's way to the device, the GPU experts' weights picked out of each token's
+    std::unique_ptr<CpuLane> lane;
+    float *lat_h = nullptr, *w_h = nullptr, *cpu_h = nullptr, *wsel_h = nullptr;
+    float *cpu_d = nullptr, *wsel_d = nullptr;
     int* top_h = nullptr;     // pinned [chunk][k]
     float* lg_h = nullptr;    // pinned [rows][vocab]
     int head_rows = 0;
@@ -215,6 +222,10 @@ struct Model::Impl {
         pinned.push_back(d);
         p = (T*) d;
         return true;
+    }
+
+    static bool kcpu_ok() {
+        return strata::kernels::cpu::exl3_cpu_available();
     }
 
     // ---- loading
@@ -449,6 +460,17 @@ struct Model::Impl {
         if (!halloc(emb_h, C * g.dim, err) || !halloc(top_h, C * g.k_exp, err) ||
             !halloc(lg_h, (size_t) head_rows * g.vocab, err) || !halloc(pin, blob, err))
             return false;
+        if (!halloc(lat_h, (size_t) kMvRows * g.lat, err) || !halloc(w_h, (size_t) kMvRows * g.k_exp, err) ||
+            !halloc(cpu_h, (size_t) kMvRows * g.lat, err) || !halloc(wsel_h, (size_t) kMvRows * g.k_exp, err) ||
+            !dalloc(cpu_d, (size_t) kMvRows * g.lat, err) || !dalloc(wsel_d, (size_t) kMvRows * g.k_exp, err))
+            return false;
+        {
+            const int workers = o.cpu_threads == -2 ? CpuLane::auto_workers() : o.cpu_threads;
+            if (workers >= 0 && o.pin_pool && kcpu_ok()) {
+                lane = std::make_unique<CpuLane>(workers, g.lat, g.ff);
+                st.cpu_threads = workers + 1;
+            }
+        }
         // staging slots
         n_slots = std::max(o.staging, g.k_exp);
         if (!dalloc(stg, (size_t) n_slots * blob, err)) return false;
@@ -637,6 +659,10 @@ struct Model::Impl {
         CK(cudaMemcpyAsync(top_h, top, (size_t) T * K * 4, cudaMemcpyDeviceToHost, s));
         // the latent input and the shared expert while the routing comes back
         if (!mat(l.fc1, xn, xn16, T, lat, false, err)) return false;
+        if (T <= kMvRows && lane) {
+            CK(cudaMemcpyAsync(lat_h, lat, (size_t) T * g.lat * 4, cudaMemcpyDeviceToHost, s));
+            CK(cudaMemcpyAsync(w_h, w, (size_t) T * K * 4, cudaMemcpyDeviceToHost, s));
+        }
         if (!mat(l.su, xn, xn16, T, su, false, err)) return false;
         k::relu2(su, (size_t) T * g.ff_sh, su, su16, s);
         if (!mat(l.sd, su, su16, T, h, true, err)) return false;
@@ -653,18 +679,42 @@ struct Model::Impl {
         return mat(l.fc2, lacc, lat16, T, h, true, err);
     }
 
-    // a few tokens: each token's experts on mv (up: lat -> eh, relu^2, down: eh -> ey), then the weighted sum
+    // a few tokens: each token's experts on mv (up: lat -> eh, relu^2, down: eh -> ey), then the weighted sum; with
+    // the CPU lane, the experts neither in VRAM nor in a staging slot computed on the CPU meanwhile (from the pinned
+    // pool) and their part added after the GPU's
     bool experts_tokens(int li, int T, std::string& err) {
+        Layer& l = L[(size_t) li];
         const int K = g.k_exp;
         for (int t = 0; t < T; ++t) {
             std::vector<char> busy((size_t) n_slots, 0);
-            std::vector<const x3::Mat*> mu((size_t) K), md((size_t) K);
-            for (int i = 0; i < K; ++i)
-                if (!locate(li, top_h[(size_t) t * K + i], busy, mu[(size_t) i], md[(size_t) i], err)) return false;
-            for (int pass = 0; pass < 2; ++pass) {
-                for (int i0 = 0; i0 < K; i0 += x3::kMaxMvJobs) {
+            std::vector<const x3::Mat*> mu, md;
+            std::vector<CpuExpert> cpu;
+            std::vector<int> gslot;   // the GPU's experts' slots among the token's K
+            for (int i = 0; i < K; ++i) {
+                const int e = top_h[(size_t) t * K + i];
+                if (lane && l.res_slot[(size_t) e] < 0 && l.host_blob[(size_t) e] != nullptr &&
+                    !in_slot(li, e)) {
+                    CpuExpert c;
+                    const uint8_t* b = l.host_blob[(size_t) e];
+                    c.up = {(const uint32_t*) (b + o_ut), (const uint16_t*) (b + o_us), (const uint16_t*) (b + o_uv),
+                            g.lat, g.ff, 2 * g.k_up};
+                    c.down = {(const uint32_t*) (b + o_dt), (const uint16_t*) (b + o_ds),
+                              (const uint16_t*) (b + o_dv), g.ff, g.lat, 2 * g.k_down};
+                    c.w = w_h[(size_t) t * K + i];
+                    cpu.push_back(c);
+                    continue;
+                }
+                const x3::Mat *a = nullptr, *d = nullptr;
+                if (!locate(li, e, busy, a, d, err)) return false;
+                mu.push_back(a);
+                md.push_back(d);
+                gslot.push_back(i);
+            }
+            const int ng = (int) gslot.size();
+            for (int pass = 0; pass < 2 && ng > 0; ++pass) {
+                for (int i0 = 0; i0 < ng; i0 += x3::kMaxMvJobs) {
                     x3::MvJob jobs[x3::kMaxMvJobs];
-                    const int n = std::min(x3::kMaxMvJobs, K - i0);
+                    const int n = std::min(x3::kMaxMvJobs, ng - i0);
                     for (int j = 0; j < n; ++j) {
                         const int i = i0 + j;
                         jobs[j].m = pass == 0 ? mu[(size_t) i] : md[(size_t) i];
@@ -676,13 +726,37 @@ struct Model::Impl {
                         return false;
                     }
                 }
-                if (pass == 0) k::relu2(eh, (size_t) K * g.ff, eh, nullptr, s);
+                if (pass == 0) k::relu2(eh, (size_t) ng * g.ff, eh, nullptr, s);
             }
-            mk::moe_combine(nullptr, ey, ident, w + (size_t) t * K, nullptr, 1, K, g.lat, 1.0f,
-                            lacc + (size_t) t * g.lat, s);
+            if (cpu.empty()) {
+                mk::moe_combine(nullptr, ey, ident, w + (size_t) t * K, nullptr, 1, K, g.lat, 1.0f,
+                                lacc + (size_t) t * g.lat, s);
+            } else {
+                // the GPU's experts' weights (theirs alone, in order), the sum, then the CPU's part added
+                for (int j = 0; j < ng; ++j) wsel_h[(size_t) t * K + j] = w_h[(size_t) t * K + gslot[(size_t) j]];
+                CK(cudaMemcpyAsync(wsel_d + (size_t) t * K, wsel_h + (size_t) t * K, (size_t) std::max(ng, 1) * 4,
+                                   cudaMemcpyHostToDevice, s));
+                if (ng > 0)
+                    mk::moe_combine(nullptr, ey, ident, wsel_d + (size_t) t * K, nullptr, 1, ng, g.lat, 1.0f,
+                                    lacc + (size_t) t * g.lat, s);
+                else
+                    CK(cudaMemsetAsync(lacc + (size_t) t * g.lat, 0, (size_t) g.lat * 4, s));
+                lane->run(cpu, lat_h + (size_t) t * g.lat, cpu_h + (size_t) t * g.lat);
+                st.cpu_experts += (long) cpu.size();
+                CK(cudaMemcpyAsync(cpu_d + (size_t) t * g.lat, cpu_h + (size_t) t * g.lat, (size_t) g.lat * 4,
+                                   cudaMemcpyHostToDevice, s));
+                mk::add(lacc + (size_t) t * g.lat, cpu_d + (size_t) t * g.lat, (size_t) g.lat, s);
+            }
             if (t + 1 < T) CK(cudaStreamSynchronize(s));   // (eh / ey and the slots again for the next token)
         }
         return true;
+    }
+
+    bool in_slot(int li, int e) const {
+        const long long key = (long long) li * 1024 + e;
+        for (int sl = 0; sl < n_slots; ++sl)
+            if (slot_owner[(size_t) sl] == key) return true;
+        return false;
     }
 
     // a prompt chunk: the rows grouped by expert (each expert's rows one GEMM: up, relu^2, down), the resident experts
@@ -856,8 +930,9 @@ std::vector<std::string> Model::info_lines() const {
     std::snprintf(b, sizeof b, "nh: %d layers (%s), dim %d, %d experts top %d, latent %d, context %d", m.g.n_layers,
                   m.g.types.c_str(), m.g.dim, m.g.n_exp, m.g.k_exp, m.g.lat, m.o.max_ctx);
     v.emplace_back(b);
-    std::snprintf(b, sizeof b, "nh: experts in VRAM %ld / %ld (%.1f GB), pinned %.1f GB, staging %d slots, load %.1f s",
-                  m.st.resident, m.st.experts, m.st.vram_gb, m.st.pinned_gb, m.n_slots, m.st.load_s);
+    std::snprintf(b, sizeof b, "nh: experts in VRAM %ld / %ld (%.1f GB), pinned %.1f GB, staging %d slots, CPU lane %d "
+                  "threads, load %.1f s", m.st.resident, m.st.experts, m.st.vram_gb, m.st.pinned_gb, m.n_slots,
+                  m.st.cpu_threads, m.st.load_s);
     v.emplace_back(b);
     return v;
 }

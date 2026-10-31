@@ -24,6 +24,8 @@ struct Options {
     int resident_cap = -1;      // routed experts kept in VRAM a layer at most (-1: as many as fit)
     std::string profile;        // an expert profile (uint32 [layers][experts] routings): the most used stay in VRAM
     bool pin_pool = true;       // the experts not in VRAM in pinned host memory (else assembled from the files a miss)
+    int cpu_threads = -2;       // the CPU lane's workers besides the caller (-1: none - a decode's misses are staged;
+                                // -2: this host's, CpuLane::auto_workers)
     bool verbose = false;
 };
 
@@ -34,6 +36,8 @@ struct Stats {
     double vram_gb = 0;         // the resident experts' bytes
     double pinned_gb = 0;
     long profiled = 0;          // routings counted (save_profile writes them)
+    long cpu_experts = 0;       // routed experts the CPU lane computed
+    int cpu_threads = 0;        // the CPU lane's threads (0: no CPU lane)
 };
 
 class Model {

@@ -12,7 +12,7 @@
 //
 //   maya-nh --pack <model>/maya-nh --ids @prompt.txt [--gen N] [--dump-logits out.bin --last N]
 //           [--gpu G] [--max-context N] [--chunk N] [--staging N] [--reserve-gb X] [--resident-cap N]
-//           [--profile FILE] [--profile-out FILE] [--no-pin-pool] [--split N]
+//           [--profile FILE] [--profile-out FILE] [--no-pin-pool] [--cpu-threads N] [--split N]
 //
 // --ids: comma- or whitespace-separated token ids, or @FILE holding them.  --gen: greedy tokens after the prompt
 // (their ids printed).  --dump-logits: the logits of the prompt's last --last positions (default 1), as
@@ -316,6 +316,7 @@ int main(int argc, char** argv) {
         else if (a == "--profile") o.profile = next();
         else if (a == "--profile-out") prof_out = next();
         else if (a == "--no-pin-pool") o.pin_pool = false;
+        else if (a == "--cpu-threads") o.cpu_threads = std::atoi(next()) - 1;   // (N threads: N - 1 workers)
         else if (a == "--split") split = std::atoi(next());
         else if (a == "--serve") serve_mode = true;
         else if (a == "-v" || a == "--verbose") o.verbose = true;
