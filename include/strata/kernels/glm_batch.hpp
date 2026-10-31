@@ -138,8 +138,11 @@ void copy_i32(const int* src, int* dst, int n, cudaStream_t s);
 void expert_scatter(const int* ids, const int* rank, const int* base, int n, int k, int* row_tok, int* pos,
                     cudaStream_t s);
 /// h[r][c] = silu(min(gu[r][c], limit)) * clamp(gu[r][n_ff + c], +-limit), rows of [gate | up].
-void swiglu_rows(const float* gu, float* h, int rows, int n_ff, float limit, cudaStream_t s, int ld_h = 0);
-// (ld_h: h's row stride, n_ff when 0; h = gu with ld_h = 2 n_ff writes each row's result over its gate half)
+void swiglu_rows(const float* gu, float* h, int rows, int n_ff, float limit, cudaStream_t s, int ld_h = 0,
+                 int ld_gu = 0);
+// (ld_h: h's row stride, n_ff when 0; h = gu with ld_h = 2 n_ff writes each row's result over its gate half; ld_gu:
+// gu's row stride, 2 n_ff when 0 - the prompt's EXL3 experts keep their gate | up rows at n_embd, which is 2 n_ff for
+// GLM but more for Hy3's 2 x 1536)
 /// The same rows, FP16 out (the Volta grouped-WMMA down product's activations): h16's row stride ld_h halves.
 void swiglu_rows_h16(const float* gu, void* h16, int rows, int n_ff, float limit, cudaStream_t s, int ld_h = 0);
 /// The same from separate gate/up arrays, FP16 out.

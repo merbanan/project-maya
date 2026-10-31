@@ -2134,12 +2134,12 @@ __global__ void expert_scatter_kernel(const int* __restrict__ ids, const int* __
 }
 
 // (h may be gu: each thread reads its gate and up values before it writes the one place they came from)
-__global__ void swiglu_rows_kernel(const float* gu, float* h, int rows, int n_ff, int ld_h, float limit) {
+__global__ void swiglu_rows_kernel(const float* gu, float* h, int rows, int n_ff, int ld_h, int ld_gu, float limit) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (int64_t) rows * n_ff) return;
     const int64_t r = i / n_ff;
     const int c = (int) (i - r * n_ff);
-    const float* row = gu + r * 2 * n_ff;
+    const float* row = gu + r * ld_gu;
     const float g = fminf(row[c], limit);
     const float u = fminf(fmaxf(row[n_ff + c], -limit), limit);
     h[r * ld_h + c] = (g / (1.0f + expf(-g))) * u;
@@ -2716,9 +2716,10 @@ void expert_scatter(const int* ids, const int* rank, const int* base, int n, int
     check("expert_scatter");
 }
 
-void swiglu_rows(const float* gu, float* h, int rows, int n_ff, float limit, cudaStream_t s, int ld_h) {
+void swiglu_rows(const float* gu, float* h, int rows, int n_ff, float limit, cudaStream_t s, int ld_h, int ld_gu) {
     if (rows <= 0) return;
-    swiglu_rows_kernel<<<nblk((int64_t) rows * n_ff), 256, 0, s>>>(gu, h, rows, n_ff, ld_h > 0 ? ld_h : n_ff, limit);
+    swiglu_rows_kernel<<<nblk((int64_t) rows * n_ff), 256, 0, s>>>(gu, h, rows, n_ff, ld_h > 0 ? ld_h : n_ff,
+                                                                   ld_gu > 0 ? ld_gu : 2 * n_ff, limit);
     check("swiglu_rows");
 }
 

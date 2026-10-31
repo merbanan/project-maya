@@ -475,7 +475,7 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
         return m;
     };
     const int o = L.place(r0 + a, nrows);
-    float* GU = L.OUTP + (size_t) o * E;   // 2 * n_ff == n_embd: the expert's own OUTP rows hold its gate/up
+    float* GU = L.OUTP + (size_t) o * E;   // 2 * n_ff <= n_embd: the expert's own OUTP rows hold its gate/up
     if (rot_rows) {
         // gate and up: W' of each, the rows rotated by each one's suh, the outputs by its svh
         for (int r = 0; r < 2; ++r) x3::reconstruct_inner_rows(mat(r), L.w16 + (size_t) r * nff * E, s);
@@ -493,7 +493,7 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
             }
         }
         for (int r = 0; r < 2; ++r) x3::rows_rot_out(GU + (size_t) r * nff, E, nrows, nff, mat(r).svh, s);
-        gb::swiglu_rows(GU, GU, nrows, nff, L.limit, s, 2 * nff);
+        gb::swiglu_rows(GU, GU, nrows, nff, L.limit, s, E, E);   // (the rows at n_embd: Hy3's 2 n_ff < n_embd)
         x3::reconstruct_inner_rows(mat(2), L.w16, s);
         uint16_t* H16 = L.w16 + wdn;
         for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
@@ -518,7 +518,7 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
                              CUBLAS_GEMM_DEFAULT_TENSOR_OP),
                 "gemm exl3 gate/up");
     }
-    gb::swiglu_rows(GU, GU, nrows, nff, L.limit, s, 2 * nff);
+    gb::swiglu_rows(GU, GU, nrows, nff, L.limit, s, E, E);   // (the rows at n_embd: Hy3's 2 n_ff < n_embd)
     x3::reconstruct_rows(mat(2), L.w16, false, s);
     uint16_t* H16 = L.w16 + wdn;
     for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
