@@ -100,6 +100,12 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
 /// (STRATA_DENSE_ATTN_DEC, default 1: decode steps; the kernel reads the cache once a token, so wider windows lose);
 /// the setter overrides the environment (benchmarks).
 int q35_attn_dec_max_tokens();
+/// the decode kernel's keys in flight a warp (2, 4 or 8), target block count and minimum resident blocks a SM (1, or 4:
+/// registers capped so 4 fit) - benchmarks; <= 0: the environment's (STRATA_DENSE_ATTN_DEC_PF / _BLOCKS / _MINB)
+void q35_set_attn_dec_tune(int pf, int blocks, int minb);
+/// the streaming kernel (1-5 tokens, FP16 cache): on / off, its block count and keys a tile (32 / 64) - benchmarks;
+/// < 0: the environment's (STRATA_DENSE_ATTN_STREAM, _STREAM_SK); blocks <= 0: one wave of what fits
+void q35_set_attn_stream(int on, int blocks, int sk);
 void q35_set_attn_dec_max_tokens(int n);
 /// the tile kernel's shape for 2-8 token windows (STRATA_DENSE_ATTN_VAR: 0 the 64-row tile, 1 32 rows / 2 warps, 2 the
 /// same with 16 keys a step); the setter overrides the environment (benchmarks)

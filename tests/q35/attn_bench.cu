@@ -3,12 +3,42 @@
 // build: nvcc -arch=sm_70 -O3 -I include tests/q35/attn_bench.cu src/kernels/cuda/q35_kernels.cu src/kernels/cuda/dense_kernels.cu
 #include "strata/kernels/q35_kernels.hpp"
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <random>
 #include <vector>
 
 using namespace strata::kernels;
+
+// the GPU's streaming read rate over a buffer: every 16 bytes read once (uint4 loads, grid-stride), XOR-folded so the
+// reads are not dropped - the ceiling the attention's K / V reads are measured against
+__global__ void read_kernel(const uint4* __restrict__ a, size_t n, unsigned* out) {
+    unsigned x = 0;
+    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        const uint4 v = __ldg(a + i);
+        x ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (x == 0x12345678u) *out = x;
+}
+double read_gbs(const void* buf, size_t bytes, cudaStream_t s) {
+    unsigned* o;
+    cudaMalloc(&o, 4);
+    int sms = 0;
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+    double best = 0;
+    for (int blocks : {sms * 4, sms * 8, sms * 16, sms * 32}) {
+        read_kernel<<<blocks, 256, 0, s>>>((const uint4*) buf, bytes / 16, o);
+        cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+        cudaEventRecord(a, s);
+        for (int r = 0; r < 10; ++r) read_kernel<<<blocks, 256, 0, s>>>((const uint4*) buf, bytes / 16, o);
+        cudaEventRecord(b, s); cudaEventSynchronize(b);
+        float ms = 0; cudaEventElapsedTime(&ms, a, b);
+        best = std::max(best, bytes / (ms / 10 * 1e-3) / 1e9);
+    }
+    cudaFree(o);
+    return best;
+}
 
 int main(int argc, char** argv) {
     const int N = argc > 1 ? atoi(argv[1]) : 90000;
@@ -46,6 +76,65 @@ int main(int argc, char** argv) {
     for (auto& x : h) x = nd(rng) * 3.0f;   // the queries (sharper softmax)
     cudaMemcpy(qf, h.data(), h.size() * 4, cudaMemcpyHostToDevice);
     cudaStreamSynchronize(s);
+    {
+        const size_t kb = (size_t) HK * max_ctx * D * 2;
+        printf("streaming read (the ceiling): K cache %.0f GB/s, V cache %.0f GB/s (%.0f MB each)\n", read_gbs(kv[0].k, kb, s),
+               read_gbs(kv[0].v, kb, s), kb / 1e6);
+    }
+    // the streaming kernel (FP16): blocks, against the tile kernel's output
+    for (int T : {1, 2, 4, 5}) {
+        const int p0 = N - T;
+        q35_set_attn_stream(0, 0, 0);
+        q35_set_attn_dec_max_tokens(0);
+        q35_set_attn_var(0);
+        q35_attn_prep(qf, H * 2 * D, kk, vv, HK * D, nw, nw, 1e-6f, 1e7f, 64, p0, T, H, HK, D, qo, kv[0], s);
+        q35_attn(qo, kv[0], p0, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
+        std::vector<float> ref((size_t) T * H * D), o2(ref.size());
+        cudaMemcpy(ref.data(), out, ref.size() * 4, cudaMemcpyDeviceToHost);
+        for (int cfg = 0; cfg < 6; ++cfg) {
+            const int sk = cfg < 3 ? 64 : 32, bl = (cfg % 3 == 0) ? 0 : (cfg % 3 == 1 ? 160 : 320);
+            q35_set_attn_stream(1, bl, sk);
+            cudaMemset(out, 0, ref.size() * 4);
+            q35_attn(qo, kv[0], p0, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
+            cudaMemcpy(o2.data(), out, o2.size() * 4, cudaMemcpyDeviceToHost);
+            double e = 0, r = 0;
+            for (size_t i = 0; i < ref.size(); ++i) { e += pow(o2[i] - ref[i], 2); r += ref[i] * ref[i]; }
+            cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+            cudaEventRecord(a, s);
+            for (int rep = 0; rep < 20; ++rep) q35_attn(qo, kv[0], p0, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
+            cudaEventRecord(b, s); cudaEventSynchronize(b);
+            float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= 20;
+            const double gb16 = (double) N * HK * D * 2 * 2 / 1e9;
+            printf("N %d T %d stream sk %d blocks %3d: fp16 %.3f ms (%.0f GB/s)  vs tile rel err %.2e  %s\n", N, T, sk, bl, ms,
+                   gb16 / ms * 1e3, sqrt(e / r), cudaGetErrorString(cudaGetLastError()));
+        }
+        q35_set_attn_stream(0, 0, 0);
+    }
+    // the decode kernel's tuning: keys in flight a warp x target blocks, at T 1 and 2
+    for (int T : {1}) {
+        q35_set_attn_dec_max_tokens(8);
+        q35_set_attn_var(0);
+        const int p0 = N - T;
+        for (int mb : {1})
+        for (int pf : {2})
+            for (int bl : {320}) {
+                if (mb == 4 && pf == 8) continue;
+                q35_set_attn_dec_tune(pf, bl, mb);
+                float ms[2] = {0, 0};
+                for (int m = 0; m < 2; ++m) {
+                    q35_attn(qo, kv[m], p0, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
+                    cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+                    cudaEventRecord(a, s);
+                    for (int r = 0; r < 20; ++r) q35_attn(qo, kv[m], p0, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
+                    cudaEventRecord(b, s); cudaEventSynchronize(b);
+                    cudaEventElapsedTime(&ms[m], a, b); ms[m] /= 20;
+                }
+                const double gb16 = (double) N * HK * D * 2 * 2 / 1e9, gb8 = (double) N * HK * (D + D / 2 + 32) / 1e9;
+                printf("N %d T %d dec minb %d pf %d blocks %4d: fp16 %.3f ms (%.0f GB/s)  k8v4 %.3f ms (%.0f GB/s)  %s\n", N, T, mb, pf, bl,
+                       ms[0], gb16 / ms[0] * 1e3, ms[1], gb8 / ms[1] * 1e3, cudaGetErrorString(cudaGetLastError()));
+            }
+        q35_set_attn_dec_tune(0, 0, 0);
+    }
     for (int T : {1, 2, 4, 8}) {
         const int p0 = N - T;
         std::vector<float> ref;
