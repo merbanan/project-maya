@@ -30,7 +30,7 @@ struct CpuLane::Impl {
     int lat = 0, ff = 0;
     std::vector<std::thread> th;
     std::mutex mu;
-    std::condition_variable cv;
+    std::condition_variable cv, cv_done;
     std::atomic<uint64_t> gen{0};
     std::atomic<int> next{0}, done{0};
     int n_jobs = 0;
@@ -40,22 +40,32 @@ struct CpuLane::Impl {
     std::vector<float> xh, u, hh, y;
     float xsum[kMaxE] = {}, hsum[kMaxE] = {};
 
+    int active = 0;   // (workers inside a call's jobs: the caller returns only after they are out)
+
+    // a call's jobs: (fn, n) taken under the lock with its generation, so a worker never mixes two calls'
     void worker() {
         uint64_t seen = 0;
         for (;;) {
+            const std::function<void(int)>* f = nullptr;
+            int n = 0;
             {
                 std::unique_lock<std::mutex> lk(mu);
                 cv.wait(lk, [&] { return stop || gen.load() != seen; });
                 if (stop) return;
                 seen = gen.load();
+                f = fn;
+                n = n_jobs;
+                ++active;
             }
-            drain();
-        }
-    }
-    void drain() {
-        for (int j; (j = next.fetch_add(1)) < n_jobs;) {
-            (*fn)(j);
-            done.fetch_add(1);
+            for (int j; (j = next.fetch_add(1)) < n;) {
+                (*f)(j);
+                done.fetch_add(1);
+            }
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                --active;
+            }
+            cv_done.notify_all();
         }
     }
     void parallel(int n, const std::function<void(int)>& f) {
@@ -73,8 +83,12 @@ struct CpuLane::Impl {
             gen.fetch_add(1);
         }
         cv.notify_all();
-        drain();
-        while (done.load() < n) std::this_thread::yield();
+        for (int j; (j = next.fetch_add(1)) < n;) {
+            f(j);
+            done.fetch_add(1);
+        }
+        std::unique_lock<std::mutex> lk(mu);
+        cv_done.wait(lk, [&] { return done.load() >= n && active == 0; });
     }
 };
 
