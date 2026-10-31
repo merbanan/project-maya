@@ -5730,7 +5730,7 @@ bool Glm5Model::fast_gqa(int il, int64_t p, std::string& err) {
         const gf::GqaStream& st = kvs_->lay[(size_t) il];
         gf::gqa_stream_summarize(kv, st, (int) p, (int) p + 1, s);
         if (F->prof_on) F->mark("gqa_st_summ");
-        KvStream* K = kvs_;
+        GqaKvStream* K = kvs_;
         gf::GqaSelBufs b = K->sel;
         bool keep = false;
         if (K->lsel != nullptr) {   // (STRATA_GLM_KV_RESELECT: the layer's last selection while it still covers p)
@@ -5776,7 +5776,7 @@ bool Glm5Model::kv_stream_init(int64_t resident, std::string& err) {
         return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : d;
     };
     const int P = gf::kGqaPage;
-    auto* K = new KvStream;
+    auto* K = new GqaKvStream;
     kvs_ = K;
     K->slice = gf::gqa_kv_rec_bytes(g.n_kv, gqa_kvm_);
     K->budget = (int) ((envi("STRATA_GLM_KV_SELECT", 8192) + P - 1) / P);
@@ -7615,8 +7615,8 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
         auto runs = slot_dsa_runs(g, m->fast_mode_, m->lat_q8_, m->l0_, m->l1_, m->mtp_il_, m->state_,
                                   m->kv_ != nullptr ? &m->kv_->host : nullptr, m->dsa_lat_, m->dsa_ik_,
                                   m->dsa_ig_, m->dsa_pool_, n);
-        const auto gruns = m->slot_gqa_runs(n);   // hy_v3's K / V rows
-        runs.insert(runs.end(), gruns.begin(), gruns.end());
+        for (const auto& r : m->slot_gqa_runs(n))   // hy_v3's K / V rows (offsets from state_)
+            runs.push_back({m->state_ + r.first, r.second});
         const int32_t hdr[4] = {m->l0_, m->l1_, n_rec, (int32_t) runs.size()};
         put(hdr, sizeof(hdr));
         put(&run, 8);
@@ -7695,8 +7695,8 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
         auto runs = slot_dsa_runs(g, m->fast_mode_, m->lat_q8_, m->l0_, m->l1_, m->mtp_il_, m->state_,
                                   m->kv_ != nullptr ? &m->kv_->host : nullptr, m->dsa_lat_, m->dsa_ik_,
                                   m->dsa_ig_, m->dsa_pool_, n);
-        const auto gruns = m->slot_gqa_runs(n);   // hy_v3's K / V rows
-        runs.insert(runs.end(), gruns.begin(), gruns.end());
+        for (const auto& r : m->slot_gqa_runs(n))   // hy_v3's K / V rows (offsets from state_)
+            runs.push_back({m->state_ + r.first, r.second});
         int32_t hdr[4] = {};
         int64_t frun = 0;
         if (!get(hdr, sizeof(hdr)) || !get(&frun, 8) || hdr[0] != m->l0_ || hdr[1] != m->l1_ || hdr[2] != n_rec ||

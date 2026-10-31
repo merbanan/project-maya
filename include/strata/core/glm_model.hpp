@@ -48,7 +48,7 @@ const char* gqa_kv_mode_name(int mode);
 }  // namespace strata::kernels::glmf
 
 namespace strata::core {
-struct KvStream;   // (src/core/glm_kv_stream.hpp: hy_v3's KV streaming)
+struct GqaKvStream;   // (src/core/glm_kv_stream.hpp: hy_v3's KV streaming)
 
 namespace glmfast {
 class Workers;
@@ -616,7 +616,7 @@ public:
     bool fast_gqa(int il, int64_t p, std::string& err);     // hy_v3: one attention mixer (xq -> mixer)
     // hy_v3, STRATA_GLM_KV_STREAM=<positions>: the whole cache in host memory, that many positions a layer cached in
     // VRAM, a decode step attending to the best pages (glm_kv_stream.hpp)
-    KvStream* kvs_ = nullptr;
+    GqaKvStream* kvs_ = nullptr;
     bool kv_stream_init(int64_t resident, std::string& err);
     void kv_stream_free();
     strata::kernels::glmf::GqaKv kv_host_view(int il) const;    // a streamed layer: its host records (+ the cache)
@@ -720,7 +720,6 @@ public:
     const char* kv_name() const {
         return g_.gqa() ? strata::kernels::glmf::gqa_kv_mode_name(gqa_kvm_) : kv_int8() ? "int8" : "fp16";
     }
-    const char* kv_name() const { return gqa_kvm_ == 2 ? "k8v4" : kv_int8() ? "int8" : "fp16"; }
     /// KV streaming: the positions of each DSA layer kept in VRAM (0: all of them - not streamed); and what
     /// STRATA_GLM_KV_RESIDENT gives for a context: rounded up to whole pools and to glmf::kKvResidentMin, 0 when unset
     /// or when the context fits in that many anyway

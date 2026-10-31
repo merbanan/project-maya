@@ -15,7 +15,7 @@
 
 namespace strata::core {
 
-struct KvStream {
+struct GqaKvStream {
     std::vector<strata::kernels::glmf::GqaStream> lay;   // by layer index (n_layers + 1: the draft block last)
     std::vector<int> layers;                             // the streamed layers (the draft block's first)
     strata::kernels::glmf::GqaSelBufs sel;
