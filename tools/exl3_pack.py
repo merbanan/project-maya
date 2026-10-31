@@ -204,6 +204,8 @@ class Plan:
         self.layers: list[dict] = []      # per MoE layer: the expert parts
         self.notes: list[str] = []
         self.emb_src = "model.language_model.embed_tokens.weight"
+        self.layer_prefix = "model.language_model.layers."
+        self.check_layers = (0, 3, 20, 44, 45)       # --check's dense and expert picks
         self.meta_raw: list[tuple[str, bytes]] | None = None   # Hy3: the reference GGUF's keys, byte for byte
 
     def f32(self, gname, shape, fn):
@@ -313,6 +315,8 @@ class Plan:
         which the engine's Hy3 path reads.  The NextN block (mtp_patch.safetensors) is not packed."""
         st, t = self.st, self.cfg
         self.emb_src = "model.embed_tokens.weight"
+        self.layer_prefix = "model.layers."
+        self.check_layers = (0, 1, 40, 79)
         g = lambda n: (lambda: st.f32(n))  # noqa: E731
         self.bf16("token_embd.weight", None, None)
         self.f32("output_norm.weight", [t["hidden_size"]], g("model.norm.weight"))
@@ -747,7 +751,8 @@ def check(plan: Plan, d: pathlib.Path, ref: pathlib.Path, n_cols: int) -> int:
         bad += not ok
     print("EXL3 matrices (decoded vs the GGUF's quant, first %d rows):" % n_cols)
     st = plan.st
-    picks = [x for x in plan.mats if re.match(r"(blk\.(0|3|20|44|45)\.|output)", x[0])]
+    lay = "|".join(str(i) for i in plan.check_layers)
+    picks = [x for x in plan.mats if re.match(r"(blk\.(%s)\.|output)" % lay, x[0])]
     for name, hf, k, n, k2, cb in picks:
         nc = min(max(128, n_cols // 128 * 128), n)   # whole output rotation blocks
         tr = st.raw(hf + ".trellis").view(np.int16).reshape(st.t[hf + ".trellis"][2])
@@ -769,11 +774,11 @@ def check(plan: Plan, d: pathlib.Path, ref: pathlib.Path, n_cols: int) -> int:
                                                      R[rname].tensor_type.name))
             bad += not ok
     for L in plan.layers:
-        if L["layer"] not in (3, 25, 44, 45):
+        if L["layer"] not in plan.check_layers:
             continue
         il, e = L["layer"], 7
         for ri, r in enumerate(ROLES):
-            p = "model.language_model.layers.%d.mlp.experts.%d.%s_proj." % (il, e, r)
+            p = plan.layer_prefix + "%d.mlp.experts.%d.%s_proj." % (il, e, r)
             tr = st.raw(p + "trellis").view(np.int16).reshape(st.t[p + "trellis"][2])
             got = exl3_rows(tr, st.f32(p + "suh"), st.f32(p + "svh"), L["k2"][ri], L["cb"])
             tt = R["blk.%d.ffn_%s_exps.weight" % (il, r)]
@@ -817,6 +822,10 @@ def main() -> int:
             print("%s is not a hy_v3 GGUF" % a.meta_gguf)
             return 1
         plan.build_hy3()
+        if a.check:
+            rc = check(plan, d, pathlib.Path(a.check).expanduser().absolute(), a.check_rows)
+            if rc or a.check_only:
+                return rc
         write_all(plan, d, out, cfg, 0, None)
         for n in plan.notes:
             print("note: " + n)
