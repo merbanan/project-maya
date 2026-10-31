@@ -34,11 +34,13 @@ struct Pack {
     std::vector<const uint8_t*> map;
     std::vector<size_t> map_bytes;
 
-    bool load(const std::string& pack_dir, std::string& err) {
+    /// geo: the geometry file's name (maya-nh's pack: nh.txt, tools/nh/pack.py's - the same format)
+    bool load(const std::string& pack_dir, std::string& err, const char* geo = "mm3.txt") {
         dir = pack_dir;
-        std::ifstream g(dir + "/mm3.txt");
+        std::ifstream g(dir + "/" + geo);
         if (!g) {
-            err = dir + "/mm3.txt: cannot open (tools/mm3/pack.py --model <model> writes it)";
+            err = dir + "/" + geo + ": cannot open (tools/" + (std::string(geo) == "mm3.txt" ? "mm3" : "nh") +
+                  "/pack.py --model <model> writes it)";
             return false;
         }
         for (std::string line; std::getline(g, line);) {

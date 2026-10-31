@@ -582,6 +582,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       set_source_files_properties(src/ds4/ds4_lt.cu PROPERTIES COMPILE_DEFINITIONS STRATA_HIPBLASLT_AVAILABLE=1)
       target_link_libraries(maya-mm3 PRIVATE roc::hipblaslt)
     endif()
+    # NVIDIA-Nemotron-3.5 (Nemotron-H, EXL3, tools/nh/pack.py): its own engine (src/nh) on maya-mm3's EXL3 kernels
+    # (mv / gemm_rows), norms and sparse attention (every block kept), with its Mamba-2, router and relu^2 kernels
+    add_executable(maya-nh src/nh/nh_main.cpp src/nh/nh_model.cu src/nh/nh_kernels.cu src/mm3/mm3_kernels.cu
+                           src/mm3/mm3_exl3.cu ${_mm3_gguf_sources})
+    target_include_directories(maya-nh PRIVATE ${_strata_gpu_include_directories} include src/mm3 src/nh third_party/ggml)
+    target_link_libraries(maya-nh PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+    target_compile_definitions(maya-nh PRIVATE MAYA_DS4_IQ_ONLY)
+    if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)
+      target_link_libraries(maya-nh PRIVATE roc::hipblaslt)
+    endif()
     if(STRATA_BUILD_TESTS)
       # maya-mm3's EXL3 kernels against the scalar CPU reference (random matrices, no model): exl3_test's cases with
       # swigluoai, the Volta / Turing tensor-core tiles and the FP16 GEMM path before sm_80
