@@ -545,7 +545,7 @@ struct Model::Impl {
         const size_t avail = fr > reserve ? fr - reserve : 0;
         int per = (int) std::min<size_t>((size_t) g.n_exp, avail / blob / std::max(1, n_moe));
         if (o.resident_cap >= 0) per = std::min(per, o.resident_cap);
-        for (int li = 0; li < g.n_layers; ++li) {
+        for (int li = 0; li < (int) L.size(); ++li) {   // (the MTP block's MoE layer too)
             Layer& l = L[(size_t) li];
             if (l.type != 'E') continue;
             std::vector<int> order((size_t) g.n_exp);
