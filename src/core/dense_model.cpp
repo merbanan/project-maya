@@ -123,6 +123,7 @@ struct Dflash {
     uint16_t *pred = nullptr, *succ = nullptr;        // selector codebooks, FP16 rows of rank
     std::vector<DfLayer> layers;
     int64_t* ring_pos = nullptr;
+    std::vector<float> conf_h;                        // the last draft's confidences (host)
     // buffers
     float *feat = nullptr, *h = nullptr, *dyn = nullptr, *a = nullptr, *hf = nullptr, *logits = nullptr, *gate = nullptr;
     float* cand_v = nullptr;
@@ -1685,12 +1686,15 @@ bool DenseModel::dflash_inject(int n, int64_t p0, std::string& err) {
     }
 }
 
+const std::vector<float>& DenseModel::dflash_conf() const { return impl_->df.conf_h; }
+
 const char* DenseModel::dflash_kind() const { return impl_->df.dspark ? "DSpark" : impl_->df.plain ? "DFlash" : "DFlash2"; }
 
 bool DenseModel::dflash_draft(int32_t anchor, int K, std::vector<int32_t>& out, std::string& err) {
     Impl& I = *impl_;
     Dflash& F = I.df;
     out.clear();
+    F.conf_h.clear();
     if (!F.on || K < 1) return true;
     K = std::min(K, F.block - 1);
     // DSpark: every row drafts (row k the token after d_(k-1)); the block as trained, its first K rows' drafts kept
@@ -1803,6 +1807,8 @@ bool DenseModel::dflash_draft(int32_t anchor, int K, std::vector<int32_t>& out, 
         q35_df_walk(F.cand_i, F.cand_v, F.gate, F.top_k, F.rank, F.pred, F.succ, anchor, K, F.tok, F.conf, s);
         out.resize((size_t) K);
         cudaMemcpyAsync(out.data(), F.tok, (size_t) K * 4, cudaMemcpyDeviceToHost, s);
+        F.conf_h.resize((size_t) K);
+        cudaMemcpyAsync(F.conf_h.data(), F.conf, (size_t) K * 4, cudaMemcpyDeviceToHost, s);
         if (cudaStreamSynchronize(s) != cudaSuccess) { err = "dflash: draft failed"; return false; }
         return true;
     } catch (const std::exception& e) {

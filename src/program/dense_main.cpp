@@ -785,6 +785,18 @@ int main(int argc, char** argv) {
                 const auto t_d = Clock::now();
                 if (!model.dflash_draft(anchor, k, d, err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
                 draft_ms += ms_since(t_d);
+                // the confidence floor (STRATA_DENSE_P_CUM, as for MTP below): the drafts after the one whose running
+                // product of confidences fell under it are not verified
+                const double p_cut_df = p_cum_env >= 0.0 ? p_cum_env
+                                        : pos < 16384 ? 0.0 : pos >= 49152 ? 0.3 : 0.3 * (double) (pos - 16384) / 32768.0;
+                const std::vector<float>& cf = model.dflash_conf();
+                if (p_cut_df > 0.0 && cf.size() == d.size()) {
+                    double pr = 1.0;
+                    for (size_t j = 0; j < d.size(); ++j) {
+                        pr *= cf[j];
+                        if (pr < p_cut_df && j + 1 < d.size()) { d.resize(j + 1); ++conf_stops; break; }
+                    }
+                }
                 win.insert(win.end(), d.begin(), d.end());
             } else if (k > 0) {
                 // the drafts: the MTP block over the pending rows (the last one's logits), then one row a draft

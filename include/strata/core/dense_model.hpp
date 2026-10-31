@@ -136,6 +136,9 @@ public:
     bool dflash_inject(int n, int64_t p0, std::string& err);
     /// K drafts after `anchor` (the token at position(), not yet fed); out gets them (host).
     bool dflash_draft(int32_t anchor, int K, std::vector<int32_t>& out, std::string& err);
+    /// The last dflash_draft's confidence of each draft (its top-1 probability as the drafter scores it; empty: the
+    /// drafter gives none) - what STRATA_DENSE_P_CUM's floor reads.
+    const std::vector<float>& dflash_conf() const;
     /// "DSpark" or "DFlash2" (the loaded drafter's kind)
     const char* dflash_kind() const;
 
