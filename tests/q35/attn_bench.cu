@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace strata::kernels;
@@ -80,6 +81,25 @@ int main(int argc, char** argv) {
         const size_t kb = (size_t) HK * max_ctx * D * 2;
         printf("streaming read (the ceiling): K cache %.0f GB/s, V cache %.0f GB/s (%.0f MB each)\n", read_gbs(kv[0].k, kb, s),
                read_gbs(kv[0].v, kb, s), kb / 1e6);
+    }
+    // `attn_bench N pp`: the prompt path - a 1024-row chunk (as the engine's, no splits) at a few depths, TFLOP/s of the
+    // causal QK^T + PV work
+    if (argc > 2 && std::string(argv[2]) == "pp") {
+        float* pout;
+        cudaMalloc(&pout, (size_t) CH * H * D * 4);
+        for (int m = 0; m < 2; ++m)
+            for (int p0 : {N / 4, N / 2, N - CH}) {
+                q35_attn(qo, kv[m], p0, CH, H, HK, D, qf, H * 2 * D, pout, scr, 1, s);
+                cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+                cudaEventRecord(a, s);
+                for (int r = 0; r < 5; ++r) q35_attn(qo, kv[m], p0, CH, H, HK, D, qf, H * 2 * D, pout, scr, 1, s);
+                cudaEventRecord(b, s); cudaEventSynchronize(b);
+                float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= 5;
+                const double fl = 4.0 * H * D * CH * (p0 + CH / 2.0);
+                printf("pp %s chunk %d at %d: %.2f ms (%.1f TFLOP/s, %.3f ms a row)  %s\n", m ? "k8v4" : "fp16", CH, p0, ms,
+                       fl / ms / 1e9, ms / CH, cudaGetErrorString(cudaGetLastError()));
+            }
+        return 0;
     }
     // the streaming kernel (FP16 and K8V4): its tile choices, against the tile kernel's output in the same format
     for (int T : {1, 2, 4, 5, 8}) {
