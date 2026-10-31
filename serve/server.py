@@ -115,9 +115,9 @@ def nvml_pids(pid: int | None, listed: set) -> set:
 CONTEXT_MIN = 4096          # the dashboard's Context size: the smallest it offers ...
 CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does not say what it was trained for
 # the largest context the dashboard offers without an "untested" warning, by engine: maya-ds4 its model's own 1M; the
-# GLM engine's 256K, and maya-mm3's 256K (MiniMax-M3.1 is offered up to its 1M; past 256K it has not been run end to
-# end yet)
-CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144}
+# GLM engine's 256K, maya-mm3's 256K (MiniMax-M3.1 is offered up to its 1M; past 256K it has not been run end to
+# end yet), and maya-nh's 128K (Nemotron-3.5's 1M likewise)
+CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144, "nh": 131072}
 CONTEXT_TESTED_DEFAULT = 262144
 # the engine log's lines a report carries (maya.py's --report reads the same ones)
 REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm prefill: \d|ERR|error|"
@@ -1590,10 +1590,11 @@ def trained_context(model_dir) -> int | None:
 
 
 def trained_context_ds4(pack) -> int | None:
-    """DeepSeek's and MiniMax's: the context its pack says the model was trained for (ds4.txt's / mm3.txt's
-    max_position_embeddings, from the model's config.json or a GGUF's context_length; V4.1-Flash and M3.1-Flash:
-    1,048,576, their native reach), the top of the dashboard's Context size.  None when the pack does not say."""
-    for name in ("ds4.txt", "mm3.txt"):
+    """DeepSeek's, MiniMax's and Nemotron's: the context its pack says the model was trained for (ds4.txt's / mm3.txt's
+    / nh.txt's max_position_embeddings, from the model's config.json or a GGUF's context_length; V4.1-Flash, M3.1-Flash
+    and Nemotron-3.5: 1,048,576, their native reach), the top of the dashboard's Context size.  None when the pack does
+    not say."""
+    for name in ("ds4.txt", "mm3.txt", "nh.txt"):
         try:
             with open(Path(pack) / name, encoding="utf-8", errors="replace") as f:
                 for line in f:

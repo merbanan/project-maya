@@ -130,11 +130,13 @@ def resolve(name: str, glm_downloads=()) -> tuple | None:
 
 
 def family_of(cfg: dict) -> str:
-    """"minimax" for a MiniMax-M3.1-Flash config (maya-mm3), "qwen" for CYBER-FROST-3.8-PS (the `maya` engine with its
-    n-gram table, --ple-gguf), "deepseek" for a DeepSeek-V4.1-Flash config (maya-ds4's --pack: also the configs from
-    before the programs' names of v1.1.16), else "glm"."""
+    """"minimax" for a MiniMax-M3.1-Flash config (maya-mm3), "nemotron" for NVIDIA-Nemotron-3.5 (maya-nh), "qwen" for
+    CYBER-FROST-3.8-PS (the `maya` engine with its n-gram table, --ple-gguf), "deepseek" for a DeepSeek-V4.1-Flash config
+    (maya-ds4's --pack: also the configs from before the programs' names of v1.1.16), else "glm"."""
     inst = cfg.get("installer") or {}
     exe = Path(str(cfg.get("exe", ""))).name
+    if inst.get("family") == "nemotron" or exe.startswith("maya-nh"):
+        return "nemotron"
     if inst.get("family") == "minimax" or exe.startswith("maya-mm3"):
         return "minimax"
     args = cfg.get("args") or []
