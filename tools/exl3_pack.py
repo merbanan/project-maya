@@ -203,6 +203,8 @@ class Plan:
         self.mats: list[tuple] = []       # (gguf name, hf prefix, k, n, k2 = 2 K, cb)
         self.layers: list[dict] = []      # per MoE layer: the expert parts
         self.notes: list[str] = []
+        self.emb_src = "model.language_model.embed_tokens.weight"
+        self.meta_raw: list[tuple[str, bytes]] | None = None   # Hy3: the reference GGUF's keys, byte for byte
 
     def f32(self, gname, shape, fn):
         self.floats.append((gname, shape, "F32", fn))
@@ -304,6 +306,36 @@ class Plan:
                 self.layers.append(self._experts(il, M, t["n_routed_experts"]))
             if il == n_layers:
                 self.gguf_only(n_float0)
+
+    def build_hy3(self):
+        """Tencent Hy3 (hy_v3): GQA attention with q / k norms, one dense layer, then MoE layers with a sigmoid router
+        (F32, as llama.cpp's converter stores it), its selection bias and one shared expert - llama.cpp's hy_v3 names,
+        which the engine's Hy3 path reads.  The NextN block (mtp_patch.safetensors) is not packed."""
+        st, t = self.st, self.cfg
+        self.emb_src = "model.embed_tokens.weight"
+        g = lambda n: (lambda: st.f32(n))  # noqa: E731
+        self.bf16("token_embd.weight", None, None)
+        self.f32("output_norm.weight", [t["hidden_size"]], g("model.norm.weight"))
+        self.mat("output.weight", "lm_head")
+        for il in range(t["num_hidden_layers"]):
+            P, H = "blk.%d." % il, "model.layers.%d." % il
+            A, M = H + "self_attn.", H + "mlp."
+            self.f32(P + "attn_norm.weight", None, g(H + "input_layernorm.weight"))
+            self.f32(P + "ffn_norm.weight", None, g(H + "post_attention_layernorm.weight"))
+            for x in ("q", "k", "v"):
+                self.mat(P + "attn_%s.weight" % x, A + "%s_proj" % x)
+            self.mat(P + "attn_output.weight", A + "o_proj")
+            self.f32(P + "attn_q_norm.weight", None, g(A + "q_norm.weight"))
+            self.f32(P + "attn_k_norm.weight", None, g(A + "k_norm.weight"))
+            if il < t.get("first_k_dense_replace", 1):
+                for r in ROLES:
+                    self.mat(P + "ffn_%s.weight" % r, M + "%s_proj" % r)
+            else:
+                self.f32(P + "ffn_gate_inp.weight", None, g(M + "router.gate.weight"))
+                self.f32(P + "exp_probs_b.bias", None, g(M + "expert_bias"))
+                for r in ROLES:
+                    self.mat(P + "ffn_%s_shexp.weight" % r, M + "shared_mlp.%s_proj" % r)
+                self.layers.append(self._experts(il, M, t["num_experts"]))
 
     def _conv(self, A: str, i: int, di: int) -> np.ndarray:
         st = self.st
@@ -469,6 +501,41 @@ def model_meta(t: dict, n_layers: int, nextn: int = 0) -> list[tuple]:
 
 
 # ------------------------------------------------------------------ writing
+def gguf_kv_raw(path: pathlib.Path) -> list[tuple[str, bytes]]:
+    """A GGUF's metadata as (key, the value's bytes with its type) - copied as they are into maya-exl3.gguf."""
+    sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+    with path.open("rb") as f:
+        b = f.read(64 << 20)
+    magic, ver, _, n_kv = struct.unpack_from("<IIQQ", b, 0)
+    if magic != GGUF_MAGIC or ver < 2:
+        raise SystemExit("%s is not a GGUF v2+" % path)
+    o = 24
+
+    def value(ty, o):
+        if ty in sizes:
+            return o + sizes[ty]
+        if ty == 8:
+            return o + 8 + struct.unpack_from("<Q", b, o)[0]
+        if ty == 9:
+            ety, n = struct.unpack_from("<IQ", b, o)
+            o += 12
+            if ety in sizes:
+                return o + n * sizes[ety]
+            for _ in range(n):
+                o = value(ety, o)
+            return o
+        raise SystemExit("%s: GGUF value type %d" % (path, ty))
+    out = []
+    for _ in range(n_kv):
+        n = struct.unpack_from("<Q", b, o)[0]
+        key = b[o + 8:o + 8 + n].decode()
+        o0 = o
+        o = value(struct.unpack_from("<I", b, o + 8 + n)[0], o + 12 + n)
+        if key != "general.alignment":   # (maya-exl3.gguf's tensors are 32-aligned, the default)
+            out.append((key, b[o0:o]))
+    return out
+
+
 def gguf_shape(a_shape, given):
     return list(given) if given is not None else list(reversed(a_shape))
 
@@ -492,25 +559,26 @@ def write_all(plan: Plan, d: pathlib.Path, out: pathlib.Path, t: dict, nextn: in
               template: pathlib.Path | None) -> None:
     st = plan.st
     n_layers = t["num_hidden_layers"]
-    meta = model_meta(t, n_layers, nextn)
-    tok = tokenizer_meta(d, t["vocab_size"], template)
     w = GGUFWriter(alignment=32)
-    for k, v, ty in meta:
-        w.add(k, v, ty)
-    for k, v in tok.items():
-        if k == "tokenizer.ggml.token_type":
-            w.add(k, v, "array:i32")
-        elif k.endswith("_id"):
-            w.add(k, v, "u32")
-        else:
-            w.add(k, v)
+    if plan.meta_raw is None:
+        meta = model_meta(t, n_layers, nextn)
+        tok = tokenizer_meta(d, t["vocab_size"], template)
+        for k, v, ty in meta:
+            w.add(k, v, ty)
+        for k, v in tok.items():
+            if k == "tokenizer.ggml.token_type":
+                w.add(k, v, "array:i32")
+            elif k.endswith("_id"):
+                w.add(k, v, "u32")
+            else:
+                w.add(k, v)
     # every float tensor, materialised once (~1 GB without the embedding), in the engine's types
     tensors = []        # (name, gguf shape, type, bytes-or-memmap)
     rows = []           # index rows
     lost_total = 0
     for name, shape, ty, fn in plan.floats:
         if name == "token_embd.weight":
-            src = "model.language_model.embed_tokens.weight"
+            src = plan.emb_src
             fn_, dt, shp, _, _ = st.t[src]
             if dt != "BF16":
                 raise SystemExit("token_embd is %s; the engine reads the embedding row of a GGUF type (BF16 here)" % dt)
@@ -547,9 +615,14 @@ def write_all(plan: Plan, d: pathlib.Path, out: pathlib.Path, t: dict, nextn: in
     # ---- maya-exl3.gguf (streamed: the embedding is 1.27 GB)
     gpath = d / GGUF_NAME
     with replace_atomic(gpath) as f:
-        f.write(struct.pack("<IIQQ", GGUF_MAGIC, 3, len(tensors), len(w.metadata)))
-        for k, (ty, v) in w.metadata.items():
-            f.write(w._kv_bytes(k, ty, v))
+        if plan.meta_raw is None:
+            f.write(struct.pack("<IIQQ", GGUF_MAGIC, 3, len(tensors), len(w.metadata)))
+            for k, (ty, v) in w.metadata.items():
+                f.write(w._kv_bytes(k, ty, v))
+        else:
+            f.write(struct.pack("<IIQQ", GGUF_MAGIC, 3, len(tensors), len(plan.meta_raw)))
+            for _, kv in plan.meta_raw:
+                f.write(kv)
         off = 0
         for name, gs, ty, data in tensors:
             f.write(struct.pack("<Q", len(name)) + name.encode())
@@ -590,7 +663,8 @@ def write_all(plan: Plan, d: pathlib.Path, out: pathlib.Path, t: dict, nextn: in
     with replace_atomic(out / "native_experts.txt") as fb, io.TextIOWrapper(fb, encoding="utf-8", newline="\n") as f:
         f.write("# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off "
                 "[shard | gate_shard up_shard down_shard] (n_expert %d, total 0; absolute offsets in %s, or in the "
-                "named shard(s) beside it) - EXL3: the experts are in exl3.txt\n" % (t["n_routed_experts"], GGUF_NAME))
+                "named shard(s) beside it) - EXL3: the experts are in exl3.txt\n"
+                % (t.get("n_routed_experts", t.get("num_experts")), GGUF_NAME))
 
     # ---- exl3.txt
     with replace_atomic(out / "exl3.txt") as fb, io.TextIOWrapper(fb, encoding="utf-8", newline="\n") as f:
@@ -723,10 +797,30 @@ def main() -> int:
     ap.add_argument("--no-mtp", action="store_true", help="leave the NextN (MTP) draft block out")
     ap.add_argument("--model-template", action="store_true",
                     help="the model directory's chat_template.jinja instead of Maya's GLM template")
+    ap.add_argument("--meta-gguf", help="Hy3: a GGUF of the same model (shard 1) whose metadata - the geometry, the "
+                                        "tokenizer and its chat template - maya-exl3.gguf takes as it is")
     a = ap.parse_args()
     d = pathlib.Path(a.model).expanduser().absolute()
     out = pathlib.Path(a.out).expanduser().absolute() if a.out else d / "pack"
     cfg = json.loads((d / "config.json").read_text())
+    if cfg.get("architectures", [None])[0] == "HYV3ForCausalLM":
+        if not a.meta_gguf:
+            print("a Hy3 pack takes its metadata from a GGUF of the model: --meta-gguf <shard 1>")
+            return 1
+        q = cfg.get("quantization_config", {})
+        print("%s: Hy3, EXL3 %s, %s bpw (head %s), codebook %s" % (d.name, q.get("version"), q.get("bits"),
+                                                                   q.get("head_bits"), q.get("codebook", "3inst")))
+        plan = Plan(SafeTensors(d), cfg)
+        plan.meta_raw = gguf_kv_raw(pathlib.Path(a.meta_gguf).expanduser().absolute())
+        arch = [kv for k, kv in plan.meta_raw if k == "general.architecture"]
+        if not arch or b"hy_v3" not in arch[0]:
+            print("%s is not a hy_v3 GGUF" % a.meta_gguf)
+            return 1
+        plan.build_hy3()
+        write_all(plan, d, out, cfg, 0, None)
+        for n in plan.notes:
+            print("note: " + n)
+        return 0
     if cfg.get("architectures", [None])[0] != "Glm5NextForConditionalGeneration":
         print("%s is %s; the EXL3 packer knows GLM-5.3-Flash (Glm5NextForConditionalGeneration)"
               % (d.name, cfg.get("architectures")))
