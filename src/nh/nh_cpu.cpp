@@ -31,39 +31,41 @@ struct CpuLane::Impl {
     std::vector<std::thread> th;
     std::mutex mu;
     std::condition_variable cv, cv_done;
-    std::atomic<uint64_t> gen{0};
-    std::atomic<int> next{0}, done{0};
-    int n_jobs = 0;
-    const std::function<void(int)>* fn = nullptr;
+    // one call's jobs, on the caller's stack: published (cur) under the lock and withdrawn before the call returns,
+    // so a worker only ever runs the jobs of the call it joined
+    struct Call {
+        const std::function<void(int)>* f = nullptr;
+        int n = 0;
+        std::atomic<int> next{0}, done{0};
+        int active = 0;   // (workers inside it; under mu)
+    };
+    Call* cur = nullptr;
+    uint64_t gen = 0;   // (under mu)
     bool stop = false;
     // per expert: xh (lat), xsum, u (ff), hh (ff), hsum, y (lat)
     std::vector<float> xh, u, hh, y;
     float xsum[kMaxE] = {}, hsum[kMaxE] = {};
 
-    int active = 0;   // (workers inside a call's jobs: the caller returns only after they are out)
-
-    // a call's jobs: (fn, n) taken under the lock with its generation, so a worker never mixes two calls'
     void worker() {
         uint64_t seen = 0;
         for (;;) {
-            const std::function<void(int)>* f = nullptr;
-            int n = 0;
+            Call* c = nullptr;
             {
                 std::unique_lock<std::mutex> lk(mu);
-                cv.wait(lk, [&] { return stop || gen.load() != seen; });
+                cv.wait(lk, [&] { return stop || gen != seen; });
                 if (stop) return;
-                seen = gen.load();
-                f = fn;
-                n = n_jobs;
-                ++active;
+                seen = gen;
+                c = cur;
+                if (c == nullptr) continue;   // (the call it was woken for has ended)
+                ++c->active;
             }
-            for (int j; (j = next.fetch_add(1)) < n;) {
-                (*f)(j);
-                done.fetch_add(1);
+            for (int j; (j = c->next.fetch_add(1)) < c->n;) {
+                (*c->f)(j);
+                c->done.fetch_add(1);
             }
             {
                 std::lock_guard<std::mutex> lk(mu);
-                --active;
+                --c->active;
             }
             cv_done.notify_all();
         }
@@ -74,21 +76,22 @@ struct CpuLane::Impl {
             for (int j = 0; j < n; ++j) f(j);
             return;
         }
+        Call c;
+        c.f = &f;
+        c.n = n;
         {
             std::lock_guard<std::mutex> lk(mu);
-            fn = &f;
-            n_jobs = n;
-            next.store(0);
-            done.store(0);
-            gen.fetch_add(1);
+            cur = &c;
+            ++gen;
         }
         cv.notify_all();
-        for (int j; (j = next.fetch_add(1)) < n;) {
+        for (int j; (j = c.next.fetch_add(1)) < n;) {
             f(j);
-            done.fetch_add(1);
+            c.done.fetch_add(1);
         }
         std::unique_lock<std::mutex> lk(mu);
-        cv_done.wait(lk, [&] { return done.load() >= n && active == 0; });
+        cv_done.wait(lk, [&] { return c.done.load() >= n && c.active == 0; });
+        cur = nullptr;   // (a worker waking after this finds no call)
     }
 };
 
