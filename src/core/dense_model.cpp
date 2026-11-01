@@ -3,6 +3,9 @@
 
 #include "strata/artifact/dequant.hpp"
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/artifact/safetensors_dir.hpp"
+#include "strata/kernels/exl3.hpp"
+#include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/dense_kernels.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/g4_kernels.hpp"
@@ -15,6 +18,8 @@
 #include "strata/prefill/gemm.hpp"
 
 #include <cuda_runtime.h>
+
+#include <deque>
 
 #include <algorithm>
 #include <climits>
@@ -50,6 +55,7 @@ struct QMat {
     int n_in = 0, n_out = 0;
     bool packed = false;                            // in q35_mmtp's packed layout (else GGUF rows)
     bool fp16_act = false;                          // FP16 activations at every width (no Q8_1: an unnormed input)
+    const strata::kernels::exl3::Mat* x3 = nullptr; // an EXL3 matrix (an exllamav3 checkpoint): dev / type unused
 };
 
 struct Layer {
@@ -199,6 +205,10 @@ std::vector<uint8_t> f32_to_q8_0(const float* src, int64_t n_in, int64_t n_out) 
 struct Found {
     const strata::GgufFile* file = nullptr;
     const strata::TensorInfo* tensor = nullptr;
+    // (an exllamav3 checkpoint's tensor under its GGUF name: `tensor` a stand-in with the GGUF shape)
+    const strata::StTensor* st = nullptr;           // a float tensor (BF16 / F16 / F32)
+    int xf = 0;                                     // 1: + 1 (the checkpoint's norms are offsets), 2: -exp (A_log -> ssm_a)
+    const strata::StTensor *trellis = nullptr, *suh = nullptr, *svh = nullptr;   // an EXL3 matrix
 };
 
 }  // namespace
@@ -206,6 +216,10 @@ struct Found {
 struct DenseModel::Impl {
     std::vector<std::unique_ptr<strata::GgufFile>> files;
     std::map<std::string, Found> index;
+    // an exllamav3 (EXL3) checkpoint directory instead of a GGUF file: its tensors under GGUF names (index_exl3)
+    std::unique_ptr<strata::SafetensorsDir> st;
+    std::deque<strata::TensorInfo> synth;
+    std::deque<strata::kernels::exl3::Mat> x3mats;
     std::vector<Layer> layers;
     Layer mtp;                                      // blk.<n_layer>: the nextn block (attn == true when loaded)
     Dflash df;
@@ -377,9 +391,142 @@ struct DenseModel::Impl {
         return nullptr;
     }
 
+    // An exllamav3 checkpoint's tensors entered under the names the GGUF path looks up (llama.cpp's convention):
+    // its norms (stored as offsets from 1) and A_log converted as they are read, its quantized matrices EXL3
+    void index_exl3(int n_layer, const strata::Json& tc) {
+        const strata::SafetensorsDir& D = *st;
+        auto stand_in = [&](const std::string& gname, std::vector<uint64_t> shape, uint32_t type) {
+            synth.emplace_back();
+            synth.back().name = gname;
+            synth.back().shape = std::move(shape);
+            synth.back().type = type;
+            return &synth.back();
+        };
+        auto flt = [&](const std::string& gname, const std::string& hname, int xf) {
+            const strata::StTensor* t = D.find(hname);
+            if (!t) return;
+            std::vector<uint64_t> shape;
+            for (auto it = t->shape.rbegin(); it != t->shape.rend(); ++it) shape.push_back((uint64_t) *it);   // (GGUF order)
+            Found f;
+            f.tensor = stand_in(gname, shape, 0 /* F32 */);
+            f.st = t;
+            f.xf = xf;
+            index[gname] = f;
+        };
+        auto mat = [&](const std::string& gname, const std::string& hbase) {
+            const strata::StTensor* tr = D.find(hbase + ".trellis");
+            if (!tr || tr->shape.size() != 3) return;
+            Found f;
+            f.tensor = stand_in(gname, {(uint64_t) tr->shape[0] * 16, (uint64_t) tr->shape[1] * 16},
+                                (uint32_t) strata::kernels::exl3::kTypeEXL3);
+            f.trellis = tr;
+            f.suh = D.find(hbase + ".suh");
+            f.svh = D.find(hbase + ".svh");
+            index[gname] = f;
+        };
+        const strata::Json* lt = tc.get("layer_types");
+        for (int l = 0; l <= n_layer; ++l) {   // (l == n_layer: the MTP block as GGUF's blk.<n_layer>)
+            const bool m = l == n_layer;
+            const std::string g = "blk." + std::to_string(l) + ".";
+            const std::string h = m ? "mtp.layers.0." : "model.language_model.layers." + std::to_string(l) + ".";
+            flt(g + "attn_norm.weight", h + "input_layernorm.weight", 1);
+            flt(g + "post_attention_norm.weight", h + "post_attention_layernorm.weight", 1);
+            mat(g + "ffn_gate.weight", h + "mlp.gate_proj");
+            mat(g + "ffn_up.weight", h + "mlp.up_proj");
+            mat(g + "ffn_down.weight", h + "mlp.down_proj");
+            const bool full = m || (lt && l < (int) lt->arr.size() && lt->arr[(size_t) l].str == "full_attention");
+            if (full) {
+                mat(g + "attn_q.weight", h + "self_attn.q_proj");
+                mat(g + "attn_k.weight", h + "self_attn.k_proj");
+                mat(g + "attn_v.weight", h + "self_attn.v_proj");
+                mat(g + "attn_output.weight", h + "self_attn.o_proj");
+                flt(g + "attn_q_norm.weight", h + "self_attn.q_norm.weight", 1);
+                flt(g + "attn_k_norm.weight", h + "self_attn.k_norm.weight", 1);
+            } else {
+                mat(g + "attn_qkv.weight", h + "linear_attn.in_proj_qkv");
+                mat(g + "attn_gate.weight", h + "linear_attn.in_proj_z");
+                mat(g + "ssm_out.weight", h + "linear_attn.out_proj");
+                flt(g + "ssm_conv1d.weight", h + "linear_attn.conv1d.weight", 0);
+                flt(g + "ssm_dt.bias", h + "linear_attn.dt_bias", 0);
+                flt(g + "ssm_a", h + "linear_attn.A_log", 2);
+                flt(g + "ssm_norm.weight", h + "linear_attn.norm.weight", 0);
+                flt(g + "ssm_alpha.weight", h + "linear_attn.in_proj_a.weight", 0);
+                flt(g + "ssm_beta.weight", h + "linear_attn.in_proj_b.weight", 0);
+            }
+            if (m) {
+                mat(g + "nextn.eh_proj.weight", "mtp.fc");
+                flt(g + "nextn.enorm.weight", "mtp.pre_fc_norm_embedding.weight", 1);
+                flt(g + "nextn.hnorm.weight", "mtp.pre_fc_norm_hidden.weight", 1);
+                flt(g + "nextn.shared_head_norm.weight", "mtp.norm.weight", 1);
+            }
+        }
+        flt("token_embd.weight", "model.language_model.embed_tokens.weight", 0);
+        flt("output_norm.weight", "model.language_model.norm.weight", 1);
+        mat("output.weight", "lm_head");
+    }
+
+    // An EXL3 matrix (Found with a trellis) onto the device; out.x3 points at it (exl3::mv / reconstruct_rows read it)
+    bool upload_exl3(const Found* f, const std::string& name, int n_in, int n_out, QMat& out, uint64_t& total,
+                     std::string& err) {
+        namespace ex = strata::kernels::exl3;
+        const strata::StTensor& tr = *f->trellis;
+        const int k = (int) tr.shape[0] * 16, n = (int) tr.shape[1] * 16, k2 = (int) tr.shape[2] / 8;
+        if (k != n_in || n != n_out || !f->suh || !f->svh || f->suh->bytes != (uint64_t) k * 2 || f->svh->bytes != (uint64_t) n * 2) {
+            err = "dense model: " + name + " (EXL3) is " + std::to_string(k) + " x " + std::to_string(n) + ", expected " +
+                  std::to_string(n_in) + " x " + std::to_string(n_out);
+            return false;
+        }
+        void *t = nullptr, *su = nullptr, *sv = nullptr;
+        if (!alloc(&t, tr.bytes + 16, err, name.c_str()) || !alloc(&su, (uint64_t) k * 2, err, name.c_str()) ||
+            !alloc(&sv, (uint64_t) n * 2, err, name.c_str()))
+            return false;
+        cudaMemcpy(t, tr.data, tr.bytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(su, f->suh->data, (size_t) k * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(sv, f->svh->data, (size_t) n * 2, cudaMemcpyHostToDevice);
+        ex::Mat m;
+        m.trellis = (const uint32_t*) t;
+        m.suh = (const uint16_t*) su;
+        m.svh = (const uint16_t*) sv;
+        m.k = k; m.n = n; m.k2 = k2; m.cb = 2;   // (the checkpoints' mul1 is the kernels' multiplier: 0x83DCD12D)
+        if (!ex::supported(m)) { err = "dense model: " + name + ": an EXL3 shape / bitrate the kernels do not take"; return false; }
+        x3mats.push_back(m);
+        out = QMat{};
+        out.type = ex::kTypeEXL3;
+        out.n_in = n_in;
+        out.n_out = n_out;
+        out.x3 = &x3mats.back();
+        dev_used += tr.bytes + (uint64_t) (k + n) * 2;
+        total += tr.bytes + (uint64_t) (k + n) * 2;
+        return true;
+    }
+
+    // A checkpoint's float tensor as F32 on the host, converted as its index entry says
+    static std::vector<float> st_floats(const Found& f) {
+        const strata::StTensor& t = *f.st;
+        uint64_t n = 1;
+        for (int64_t d : t.shape) n *= (uint64_t) d;
+        std::vector<float> h(n);
+        if (t.dtype == "F32") std::memcpy(h.data(), t.data, n * 4);
+        else if (t.dtype == "F16") strata::dequantize_f16(t.data, h.data(), (int) n);
+        else strata::dequantize_bf16(t.data, h.data(), (int) n);
+        if (f.xf == 1) for (float& v : h) v += 1.0f;
+        else if (f.xf == 2) for (float& v : h) v = -std::exp(v);
+        return h;
+    }
+
     // A float vector or matrix (F32, F16 or BF16 in the file) uploaded as F32.
     bool upload_floats(const Found* f, const std::string& name, uint64_t expect, float** out, std::string& err) {
         if (!f) { err = "dense model: missing tensor " + name; return false; }
+        if (f->st) {
+            const std::vector<float> host = st_floats(*f);
+            if (expect && host.size() != expect) {
+                err = "dense model: " + name + " has " + std::to_string(host.size()) + " values, expected " + std::to_string(expect);
+                return false;
+            }
+            if (!alloc(out, host.size() * 4, err, name.c_str())) return false;
+            cudaMemcpy(*out, host.data(), host.size() * 4, cudaMemcpyHostToDevice);
+            return true;
+        }
         uint64_t n = 1;
         for (uint64_t d : f->tensor->shape) n *= d;
         if (expect && n != expect) {
@@ -430,6 +577,52 @@ struct DenseModel::Impl {
     bool upload_mat(const Found* f, const std::string& name, int n_in, int n_out, QMat& out, uint64_t& total,
                     std::string& err, bool packable = true, bool wide = true, bool host_only = false) {
         if (!f) { err = "dense model: missing tensor " + name; return false; }
+        if (f->trellis) return upload_exl3(f, name, n_in, n_out, out, total, err);
+        if (f->st) {   // a checkpoint's float matrix (the embedding): Q8_0 rows, as the row lookups and GEMVs take
+            const strata::StTensor& t = *f->st;
+            if (t.shape.size() != 2 || t.shape[0] != n_out || t.shape[1] != n_in || n_in % 32) {
+                err = "dense model: " + name + " is not [" + std::to_string(n_out) + ", " + std::to_string(n_in) + "]";
+                return false;
+            }
+            const uint64_t blocks = (uint64_t) n_out * (n_in / 32), bytes = blocks * 34;
+            std::vector<uint8_t> q(bytes);
+            const bool bf = t.dtype == "BF16";
+            auto work = [&](uint64_t b0, uint64_t b1) {
+                for (uint64_t b = b0; b < b1; ++b) {
+                    float v[32], amax = 0.0f;
+                    for (int i = 0; i < 32; ++i) {
+                        const uint16_t u = ((const uint16_t*) t.data)[b * 32 + i];
+                        if (bf) { const uint32_t w = (uint32_t) u << 16; std::memcpy(&v[i], &w, 4); }
+                        else { v[i] = strata::kernels::f32_from_f16(u); }
+                        amax = std::max(amax, std::fabs(v[i]));
+                    }
+                    const float d = amax / 127.0f, id = d > 0.0f ? 1.0f / d : 0.0f;
+                    uint8_t* o = q.data() + b * 34;
+                    const uint16_t dh = strata::kernels::f16_from_f32(d);
+                    std::memcpy(o, &dh, 2);
+                    for (int i = 0; i < 32; ++i) o[2 + i] = (uint8_t) (int8_t) std::lround(v[i] * id);
+                }
+            };
+            const unsigned nt = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+            std::vector<std::thread> th;
+            for (unsigned i = 0; i < nt; ++i) th.emplace_back(work, blocks * i / nt, blocks * (i + 1) / nt);
+            for (auto& x : th) x.join();
+            void* dev = nullptr;
+            if (host_only) {
+                void* host = nullptr;
+                if (cudaHostAlloc(&host, bytes, cudaHostAllocMapped) != cudaSuccess || cudaHostGetDevicePointer(&dev, host, 0) != cudaSuccess) {
+                    err = "dense model: " + name + ": pinned host memory"; return false;
+                }
+                std::memcpy(host, q.data(), bytes);
+                host_allocs.push_back(host);
+            } else {
+                if (!alloc(&dev, bytes, err, name.c_str())) return false;
+                cudaMemcpy(dev, q.data(), bytes, cudaMemcpyHostToDevice);
+            }
+            out = QMat{dev, 8 /* Q8_0 */, n_in, n_out};
+            total += bytes;
+            return !(packable && !host_only) || pack(out, wide, err);
+        }
         const strata::TensorInfo& t = *f->tensor;
         if (t.shape.size() != 2 || t.shape[0] != (uint64_t) n_in || t.shape[1] != (uint64_t) n_out) {
             err = "dense model: " + name + " has shape [" + std::to_string(t.shape.empty() ? 0 : t.shape[0]) + ", " +
@@ -504,6 +697,27 @@ struct DenseModel::Impl {
         cur_T = T; cur_x = x; cur_n = n_in; q8_ready = h8_ready = false;
         if (T > kMaxCols) q35_to_half(x, xh, (int64_t) T * n_in, stream);
     }
+    // an EXL3 matrix: up to 8 rows by exl3::mv (F32 rows in, the weights decoded once for all of them); a prompt
+    // chunk by FP16 GEMMs over the weight reconstructed a column slice at a time into the GEMM's scratch
+    void mm_exl3(const QMat& w, float* y) {
+        namespace ex = strata::kernels::exl3;
+        const ex::Mat& m = *w.x3;
+        if (cur_T <= kMaxCols) {
+            ex::MvJob j;
+            j.m = &m; j.xf = cur_x; j.y = y; j.ncol = cur_T;
+            j.xf_cs = (size_t) cur_n; j.y_cs = (size_t) w.n_out;
+            if (!ex::mv(&j, 1, stream)) throw std::runtime_error("exl3 mv");
+            return;
+        }
+        const int64_t step = std::max<int64_t>(128, gemm.scratch_elems() / m.k / 128 * 128);
+        for (int64_t c0 = 0; c0 < m.n; c0 += step) {
+            const int nc = (int) std::min<int64_t>(step, m.n - c0);
+            const ex::Mat v = ex::view(m, (int) c0, nc);
+            ex::reconstruct_rows(v, gemm.scratch(), false, stream);
+            gemm.f16(xh, gemm.scratch(), y + c0, cur_T, nc, m.k, w.n_out);
+        }
+    }
+
     // (decode / verify) the GEMV input's FP16 rows written by the kernel that made x: no conversion pass
     // (STRATA_DENSE_FUSE=0: the separate passes); rows past T keep stale finite values - their products are dropped
     bool fuse = true;
@@ -513,6 +727,7 @@ struct DenseModel::Impl {
         if (h8_out(T)) h8_ready = true;
     }
     void mm(const QMat& w, float* y) {
+        if (w.x3) { mm_exl3(w, y); return; }
         if (cur_T > kMaxCols) {
             if (w.packed) {   // dequantized to FP16 straight from the packed layout, row slices that fit the scratch
                 const int64_t step = std::max<int64_t>(32, gemm.scratch_elems() / w.n_in / 32 * 32);
@@ -691,58 +906,93 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
     }
     I.prof.on = std::getenv("STRATA_DENSE_PROF") != nullptr && std::atoi(std::getenv("STRATA_DENSE_PROF")) != 0;
     try {
-        // ---- 1. the files and the tensor index
-        for (const std::string& p : shard_paths(path)) I.files.emplace_back(new strata::GgufFile(p));
-        for (const auto& f : I.files)
-            for (const auto& t : f->tensors()) I.index[t.name] = Found{f.get(), &t};
-        const strata::GgufFile& g0 = *I.files.front();
+        if (std::filesystem::is_directory(path)) {
+            // ---- 1-2. an exllamav3 (EXL3) checkpoint directory: config.json, its tensors under GGUF names
+            I.st = std::make_unique<strata::SafetensorsDir>(path);
+            const strata::Json* tcp = I.st->config().get("text_config");
+            const strata::Json& tc = tcp ? *tcp : I.st->config();
+            auto num = [&](const char* k, double d) { const strata::Json* j = tc.get(k); return j && j->kind == strata::Json::Num ? j->num : d; };
+            cfg_.arch = "qwen35";
+            cfg_.n_layer = (int) num("num_hidden_layers", 0);
+            cfg_.n_embd = (int) num("hidden_size", 0);
+            cfg_.n_ff = (int) num("intermediate_size", 0);
+            cfg_.n_head = (int) num("num_attention_heads", 0);
+            cfg_.n_head_kv = (int) num("num_key_value_heads", 0);
+            cfg_.head_dim = (int) num("head_dim", 0);
+            const strata::Json* rp = tc.get("rope_parameters");
+            const double prf = rp && rp->get("partial_rotary_factor") ? rp->get("partial_rotary_factor")->num : num("partial_rotary_factor", 1.0);
+            cfg_.n_rot = (int) std::lround(cfg_.head_dim * prf);
+            cfg_.rope_base = (float) (rp && rp->get("rope_theta") ? rp->get("rope_theta")->num : num("rope_theta", 10000.0));
+            cfg_.ssm_d_conv = (int) num("linear_conv_kernel_dim", 4);
+            cfg_.ssm_state = (int) num("linear_key_head_dim", 128);
+            cfg_.ssm_k_heads = (int) num("linear_num_key_heads", 0);
+            cfg_.ssm_v_heads = (int) num("linear_num_value_heads", 0);
+            cfg_.rms_eps = (float) num("rms_norm_eps", 1e-6);
+            cfg_.eos_id = (int32_t) num("eos_token_id", -1);
+            cfg_.n_nextn = (int) num("mtp_num_hidden_layers", 0);
+            if (cfg_.n_layer < 1 || cfg_.n_embd < 1 || num("num_experts", 0) > 0 ||
+                num("linear_value_head_dim", 128) != cfg_.ssm_state) {
+                err = "dense model: " + path + ": not a dense Qwen3.5 / 3.8 checkpoint this engine reads";
+                return false;
+            }
+            I.index_exl3(cfg_.n_layer, tc);
+            // the value heads in the checkpoint's own (grouped) order: value head h reads key head h / (h_v / h_k)
+            q35_set_gdn_grouped(cfg_.ssm_v_heads / std::max(1, cfg_.ssm_k_heads));
+        } else {
+            q35_set_gdn_grouped(0);
+            // ---- 1. the files and the tensor index
+            for (const std::string& p : shard_paths(path)) I.files.emplace_back(new strata::GgufFile(p));
+            for (const auto& f : I.files)
+                for (const auto& t : f->tensors()) I.index[t.name] = Found{f.get(), &t};
+            const strata::GgufFile& g0 = *I.files.front();
 
-        // ---- 2. the configuration, from the model's own metadata
-        const strata::MetaValue* arch = g0.get("general.architecture");
-        if (!arch) { err = "dense model: missing general.architecture"; return false; }
-        cfg_.arch = arch->s;
-        const std::string a = cfg_.arch + ".";
-        if (cfg_.arch == "gemma4") return load_gemma4(max_context, err);
-        if (cfg_.arch == "muse-glimmer") return load_muse(max_context, err);
-        if (cfg_.arch.rfind("qwen3", 0) != 0) {
-            err = "dense model: architecture '" + cfg_.arch + "' is not a qwen35 dense model";
-            return false;
-        }
-        int64_t v = 0;
-        if (g0.get(a + "expert_count") && g0.get(a + "expert_count")->u > 0) {   // qwen35moe: a MoE FFN in every layer
-            if (!strata::prefill::mmq::built()) { err = "dense model: a MoE model needs the MMQ build (STRATA_GGML_DIR)"; return false; }
-            cfg_.n_expert = (int) g0.get(a + "expert_count")->u;
-            if (meta_int(g0, a + "expert_used_count", v)) cfg_.n_expert_used = (int) v;
-            if (meta_int(g0, a + "expert_feed_forward_length", v)) cfg_.n_ff_exp = (int) v;
-            if (meta_int(g0, a + "expert_shared_feed_forward_length", v)) cfg_.n_ff_shexp = (int) v;
-            if (const auto* e = g0.get(a + "expert_weights_scale")) cfg_.expert_weights_scale = (float) e->num();
-            if (cfg_.n_expert_used < 1 || cfg_.n_ff_exp < 1 || cfg_.n_expert > 1024) { err = "dense model: MoE metadata"; return false; }
-            cfg_.n_ff = std::max(cfg_.n_ff_exp, cfg_.n_ff_shexp);
-        }
-        auto need = [&](const char* key, int& dst) {
-            if (!meta_int(g0, a + key, v)) { err = std::string("dense model: missing ") + a + key; return false; }
-            dst = (int) v;
-            return true;
-        };
-        if (!need("block_count", cfg_.n_layer) || !need("embedding_length", cfg_.n_embd) ||
-            (!cfg_.n_expert && !need("feed_forward_length", cfg_.n_ff)) || !need("attention.head_count", cfg_.n_head) ||
-            !need("attention.head_count_kv", cfg_.n_head_kv) || !need("attention.key_length", cfg_.head_dim) ||
-            !need("rope.dimension_count", cfg_.n_rot) || !need("ssm.conv_kernel", cfg_.ssm_d_conv) ||
-            !need("ssm.state_size", cfg_.ssm_state) || !need("ssm.group_count", cfg_.ssm_k_heads) ||
-            !need("ssm.time_step_rank", cfg_.ssm_v_heads))
-            return false;
-        // block_count includes the MTP/nextn layer(s) stored at the end of the file: they are not part of the main
-        // forward pass (llama.cpp uses n_layer_all - n_layer_nextn), running them corrupts the hidden state.
-        if (meta_int(g0, a + "nextn_predict_layers", v) && v > 0 && v < cfg_.n_layer) {
-            cfg_.n_nextn = (int) v;
-            cfg_.n_layer -= (int) v;
-        }
-        if (const auto* e = g0.get(a + "attention.layer_norm_rms_epsilon")) cfg_.rms_eps = (float) e->num();
-        if (const auto* e = g0.get(a + "rope.freq_base")) cfg_.rope_base = (float) e->num();
-        if (const auto* e = g0.get("tokenizer.ggml.eos_token_id")) cfg_.eos_id = (int32_t) e->u;
-        if (meta_int(g0, a + "ssm.inner_size", v) && v != cfg_.value_dim()) {
-            err = "dense model: ssm.inner_size " + std::to_string(v) + " != state_size * time_step_rank";
-            return false;
+            // ---- 2. the configuration, from the model's own metadata
+            const strata::MetaValue* arch = g0.get("general.architecture");
+            if (!arch) { err = "dense model: missing general.architecture"; return false; }
+            cfg_.arch = arch->s;
+            const std::string a = cfg_.arch + ".";
+            if (cfg_.arch == "gemma4") return load_gemma4(max_context, err);
+            if (cfg_.arch == "muse-glimmer") return load_muse(max_context, err);
+            if (cfg_.arch.rfind("qwen3", 0) != 0) {
+                err = "dense model: architecture '" + cfg_.arch + "' is not a qwen35 dense model";
+                return false;
+            }
+            int64_t v = 0;
+            if (g0.get(a + "expert_count") && g0.get(a + "expert_count")->u > 0) {   // qwen35moe: a MoE FFN in every layer
+                if (!strata::prefill::mmq::built()) { err = "dense model: a MoE model needs the MMQ build (STRATA_GGML_DIR)"; return false; }
+                cfg_.n_expert = (int) g0.get(a + "expert_count")->u;
+                if (meta_int(g0, a + "expert_used_count", v)) cfg_.n_expert_used = (int) v;
+                if (meta_int(g0, a + "expert_feed_forward_length", v)) cfg_.n_ff_exp = (int) v;
+                if (meta_int(g0, a + "expert_shared_feed_forward_length", v)) cfg_.n_ff_shexp = (int) v;
+                if (const auto* e = g0.get(a + "expert_weights_scale")) cfg_.expert_weights_scale = (float) e->num();
+                if (cfg_.n_expert_used < 1 || cfg_.n_ff_exp < 1 || cfg_.n_expert > 1024) { err = "dense model: MoE metadata"; return false; }
+                cfg_.n_ff = std::max(cfg_.n_ff_exp, cfg_.n_ff_shexp);
+            }
+            auto need = [&](const char* key, int& dst) {
+                if (!meta_int(g0, a + key, v)) { err = std::string("dense model: missing ") + a + key; return false; }
+                dst = (int) v;
+                return true;
+            };
+            if (!need("block_count", cfg_.n_layer) || !need("embedding_length", cfg_.n_embd) ||
+                (!cfg_.n_expert && !need("feed_forward_length", cfg_.n_ff)) || !need("attention.head_count", cfg_.n_head) ||
+                !need("attention.head_count_kv", cfg_.n_head_kv) || !need("attention.key_length", cfg_.head_dim) ||
+                !need("rope.dimension_count", cfg_.n_rot) || !need("ssm.conv_kernel", cfg_.ssm_d_conv) ||
+                !need("ssm.state_size", cfg_.ssm_state) || !need("ssm.group_count", cfg_.ssm_k_heads) ||
+                !need("ssm.time_step_rank", cfg_.ssm_v_heads))
+                return false;
+            // block_count includes the MTP/nextn layer(s) stored at the end of the file: they are not part of the main
+            // forward pass (llama.cpp uses n_layer_all - n_layer_nextn), running them corrupts the hidden state.
+            if (meta_int(g0, a + "nextn_predict_layers", v) && v > 0 && v < cfg_.n_layer) {
+                cfg_.n_nextn = (int) v;
+                cfg_.n_layer -= (int) v;
+            }
+            if (const auto* e = g0.get(a + "attention.layer_norm_rms_epsilon")) cfg_.rms_eps = (float) e->num();
+            if (const auto* e = g0.get(a + "rope.freq_base")) cfg_.rope_base = (float) e->num();
+            if (const auto* e = g0.get("tokenizer.ggml.eos_token_id")) cfg_.eos_id = (int32_t) e->u;
+            if (meta_int(g0, a + "ssm.inner_size", v) && v != cfg_.value_dim()) {
+                err = "dense model: ssm.inner_size " + std::to_string(v) + " != state_size * time_step_rank";
+                return false;
+            }
         }
         if (cfg_.ssm_state != 128 || cfg_.ssm_d_conv != 4 || cfg_.ssm_v_heads % cfg_.ssm_k_heads != 0) {
             err = "dense model: the GDN kernels are written for state_size 128 and conv_kernel 4";
@@ -769,6 +1019,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
 
         cudaError_t cs = cudaStreamCreate(&I.stream);
         if (cs != cudaSuccess) { err = std::string("dense model: CUDA setup: ") + cudaGetErrorString(cs); return false; }
+        if (I.st && !strata::kernels::exl3::prepare(I.stream)) { err = "dense model: EXL3 kernel setup"; return false; }
 
         // ---- 3. the layers
         uint64_t total = 0;
@@ -792,9 +1043,13 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             const uint64_t margin = 768ull << 20;
             if (auto_chunk && !std::getenv("STRATA_DENSE_GPU_MIB")) {
                 uint64_t file_bytes = 0;   // (the weights' upper bound: the files, the host-side embedding included)
-                for (const std::string& p : shard_paths(path)) {
-                    std::error_code ec;
-                    file_bytes += (uint64_t) std::filesystem::file_size(p, ec);
+                if (I.st) {
+                    for (const auto& kv : I.st->tensors()) file_bytes += kv.second.bytes;
+                } else {
+                    for (const std::string& p : shard_paths(path)) {
+                        std::error_code ec;
+                        file_bytes += (uint64_t) std::filesystem::file_size(p, ec);
+                    }
                 }
                 for (const int ch : {4096, 2048, 1024})
                     if ((uint64_t) free_b > kv_need + act_of(ch) + margin + file_bytes) { I.chunk = ch; break; }
@@ -1017,7 +1272,13 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         {
             const char* e = std::getenv("STRATA_DENSE_DRAFT_VOCAB");
             const int dv = e ? std::atoi(e) : cfg_.n_expert == 0 ? 32768 : 0;
-            if (dv > 0 && dv < cfg_.n_vocab) I.head_draft.n_out = dv / 128 * 128;   // (rows are contiguous blocks)
+            if (dv > 0 && dv < cfg_.n_vocab) {
+                I.head_draft.n_out = dv / 128 * 128;   // (rows are contiguous blocks)
+                if (I.head.x3) {   // (EXL3: a view of the head's first columns)
+                    I.x3mats.push_back(strata::kernels::exl3::view(*I.head.x3, 0, I.head_draft.n_out));
+                    I.head_draft.x3 = &I.x3mats.back();
+                }
+            }
             const char* x = std::getenv("STRATA_DENSE_MTP_VOCAB_EXTRA");
             I.mtp_extra = I.head_draft.n_out < cfg_.n_vocab ? (x ? std::max(0, std::atoi(x)) / 32 * 32 : 4096) : 0;
         }

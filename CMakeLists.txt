@@ -246,6 +246,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/dense_kernels.cu
                           src/kernels/cuda/q35_kernels.cu
                           src/kernels/cuda/q35_mmt.cu
+                          src/kernels/cuda/exl3.cu
+                          src/kernels/cuda/exl3_legacy.cu
                           src/kernels/cuda/q35_dflash.cu
                           src/kernels/cuda/q35_moe.cu
                           src/kernels/cuda/g4_kernels.cu

@@ -20,6 +20,7 @@
 // The prompt is read one token at a time (the same step as decoding).  Correct, and the simplest thing that can
 // be checked against llama.cpp; a batched prefill is the next optimisation, not a prerequisite.
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/artifact/safetensors_dir.hpp"
 #include "strata/core/dense_model.hpp"
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/dense_kernels.hpp"
@@ -35,6 +36,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <climits>
+#include <filesystem>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -364,6 +366,19 @@ int main(int argc, char** argv) {
                     break;
                 }
     } catch (const std::exception&) {}
+    if (std::filesystem::is_directory(gguf)) {   // (a checkpoint directory: its tokenizer_config.json's added tokens)
+        try {
+            const strata::Json tc = strata::Json::parse(strata::read_text(gguf + "/tokenizer_config.json"));
+            if (const strata::Json* add = tc.get("added_tokens_decoder"))
+                for (const auto& kv : add->obj) {
+                    const strata::Json* c = kv.second.get("content");
+                    if (!c) continue;
+                    const int32_t id = (int32_t) std::atoi(kv.first.c_str());
+                    if (c->str == "<|im_end|>" || c->str == "<|endoftext|>") stop_ids.push_back(id);
+                    if (c->str == "<|im_start|>") im_start = id;
+                }
+        } catch (const std::exception&) {}
+    }
     std::sort(stop_ids.begin(), stop_ids.end());
     stop_ids.erase(std::unique(stop_ids.begin(), stop_ids.end()), stop_ids.end());
 

@@ -50,6 +50,9 @@ bool q35_gdn_prep(float* conv_state, const float* raw, int ld, const float* w, f
 
 /// The delta rule over T tokens (see the header).  x rows: [q (h_k*128) | k (h_k*128) | v (h_v*128)], stride ld;
 /// g, b rows of h_v (row stride ldg); o rows of h_v*128 (dense).  q scaled by 1/sqrt(128) inside.
+/// The GDN value heads' order: 0 (default) GGUF's tiled one (value head h reads key head h % h_k), g > 0 the model's
+/// grouped one (h / g, g = h_v / h_k) - the EXL3 checkpoints keep it.
+void q35_set_gdn_grouped(int group);
 void q35_gdn_seq(float* state, const float* x, int ld, const float* g, const float* b, int ldg, float* o, int T,
                  int h_k, int h_v, bool commit, void* stream);
 

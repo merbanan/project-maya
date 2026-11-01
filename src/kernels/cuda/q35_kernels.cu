@@ -208,12 +208,17 @@ __global__ void gate_beta_kernel(float* __restrict__ a, float* __restrict__ b, c
     b[i] = 1.0f / (1.0f + expf(-b[i]));
 }
 
+// a value head's key head: GGUF files tile them (h % h_k, llama.cpp's converter reorders the value heads), checkpoints
+// with the model's own order group them (h / (h_v / h_k): q35_set_gdn_grouped)
+__constant__ int c_gdn_group;
+__device__ __forceinline__ int gdn_kh(int h, int h_k) { return c_gdn_group > 0 ? h / c_gdn_group : h % h_k; }
+
 // block = value head h, thread = state column j; the column's 128 state values in registers
 __global__ void __launch_bounds__(128) gdn_seq_kernel(float* __restrict__ state, const float* __restrict__ x, int ld,
                                                       const float* __restrict__ g, const float* __restrict__ b, int ldg,
                                                       float* __restrict__ o, int T, int h_k, int h_v, int commit) {
     constexpr int S = 128;
-    const int h = blockIdx.x, j = threadIdx.x, kh = h % h_k;
+    const int h = blockIdx.x, j = threadIdx.x, kh = gdn_kh(h, h_k);
     __shared__ float sq[S], sk[S];
     float st[S];
 #pragma unroll
@@ -251,7 +256,7 @@ __global__ void __launch_bounds__(128) gdn_seq4_kernel(float* __restrict__ state
                                                        const float* __restrict__ g, const float* __restrict__ b, int ldg,
                                                        float* __restrict__ o, int T, int h_k, int h_v, int commit) {
     constexpr int S = 128, R = 32;
-    const int h = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5, kh = h % h_k;
+    const int h = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5, kh = gdn_kh(h, h_k);
     const int j = blockIdx.y * 32 + lane, i0 = w * R;
     __shared__ float sq[S], sk[S], rs[4][32], ra[4][32];
     float st[R];
@@ -294,7 +299,7 @@ __global__ void __launch_bounds__(128) gdn_seq4p_kernel(float* __restrict__ stat
                                                         const float* __restrict__ g, const float* __restrict__ b, int ldg,
                                                         float* __restrict__ o, int T, int h_k, int h_v, int commit) {
     constexpr int S = 128, R = 32;
-    const int h = blockIdx.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5, kh = h % h_k;
+    const int h = blockIdx.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5, kh = gdn_kh(h, h_k);
     const int j = blockIdx.y * 32 + lane, i0 = w * R;
     __shared__ float sq[2][S], sk[2][S], rs[4][32], ra[4][32];
     float st[R];
@@ -359,7 +364,7 @@ __global__ void __launch_bounds__(128) commit_gdn_kernel(const Q35CommitLayer* _
     const float* __restrict__ g = L.ab;
     const float* __restrict__ b = L.ab + h_v;
     const int ldg = 2 * h_v;
-    const int h = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5, kh = h % h_k;
+    const int h = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5, kh = gdn_kh(h, h_k);
     const int j = blockIdx.y * 32 + lane, i0 = w * R;
     __shared__ float sk[S], rs[4][32];
     float st[R];
@@ -1641,6 +1646,8 @@ void q35_gate_beta(float* alpha, float* beta, int ld, const float* dt, const flo
                                                                                        T * h_v, h_v, ld);
     check("q35_gate_beta");
 }
+
+void q35_set_gdn_grouped(int group) { cudaMemcpyToSymbol(c_gdn_group, &group, sizeof group); }
 
 void q35_gdn_seq(float* state, const float* x, int ld, const float* g, const float* b, int ldg, float* o, int T,
                  int h_k, int h_v, bool commit, void* stream) {

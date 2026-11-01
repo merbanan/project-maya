@@ -35,9 +35,9 @@ def ref_tokens(ids, n_new, ctx):
     finally:
         p.terminate(); p.wait()
 
-def eng_tokens(binary, ids, n_new, ctx, env, extra):
+def eng_tokens(binary, ids, n_new, ctx, env, extra, model=None):
     e = dict(os.environ); e.update(env)
-    p = subprocess.Popen([binary, "--serve", "--native", GGUF, "--context", str(ctx)] + extra, stdin=subprocess.PIPE,
+    p = subprocess.Popen([binary, "--serve", "--native", model or GGUF, "--context", str(ctx)] + extra, stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=sys.stderr, text=True, env=e)
     for line in p.stdout:
         if line.startswith("READY") or line.startswith("ERR"):
@@ -65,6 +65,7 @@ def main():
     ap.add_argument("--bin", default="build/strata-dense"); ap.add_argument("--env", action="append", default=[])
     ap.add_argument("--arg", action="append", default=[]); ap.add_argument("--no-ref", action="store_true")
     ap.add_argument("--gguf", default=GGUF)
+    ap.add_argument("--model", help="the engine's model (default --gguf): e.g. an EXL3 checkpoint directory; the tokenizer stays --gguf's")
     a = ap.parse_args()
     globals()["GGUF"] = a.gguf
     tok = Tokenizer.from_gguf(GGUF)
@@ -74,7 +75,7 @@ def main():
     ids = tok.encode(text, parse_special=True)
     print(f"prompt tokens: {len(ids)}")
     env = dict(kv.split("=", 1) for kv in a.env)
-    mine = eng_tokens(a.bin, ids, a.new, a.ctx, env, a.arg)
+    mine = eng_tokens(a.bin, ids, a.new, a.ctx, env, a.arg, a.model)
     print("engine :", repr(tok.decode(mine))[:400])
     import hashlib
     print("engine ids:", len(mine), hashlib.sha1(",".join(map(str, mine)).encode()).hexdigest()[:16])
