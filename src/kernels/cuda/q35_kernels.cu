@@ -645,6 +645,205 @@ __global__ void __launch_bounds__(AW_ * 32) attn_tc_kernel(const float* __restri
     }
 }
 
+// ---- the prompt path (FP16 cache): attn_tc_kernel's 64-row x 32-key tiles with 8 warps instead of 4 - warp (rt, h)
+// the rows 16 rt .. +15 and the head dims 128 h .. +127.  S = Q K^T: each warp of a pair its half of the head
+// dimension (the two partials summed in the softmax); the softmax: warp (rt, h) the rows 16 rt + 8 h .. +7, 4 lanes a
+// row (8 keys each), m and l in its registers, the rows' correction factors through shared memory; O += P V: each
+// warp its 8 of the 16 output fragments.  Twice the warps an SM (the old kernel: 4 a block, one block an SM - its
+// shared memory), the same tiles, splits and partial layout.
+constexpr int PP_AR = 64, PP_AK = 32, PP_W = 8, PP_LDS = PP_AK + 4, PP_LDP = PP_AK + 8;
+constexpr size_t kPpSmem = (size_t) PP_AR * LDQ * 2 + 2 * (size_t) PP_AK * LDQ * 2 + 2 * (size_t) PP_AR * PP_LDS * 4 +
+                           (size_t) PP_AR * PP_LDP * 2 + 4 * (size_t) PP_AR * 4 + 16;
+__global__ void __launch_bounds__(PP_W * 32) attn_pp_kernel(const float* __restrict__ q, Q35Kv kv, int p0, int T,
+                                                           int n_head, int G, int max_ctx, int split_len, float scale,
+                                                           const float* __restrict__ q_full, int ldq,
+                                                           float* __restrict__ out, float* __restrict__ part_o,
+                                                           float* __restrict__ part_ml) {
+    using namespace nvcuda;
+    constexpr int AR = PP_AR, AK = PP_AK, LDS = PP_LDS, LDP = PP_LDP;
+    extern __shared__ __align__(32) unsigned char smem[];
+    __half* sQ = (__half*) smem;
+    __half* sK = sQ + AR * LDQ;
+    __half* sV = sK + AK * LDQ;
+    float* sS = (float*) (sV + AK * LDQ);            // [2 halves][AR][LDS] partial scores; the rescale's scratch
+    __half* sP = (__half*) (sS + 2 * AR * LDS);      // [AR][LDP]
+    float* sCorr = (float*) (sP + AR * LDP);         // [AR] this tile's correction factors
+    float* sL = sCorr + AR;                          // [AR] the final totals / maxima (epilogue)
+    float* sM = sL + AR;
+    int* sNeed = (int*) (sM + AR);                   // [4] a row tile's O needs rescaling this tile
+    const int kvh = blockIdx.y, split = blockIdx.z, n_split = gridDim.z;
+    const int rows = T * G, r0 = blockIdx.x * AR;
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, rt = w >> 1, hf = w & 1;
+    const int qld = n_head * AD;
+    for (int i = tid; i < AR * (AD / 4); i += PP_W * 32) {   // Q (scaled) -> sQ
+        const int r = i / (AD / 4), d = (i % (AD / 4)) * 4, row = r0 + r;
+        float4 f = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (row < rows) {
+            const int tok = row / G, head = kvh * G + row % G;
+            f = *(const float4*) (q + (size_t) tok * qld + (size_t) head * AD + d);
+        }
+        __half2* dst = (__half2*) (sQ + r * LDQ + d);
+        dst[0] = __floats2half2_rn(f.x * scale, f.y * scale);
+        dst[1] = __floats2half2_rn(f.z * scale, f.w * scale);
+    }
+    const int last_row = min(r0 + AR, rows) - 1;
+    const int kend = p0 + last_row / G + 1;
+    const int ks = split * split_len, ke = min(kend, ks + split_len);
+    const int tr0 = r0 + rt * 16;                    // the warp's row tile
+    const bool t_on = tr0 < rows;
+    const int tlast = t_on ? p0 + (min(tr0 + 16, rows) - 1) / G : -1;
+    // the softmax rows: 16 rt + 8 hf + (lane >> 2), lane & 3 its 8 keys
+    const int sr = rt * 16 + hf * 8 + (lane >> 2), sq = lane & 3;
+    const int srow = r0 + sr;
+    const bool srow_ok = srow < rows;
+    const int spos = srow_ok ? p0 + srow / G : -1;
+    constexpr float kLazy = 8.0f;
+    float m = -INFINITY, l = 0.0f;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> fo[8];   // O rows of the tile, dims 128 hf + 16 n
+#pragma unroll
+    for (int n = 0; n < 8; ++n) wmma::fill_fragment(fo[n], 0.0f);
+    constexpr int PF = AK * (AD / 8) / (PP_W * 32);   // 16-byte chunks a thread a tile, K and V each
+    uint4 pk[PF], pv[PF];
+    auto fetch = [&](int k0) {
+#pragma unroll
+        for (int j = 0; j < PF; ++j) {
+            const int i = tid + j * PP_W * 32, r = i / (AD / 8), d = (i % (AD / 8)) * 8, key = k0 + r;
+            pk[j] = pv[j] = make_uint4(0, 0, 0, 0);
+            if (key < ke) {
+                const size_t cell = (size_t) kvh * max_ctx + key;
+                pk[j] = __ldg((const uint4*) ((const __half*) kv.k + cell * AD + d));
+                pv[j] = __ldg((const uint4*) ((const __half*) kv.v + cell * AD + d));
+            }
+        }
+    };
+    if (ks < ke) fetch(ks);
+    for (int k0 = ks; k0 < ke; k0 += AK) {
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < PF; ++j) {
+            const int i = tid + j * PP_W * 32, r = i / (AD / 8), d = (i % (AD / 8)) * 8;
+            *(uint4*) (sK + r * LDQ + d) = pk[j];
+            *(uint4*) (sV + r * LDQ + d) = pv[j];
+        }
+        if (tid < 4) sNeed[tid] = 0;
+        __syncthreads();
+        if (k0 + AK < ke) fetch(k0 + AK);
+        const bool tile_on = t_on && k0 <= tlast;   // (the same for both warps of a pair)
+        if (tile_on) {   // S partial (16 x AK) over the head dims 128 hf .. +127
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[AK / 16];
+#pragma unroll
+            for (int n = 0; n < AK / 16; ++n) wmma::fill_fragment(acc[n], 0.0f);
+#pragma unroll
+            for (int kk = 8 * hf; kk < 8 * hf + 8; ++kk) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fq;
+                wmma::load_matrix_sync(fq, sQ + (rt * 16) * LDQ + kk * 16, LDQ);
+#pragma unroll
+                for (int n = 0; n < AK / 16; ++n) {
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+                    wmma::load_matrix_sync(fb, sK + (n * 16) * LDQ + kk * 16, LDQ);
+                    wmma::mma_sync(acc[n], fq, fb, acc[n]);
+                }
+            }
+#pragma unroll
+            for (int n = 0; n < AK / 16; ++n)
+                wmma::store_matrix_sync(sS + (size_t) hf * AR * LDS + (rt * 16) * LDS + n * 16, acc[n], LDS,
+                                        wmma::mem_row_major);
+        }
+        __syncthreads();
+        if (tile_on) {   // the softmax of the warp's 8 rows
+            float sv[8], mt = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int c = sq * 8 + j, key = k0 + c;
+                const float s2 = sS[sr * LDS + c] + sS[(size_t) AR * LDS + sr * LDS + c];
+                sv[j] = srow_ok && key < ke && key <= spos ? s2 : -INFINITY;
+                mt = fmaxf(mt, sv[j]);
+            }
+            mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, 1));
+            mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, 2));
+            const bool need = mt > m + kLazy;
+            float corr = 1.0f;
+            if (need) {
+                corr = m == -INFINITY ? 0.0f : __expf(m - mt);
+                l *= corr;
+                m = mt;
+            }
+            float ps = 0.0f;
+            __half pr[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float pj = sv[j] == -INFINITY ? 0.0f : __expf(sv[j] - m);
+                ps += pj;
+                pr[j] = __float2half(pj);
+            }
+            *(uint4*) (sP + sr * LDP + sq * 8) = *(const uint4*) pr;
+            ps += __shfl_xor_sync(0xffffffffu, ps, 1);
+            ps += __shfl_xor_sync(0xffffffffu, ps, 2);
+            l += ps;
+            if (sq == 0) sCorr[sr] = corr;
+            if (__any_sync(0xffffffffu, need) && lane == 0) sNeed[rt] = 1;
+        }
+        __syncthreads();
+        if (tile_on) {
+            if (sNeed[rt]) {   // (rare after the first tile) the pair's O rows scaled by their factors
+                float* sc = sS + (size_t) w * 256;   // (a warp's 16 x 16 scratch, the partial scores are read)
+#pragma unroll
+                for (int n = 0; n < 8; ++n) {
+                    wmma::store_matrix_sync(sc, fo[n], 16, wmma::mem_row_major);
+                    __syncwarp();
+                    for (int e = lane; e < 256; e += 32) sc[e] *= sCorr[rt * 16 + e / 16];
+                    __syncwarp();
+                    wmma::load_matrix_sync(fo[n], sc, 16, wmma::mem_row_major);
+                    __syncwarp();
+                }
+            }
+#pragma unroll
+            for (int kk = 0; kk < AK / 16; ++kk) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fp;
+                wmma::load_matrix_sync(fp, sP + (rt * 16) * LDP + kk * 16, LDP);
+#pragma unroll
+                for (int n = 0; n < 8; ++n) {
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> fv;
+                    wmma::load_matrix_sync(fv, sV + (kk * 16) * LDQ + hf * 128 + n * 16, LDQ);
+                    wmma::mma_sync(fo[n], fp, fv, fo[n]);
+                }
+            }
+        }
+    }
+    // the rows' totals for both warps of a pair, then the output (or the partials)
+    if (sq == 0) { sL[sr] = l; sM[sr] = m; }
+    __syncthreads();
+    if (!t_on) return;
+    float* sc = sS + (size_t) w * 256;
+    const int ri = lane >> 1, hi = lane & 1, row = tr0 + ri;
+    const bool row_ok = row < rows;
+    const int tok = row_ok ? row / G : 0, head = kvh * G + (row_ok ? row % G : 0);
+    const float lr = sL[rt * 16 + ri], inv_l = lr > 0.0f ? 1.0f / lr : 0.0f;
+#pragma unroll
+    for (int n = 0; n < 8; ++n) {
+        wmma::store_matrix_sync(sc, fo[n], 16, wmma::mem_row_major);
+        __syncwarp();
+        if (row_ok) {
+            const int d0 = hf * 128 + n * 16 + hi * 8;
+            if (n_split == 1) {
+                float* o = out + (size_t) tok * qld + (size_t) head * AD + d0;
+                const float* gt = q_full + (size_t) tok * ldq + (size_t) head * 2 * AD + AD + d0;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) o[j] = sc[ri * 16 + hi * 8 + j] * inv_l * sigm(gt[j]);
+            } else {
+                float* o = part_o + (((size_t) split * gridDim.y + kvh) * rows + row) * AD + d0;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) o[j] = sc[ri * 16 + hi * 8 + j];
+            }
+        }
+        __syncwarp();
+    }
+    if (n_split > 1 && row_ok && hi == 0 && hf == 0) {
+        part_ml[(((size_t) split * gridDim.y + kvh) * rows + row) * 2] = sM[rt * 16 + ri];
+        part_ml[(((size_t) split * gridDim.y + kvh) * rows + row) * 2 + 1] = lr;
+    }
+}
+
 // ---- decode / short verify (the tile kernel above fills 1 of its 4 warps with 6-48 rows and runs 1 block a SM):
 // block = (kv head, split, token t), 4 warps, warp w takes the split's keys w, w + 4, ..; lane l the dims 8 l .. 8 l + 7
 // of the G rows of token t (CUDA cores: q.k by a warp sum, the online softmax and O in registers), two keys in flight
@@ -1415,6 +1614,8 @@ void q35_stream_phases(unsigned long long* out, bool reset) {
     }
 }
 #endif
+int g_attn_pp = -1;
+void q35_set_attn_pp(int on) { g_attn_pp = on; }
 void q35_set_attn_stream(int on, int blocks, int sk) {
     g_attn_stream = on;
     g_stream_blocks = blocks;
@@ -1448,6 +1649,9 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
     // slower (27B 28K prompt, two cooled rounds: 807 / 788 -> 755 / 748 tok/s; strided fragment loads from L1 lose to the
     // staged tile), so off
     static const bool direct = std::getenv("STRATA_DENSE_ATTN_DIRECT") && std::atoi(std::getenv("STRATA_DENSE_ATTN_DIRECT")) != 0;
+    // (STRATA_DENSE_ATTN_PP=0: prompt chunks on attn_tc_kernel's 4 warps)
+    static const bool pp_env = !std::getenv("STRATA_DENSE_ATTN_PP") || std::atoi(std::getenv("STRATA_DENSE_ATTN_PP")) != 0;
+    const bool pp_on = g_attn_pp >= 0 ? g_attn_pp != 0 : pp_env;
     const int v = vsel == -2 ? (T >= 2 && T <= 4 ? 2 : 0) : (T >= 2 && T <= 8) ? vsel : 0;
     const int AR_v = v ? 32 : AR, AK_v = v == 2 ? 16 : AK, AW_v = v ? 2 : AW;
     const int tiles = (rows + AR_v - 1) / AR_v;
@@ -1591,6 +1795,12 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
         else go(attn_tc_kernel<1, 32, 16, 2>, attn_smem<32, 16, 2>(), 64);
     } else if (kv.mode == 0 && direct) {
         attn_tc_kernel<0, AR, AK, AW, true><<<grid, AW * 32, attn_smem<AR, AK, AW, true>(), (cudaStream_t) stream>>>(
+            q, kv, p0, T, n_head, G, max_ctx, split_len, sc, q_full, ldq, out, part_o, part_ml);
+    } else if (kv.mode == 0 && T > 8 && pp_on) {   // (a prompt chunk: the 8-warp kernel)
+        static const bool pp_attr =
+            cudaFuncSetAttribute(attn_pp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kPpSmem) == cudaSuccess;
+        if (!pp_attr) throw std::runtime_error("q35_attn: attn_pp_kernel shared memory attribute");
+        attn_pp_kernel<<<grid, PP_W * 32, kPpSmem, (cudaStream_t) stream>>>(
             q, kv, p0, T, n_head, G, max_ctx, split_len, sc, q_full, ldq, out, part_o, part_ml);
     } else if (kv.mode == 0) {
         attn_tc_kernel<0><<<grid, AW * 32, kAttnSmem, (cudaStream_t) stream>>>(

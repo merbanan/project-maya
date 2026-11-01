@@ -138,6 +138,35 @@ int main(int argc, char** argv) {
         cudaMemset(v16, 0, ((size_t) HK * max_ctx + 32) * D * 2);
         const Q35Kv kv16{k16, v16, nullptr, nullptr, 0, max_ctx};
         std::vector<float> ref8[3], got((size_t) CH * H * D);
+        // the 8-warp prompt kernel against attn_tc_kernel (FP16): relative error and time
+        for (int pi = 0; pi < 3; ++pi) {
+            const int p0 = pi == 0 ? N / 4 : pi == 1 ? N / 2 : N - CH;
+            std::vector<float> a((size_t) CH * H * D), b2(a.size());
+            float tms[2];
+            for (int k = 0; k < 2; ++k) {
+                q35_set_attn_pp(k);
+                cudaMemset(pout, 0xff, a.size() * 4);   // (NaN: an output not written shows)
+                q35_attn(qo, kv[0], p0, CH, H, HK, D, qf, H * 2 * D, pout, scr, 1, s);
+                cudaMemcpy(k ? b2.data() : a.data(), pout, a.size() * 4, cudaMemcpyDeviceToHost);
+                cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+                cudaEventRecord(e0, s);
+                for (int r = 0; r < 5; ++r) q35_attn(qo, kv[0], p0, CH, H, HK, D, qf, H * 2 * D, pout, scr, 1, s);
+                cudaEventRecord(e1, s); cudaEventSynchronize(e1);
+                cudaEventElapsedTime(&tms[k], e0, e1); tms[k] /= 5;
+            }
+            q35_set_attn_pp(-1);
+            double e = 0, r = 0;
+            size_t nan = 0, same = 0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                if (std::isnan(b2[i]) || std::isnan(a[i])) { ++nan; continue; }
+                same += b2[i] == a[i];
+                e += pow(b2[i] - a[i], 2); r += a[i] * a[i];
+            }
+            printf("(%zu NaN, %zu of %zu equal) ", nan, same, a.size());
+            const double fl = 4.0 * H * D * CH * (p0 + CH / 2.0);
+            printf("pp fp16 at %d: tc %.2f ms (%.1f TFLOP/s)  pp8 %.2f ms (%.1f TFLOP/s)  rel err %.2e  %s\n", p0, tms[0],
+                   fl / tms[0] / 1e9, tms[1], fl / tms[1] / 1e9, sqrt(e / r), cudaGetErrorString(cudaGetLastError()));
+        }
         for (int m : {0, 2, 3})   // (FP16, K8V8, K8V8 unpacked to FP16 first)
             for (int pi = 0; pi < 3; ++pi) {
                 const int p0 = pi == 0 ? N / 4 : pi == 1 ? N / 2 : N - CH;

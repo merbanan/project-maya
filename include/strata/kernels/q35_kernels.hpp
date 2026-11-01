@@ -108,6 +108,8 @@ int q35_attn_dec_max_tokens();
 void q35_set_attn_dec_tune(int pf, int blocks, int minb);
 /// the streaming kernel (1-5 tokens, FP16 cache): on / off, its block count and keys a tile (32 / 64) - benchmarks;
 /// < 0: the environment's (STRATA_DENSE_ATTN_STREAM, _STREAM_SK); blocks <= 0: one wave of what fits
+/// The prompt path's attention kernel: 1 the 8-warp attn_pp_kernel (default), 0 attn_tc_kernel, -1 the env's.
+void q35_set_attn_pp(int on);
 void q35_set_attn_stream(int on, int blocks, int sk);
 void q35_set_attn_dec_max_tokens(int n);
 /// the tile kernel's shape for 2-8 token windows (STRATA_DENSE_ATTN_VAR: 0 the 64-row tile, 1 32 rows / 2 warps, 2 the
