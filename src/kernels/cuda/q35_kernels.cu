@@ -80,6 +80,36 @@ __global__ void conv_seq_kernel(float* __restrict__ st, const float* __restrict_
     if (commit) { st[c * 3] = h0; st[c * 3 + 1] = h1; st[c * 3 + 2] = h2; }
 }
 
+// the same convolution a thread a (channel, token) - a prompt chunk's tokens in parallel (conv_seq_kernel walked them
+// one after another a channel); each output's arithmetic as conv_seq_kernel's, so the same bits.  The state is
+// read here and moved on by conv_commit_kernel afterwards
+__global__ void conv_par_kernel(const float* __restrict__ st, const float* __restrict__ raw, int ld,
+                                const float* __restrict__ w, float* __restrict__ out, int T, int C) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (c >= C) return;
+    auto in = [&](int u) { return u >= 0 ? raw[(size_t) u * ld + c] : st[c * 3 + 3 + u]; };   // (u -3..-1: the state)
+    const float h0 = in(t - 3), h1 = in(t - 2), h2 = in(t - 1), x = raw[(size_t) t * ld + c];
+    const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+    float sum = 0.0f;
+    sum += h0 * w0;
+    sum += h1 * w1;
+    sum += h2 * w2;
+    sum += x * w3;
+    sum = __fadd_rn(sum, 0.0f);
+    out[(size_t) t * ld + c] = sum / (1.0f + expf(-sum));
+}
+__global__ void conv_commit_kernel(float* __restrict__ st, const float* __restrict__ raw, int ld, int T, int C) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float h[3];
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        const int u = T - 3 + i;
+        h[i] = u >= 0 ? raw[(size_t) u * ld + c] : st[c * 3 + 3 + u];
+    }
+    st[c * 3] = h[0]; st[c * 3 + 1] = h[1]; st[c * 3 + 2] = h[2];
+}
+
 // block (row, token), 128 threads: x / sqrt(sum x^2 + eps), as native_gdn_preprocess.cu's l2_norm computes it
 __global__ void qk_l2_kernel(float* __restrict__ x, int ld, float eps) {
     __shared__ float sh[32];
@@ -1278,7 +1308,12 @@ void q35_to_half(const float* src, uint16_t* dst, int64_t n, void* stream) {
 
 void q35_conv_seq(float* conv_state, const float* raw, int ld, const float* w, float* out, int T, int C, bool commit,
                   void* stream) {
-    conv_seq_kernel<<<blocks(C, 128), 128, 0, (cudaStream_t) stream>>>(conv_state, raw, ld, w, out, T, C, commit);
+    if (T > 8 && T <= 65535) {   // (a prompt chunk: the tokens in parallel, then the state moved on)
+        conv_par_kernel<<<dim3(blocks(C, 128), T), 128, 0, (cudaStream_t) stream>>>(conv_state, raw, ld, w, out, T, C);
+        if (commit) conv_commit_kernel<<<blocks(C, 128), 128, 0, (cudaStream_t) stream>>>(conv_state, raw, ld, T, C);
+    } else {
+        conv_seq_kernel<<<blocks(C, 128), 128, 0, (cudaStream_t) stream>>>(conv_state, raw, ld, w, out, T, C, commit);
+    }
     check("q35_conv_seq");
 }
 
