@@ -743,7 +743,10 @@ __global__ void __launch_bounds__(AW_ * 32) attn_tc_kernel(const float* __restri
 // row (8 keys each), m and l in its registers, the rows' correction factors through shared memory; O += P V: each
 // warp its 8 of the 16 output fragments.  Twice the warps an SM (the old kernel: 4 a block, one block an SM - its
 // shared memory), the same tiles, splits and partial layout.
-constexpr int PP_AR = 64, PP_AK = 32, PP_W = 8, PP_LDS = PP_AK + 4, PP_LDP = PP_AK + 8;
+#ifndef Q35_PP_LDP
+#define Q35_PP_LDP 40
+#endif
+constexpr int PP_AR = 64, PP_AK = 32, PP_W = 8, PP_LDS = PP_AK + 4, PP_LDP = Q35_PP_LDP;
 constexpr size_t kPpSmem = (size_t) PP_AR * LDQ * 2 + 2 * (size_t) PP_AK * LDQ * 2 + 2 * (size_t) PP_AR * PP_LDS * 4 +
                            (size_t) PP_AR * PP_LDP * 2 + 4 * (size_t) PP_AR * 4 + 16;
 // HALVES: the rows 0-31 (warps 0-3) and 32-63 (warps 4-7) synchronise their S / softmax / P V phases with their own
@@ -1084,7 +1087,10 @@ constexpr int SNT = 256, SLD = AD + 8, SRES = 8;   // threads, K / V / Q row pit
 // of 64-key tiles fits 2 a SM.
 template <int RT, int SK_> struct StreamGeo {
     static constexpr int SK = SK_;                              // keys a tile
-    static constexpr int SSLD = SK + 4;                         // S row pitch (floats); P (halves) over it
+#ifndef Q35_STREAM_SPAD
+#define Q35_STREAM_SPAD 12   // (S / P row pitch padding: 4 put rows 8 apart on the same banks - K8V8 1 token 0.277 -> 0.249 ms at 68K)
+#endif
+    static constexpr int SSLD = SK + Q35_STREAM_SPAD;           // S row pitch (floats); P (halves) over it
     static constexpr int NF = RT * 16 / 8;                      // O fragments a warp (RT x 16 over 8 warps)
     static constexpr int NFR = RT * SK / 16;                    // S fragments a tile
     // S's tasks (REUSE): a warp a (key column of 16, head-dimension part) - each K fragment loaded once for the RT row
