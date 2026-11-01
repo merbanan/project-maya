@@ -38,6 +38,16 @@ __device__ __forceinline__ float block_sum(float v, float* sh) {
     return warp_sum(s);
 }
 
+// the GDN recurrent state's storage: FP16, the arithmetic F32 in registers (kQ35StateBytes; -DQ35_STATE_F32 for F32).
+// Chain 292: the same 512 greedy tokens at 2K / 35K / 68K, DFlash2 35K 84.35 -> 85.65, MTP 68K 39.0 -> 39.7 tok/s
+#ifndef Q35_STATE_F32
+#define GST_LD(p, i) __half2float(((const __half*) (p))[i])
+#define GST_ST(p, i, v) (((__half*) (p))[i] = __float2half(v))
+#else
+#define GST_LD(p, i) ((p)[i])
+#define GST_ST(p, i, v) ((p)[i] = (v))
+#endif
+
 // ------------------------------------------------------------------------------------------------ norms
 __global__ void rms_rows_kernel(const float* __restrict__ x, int ldx, const float* __restrict__ w,
                                 float* __restrict__ of, __half* __restrict__ oh, int cols, float eps) {
@@ -237,7 +247,7 @@ __global__ void __launch_bounds__(128) gdn_seq_kernel(float* __restrict__ state,
     __shared__ float sq[S], sk[S];
     float st[S];
 #pragma unroll
-    for (int i = 0; i < S; ++i) st[i] = state[((size_t) i * h_v + h) * S + j];
+    for (int i = 0; i < S; ++i) st[i] = GST_LD(state, ((size_t) i * h_v + h) * S + j);
     const float qscale = 1.0f / sqrtf((float) S);
     for (int t = 0; t < T; ++t) {
         const float* xr = x + (size_t) t * ld;
@@ -259,7 +269,7 @@ __global__ void __launch_bounds__(128) gdn_seq_kernel(float* __restrict__ state,
     }
     if (commit) {
 #pragma unroll
-        for (int i = 0; i < S; ++i) state[((size_t) i * h_v + h) * S + j] = st[i];
+        for (int i = 0; i < S; ++i) GST_ST(state, ((size_t) i * h_v + h) * S + j, st[i]);
     }
 }
 
@@ -276,7 +286,7 @@ __global__ void __launch_bounds__(128) gdn_seq4_kernel(float* __restrict__ state
     __shared__ float sq[S], sk[S], rs[4][32], ra[4][32];
     float st[R];
 #pragma unroll
-    for (int i = 0; i < R; ++i) st[i] = state[((size_t) (i0 + i) * h_v + h) * S + j];
+    for (int i = 0; i < R; ++i) st[i] = GST_LD(state, ((size_t) (i0 + i) * h_v + h) * S + j);
     const float qscale = 1.0f / sqrtf((float) S);
     for (int t = 0; t < T; ++t) {
         const float* xr = x + (size_t) t * ld;
@@ -303,7 +313,7 @@ __global__ void __launch_bounds__(128) gdn_seq4_kernel(float* __restrict__ state
     }
     if (commit) {
 #pragma unroll
-        for (int i = 0; i < R; ++i) state[((size_t) (i0 + i) * h_v + h) * S + j] = st[i];
+        for (int i = 0; i < R; ++i) GST_ST(state, ((size_t) (i0 + i) * h_v + h) * S + j, st[i]);
     }
 }
 
@@ -320,7 +330,7 @@ __global__ void __launch_bounds__(128) gdn_seq4p_kernel(float* __restrict__ stat
     __shared__ float sq[2][S], sk[2][S], rs[4][32], ra[4][32];
     float st[R];
 #pragma unroll
-    for (int i = 0; i < R; ++i) st[i] = state[((size_t) (i0 + i) * h_v + h) * S + j];
+    for (int i = 0; i < R; ++i) st[i] = GST_LD(state, ((size_t) (i0 + i) * h_v + h) * S + j);
     const float qscale = 1.0f / sqrtf((float) S);
     // token 0's inputs
     float nv = x[2 * h_k * S + h * S + j], ng = g[h], nb = b[h];
@@ -358,7 +368,7 @@ __global__ void __launch_bounds__(128) gdn_seq4p_kernel(float* __restrict__ stat
     }
     if (commit) {
 #pragma unroll
-        for (int i = 0; i < R; ++i) state[((size_t) (i0 + i) * h_v + h) * S + j] = st[i];
+        for (int i = 0; i < R; ++i) GST_ST(state, ((size_t) (i0 + i) * h_v + h) * S + j, st[i]);
     }
 }
 
@@ -468,7 +478,7 @@ __global__ void __launch_bounds__(256) gdn_chunk_scan_kernel(float* __restrict__
     __shared__ float sM[GC][GC + 1], sF[2 * GC];
     const int h = blockIdx.x, j0 = blockIdx.y * CW, tid = threadIdx.x, kh = gdn_kh(h, h_k);
     const float qscale = 1.0f / sqrtf((float) S);
-    for (int e = tid; e < S * CW; e += 256) sS[e / CW][e % CW] = state[((size_t) (e / CW) * h_v + h) * S + j0 + e % CW];
+    for (int e = tid; e < S * CW; e += 256) sS[e / CW][e % CW] = GST_LD(state, ((size_t) (e / CW) * h_v + h) * S + j0 + e % CW);
     const int nch = (R + GC - 1) / GC;
     const int dt = tid >> 3, dj = (tid & 7) * 4;          // D / O: row dt, columns dj .. dj + 3
     const int si = tid >> 1, sj = (tid & 1) * 16;          // S: row si, columns sj .. sj + 15
@@ -541,7 +551,7 @@ __global__ void __launch_bounds__(256) gdn_chunk_scan_kernel(float* __restrict__
         }
     }
     __syncthreads();
-    for (int e = tid; e < S * CW; e += 256) state[((size_t) (e / CW) * h_v + h) * S + j0 + e % CW] = sS[e / CW][e % CW];
+    for (int e = tid; e < S * CW; e += 256) GST_ST(state, ((size_t) (e / CW) * h_v + h) * S + j0 + e % CW, sS[e / CW][e % CW]);
 }
 
 // ---- commit of every GDN layer in two launches (a verify window's kept n tokens): the conv states take the last 3
@@ -568,7 +578,7 @@ __global__ void __launch_bounds__(128) commit_gdn_kernel(const Q35CommitLayer* _
     __shared__ float sk[S], rs[4][32];
     float st[R];
 #pragma unroll
-    for (int i = 0; i < R; ++i) st[i] = state[((size_t) (i0 + i) * h_v + h) * S + j];
+    for (int i = 0; i < R; ++i) st[i] = GST_LD(state, ((size_t) (i0 + i) * h_v + h) * S + j);
     for (int t = 0; t < n; ++t) {
         const float* xr = x + (size_t) t * C;
         __syncthreads();
@@ -588,7 +598,7 @@ __global__ void __launch_bounds__(128) commit_gdn_kernel(const Q35CommitLayer* _
         for (int i = 0; i < R; ++i) st[i] += sk[i0 + i] * d;
     }
 #pragma unroll
-    for (int i = 0; i < R; ++i) state[((size_t) (i0 + i) * h_v + h) * S + j] = st[i];
+    for (int i = 0; i < R; ++i) GST_ST(state, ((size_t) (i0 + i) * h_v + h) * S + j, st[i]);
 }
 
 // ------------------------------------------------------------------------------------------------ attention prep
@@ -1932,7 +1942,7 @@ __global__ void __launch_bounds__(128) commit_gdn_rec_kernel(const Q35CommitLaye
     __shared__ float sk[2][S];
     float st[R];
 #pragma unroll
-    for (int i = 0; i < R; ++i) st[i] = state[((size_t) (i0 + i) * h_v + h) * S + j];
+    for (int i = 0; i < R; ++i) st[i] = GST_LD(state, ((size_t) (i0 + i) * h_v + h) * S + j);
     for (int t = 0; t < n; ++t) {
         float* skb = sk[t & 1];
         skb[threadIdx.x] = x[(size_t) t * C + h_k * S + kh * S + threadIdx.x];
@@ -1945,7 +1955,7 @@ __global__ void __launch_bounds__(128) commit_gdn_rec_kernel(const Q35CommitLaye
         for (int i = 0; i < R; ++i) st[i] += skb[i0 + i] * d;
     }
 #pragma unroll
-    for (int i = 0; i < R; ++i) state[((size_t) (i0 + i) * h_v + h) * S + j] = st[i];
+    for (int i = 0; i < R; ++i) GST_ST(state, ((size_t) (i0 + i) * h_v + h) * S + j, st[i]);
 }
 
 void q35_commit_all(const Q35CommitLayer* tab_dev, int n_layers, int n, int C, int h_k, int h_v, void* stream, bool rec) {

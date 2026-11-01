@@ -1241,7 +1241,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                         }
                     }
                 }
-                const uint64_t sbytes = (uint64_t) cfg_.ssm_state * cfg_.ssm_v_heads * cfg_.ssm_state * 4;
+                const uint64_t sbytes = (uint64_t) cfg_.ssm_state * cfg_.ssm_v_heads * cfg_.ssm_state * kQ35StateBytes;
                 const uint64_t cbytes = (uint64_t) C * (cfg_.ssm_d_conv - 1) * 4;
                 if (!I.alloc(&L.state, sbytes, err, "GDN state") || !I.alloc(&L.conv_state, cbytes, err, "conv state") ||
                     !I.alloc(&L.st_raw, (uint64_t) kMaxCols * C * 4, err, "verify stash") ||
@@ -1383,7 +1383,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
 
 void DenseModel::reset() {
     Impl& I = *impl_;
-    const uint64_t sbytes = (uint64_t) cfg_.ssm_state * cfg_.ssm_v_heads * cfg_.ssm_state * 4;
+    const uint64_t sbytes = (uint64_t) cfg_.ssm_state * cfg_.ssm_v_heads * cfg_.ssm_state * kQ35StateBytes;
     const uint64_t cbytes = (uint64_t) cfg_.conv_channels() * (cfg_.ssm_d_conv - 1) * 4;
     for (Layer& L : I.layers) {
         if (L.state) cudaMemsetAsync(L.state, 0, sbytes, I.stream);
@@ -2286,7 +2286,7 @@ bool DenseModel::dflash_draft(int32_t anchor, int K, std::vector<int32_t>& out, 
 
 uint64_t DenseModel::ckpt_bytes() const {
     const Impl& I = *impl_;
-    const uint64_t sb = (uint64_t) cfg_.ssm_state * cfg_.ssm_v_heads * cfg_.ssm_state * 4;
+    const uint64_t sb = (uint64_t) cfg_.ssm_state * cfg_.ssm_v_heads * cfg_.ssm_state * kQ35StateBytes;
     const uint64_t cb = (uint64_t) cfg_.conv_channels() * (cfg_.ssm_d_conv - 1) * 4;
     uint64_t n = 0;
     for (const Layer& L : I.layers)
@@ -2299,7 +2299,7 @@ namespace {
 // every buffer of the recurrent state, in a fixed order: (device pointer, bytes)
 std::vector<std::pair<void*, uint64_t>> ckpt_parts(DenseModel::Impl& I, const DenseConfig& c) {
     std::vector<std::pair<void*, uint64_t>> v;
-    const uint64_t sb = (uint64_t) c.ssm_state * c.ssm_v_heads * c.ssm_state * 4;
+    const uint64_t sb = (uint64_t) c.ssm_state * c.ssm_v_heads * c.ssm_state * kQ35StateBytes;
     const uint64_t cb = (uint64_t) c.conv_channels() * (c.ssm_d_conv - 1) * 4;
     for (Layer& L : I.layers)
         if (!L.attn) { v.push_back({L.state, sb}); v.push_back({L.conv_state, cb}); }

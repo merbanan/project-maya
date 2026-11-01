@@ -53,6 +53,12 @@ bool q35_gdn_prep(float* conv_state, const float* raw, int ld, const float* w, f
 /// The GDN value heads' order: 0 (default) GGUF's tiled one (value head h reads key head h % h_k), g > 0 the model's
 /// grouped one (h / g, g = h_v / h_k) - the EXL3 checkpoints keep it.
 void q35_set_gdn_grouped(int group);
+/// bytes an element of the GDN recurrent state (FP16 storage; -DQ35_STATE_F32 for F32)
+#ifdef Q35_STATE_F32
+constexpr int kQ35StateBytes = 4;
+#else
+constexpr int kQ35StateBytes = 2;
+#endif
 /// d_rec (a verify pass; with the pipelined kernel): each token's update d [T][h_v][128] recorded for commit
 void q35_gdn_seq(float* state, const float* x, int ld, const float* g, const float* b, int ldg, float* o, int T,
                  int h_k, int h_v, bool commit, void* stream, float* d_rec = nullptr);
