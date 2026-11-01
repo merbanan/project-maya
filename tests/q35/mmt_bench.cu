@@ -113,7 +113,30 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < 50; ++i) strata::kernels::q35_mmtp(type, dQ, dXh, dY, K, N, M, dP, s);
                 cudaEventRecord(e1, s); cudaEventSynchronize(e1);
                 float ms; cudaEventElapsedTime(&ms, e0, e1);
-                printf("   packed M %d: %8.1f us  %6.0f GB/s\n", M, 1000 * ms / 50, nb * bytes / (ms / 50 * 1e-3) / 1e9);
+                printf("   packed M %d: %8.1f us  %6.0f GB/s", M, 1000 * ms / 50, nb * bytes / (ms / 50 * 1e-3) / 1e9);
+                for (int pr = 1; pr <= 2; ++pr) {   // the loads alone / the math alone
+                    strata::kernels::q35_mmtp_set_probe(pr);
+                    strata::kernels::q35_mmtp(type, dQ, dXh, dY, K, N, M, dP, s);
+                    cudaEventRecord(e0, s);
+                    for (int i = 0; i < 50; ++i) strata::kernels::q35_mmtp(type, dQ, dXh, dY, K, N, M, dP, s);
+                    cudaEventRecord(e1, s); cudaEventSynchronize(e1);
+                    float mp; cudaEventElapsedTime(&mp, e0, e1);
+                    printf("  %s %7.1f us", pr == 1 ? "loads" : "math", 1000 * mp / 50);
+                }
+                strata::kernels::q35_mmtp_set_probe(0);
+                printf("\n");
+                printf("     splits:");   // (the heuristic's choice against a sweep)
+                for (int sp : {1, 2, 3, 4, 5, 6, 8, 10, 16}) {
+                    strata::kernels::q35_mmtp_set_probe(0, sp);
+                    strata::kernels::q35_mmtp(type, dQ, dXh, dY, K, N, M, dP, s);
+                    cudaEventRecord(e0, s);
+                    for (int i = 0; i < 50; ++i) strata::kernels::q35_mmtp(type, dQ, dXh, dY, K, N, M, dP, s);
+                    cudaEventRecord(e1, s); cudaEventSynchronize(e1);
+                    float mp; cudaEventElapsedTime(&mp, e0, e1);
+                    printf("  %d: %.1f", sp, 1000 * mp / 50);
+                }
+                strata::kernels::q35_mmtp_set_probe(0, 0);
+                printf(" us\n");
             }
             cudaFree(dQ);
         }

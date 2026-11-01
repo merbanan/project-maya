@@ -1,3 +1,4 @@
+#include <cstdlib>
 // src/kernels/cuda/q35_mmt.cu - Y[t][n] = sum_k W[n][k] X[t][k] for up to 8 token rows on the tensor cores (sm_70+),
 // the weights in their GGUF blocks (Q4_K, Q5_K, Q6_K, Q8_0).  See q35_kernels.hpp (q35_mmt).
 //
@@ -420,7 +421,9 @@ __global__ void __launch_bounds__(64) dequant_packed_kernel(const uint4* __restr
         *(uint4*) (out + (size_t) (g * 32 + r - g0 * 32) * K + (size_t) sb * 256 + lane * 8) = *(const uint4*) (tl + r * LD + lane * 8);
 }
 
-template <int TYPE>
+// PROBE (mmt_bench only): 1 the weights' loads alone (no dequantization / products), 2 the math alone (every
+// super-block over the first one's registers)
+template <int TYPE, int PROBE = 0>
 __global__ void __launch_bounds__(kW * 32) mmtp_kernel(const uint4* __restrict__ P, const __half* __restrict__ X, int K,
                                                        int N, int M, int sb_per_split, float* __restrict__ out) {
     constexpr int CH = packed_bytes<TYPE>() / 16;
@@ -452,8 +455,9 @@ __global__ void __launch_bounds__(kW * 32) mmtp_kernel(const uint4* __restrict__
         }
         __syncthreads();
         if (!on) continue;
-        if (sb + 1 < sb1) load(sb + 1, nx);
-        sb_mma<TYPE>(w, 0, sx + tok * kXld, 0, c);
+        if (sb + 1 < sb1 && PROBE != 2) load(sb + 1, nx);
+        if (PROBE != 1) sb_mma<TYPE>(w, 0, sx + tok * kXld, 0, c);
+        else c[0] += __uint_as_float(w[0] ^ w[4 * CH - 1]);   // (the loads kept alive)
     }
     if (!on) return;
     const int j = lane & 3, hi = lane >> 4, b = 4 * ((lane >> 2) & 3);
@@ -715,11 +719,32 @@ void q35_mmt_dequant_packed(int ggml_type, const void* packed, int K, int N, int
     check("q35_mmt_dequant_packed");
 }
 
+static int g_mmtp_probe = 0, g_mmtp_splits = 0;
+void q35_mmtp_set_probe(int probe, int splits) { g_mmtp_probe = probe; g_mmtp_splits = splits; }
 void q35_mmtp(int ggml_type, const void* packed, const uint16_t* xh8, float* y, int K, int N, int M, float* part,
               void* stream) {
     if (M < 1 || M > 8 || K % 256 != 0) throw std::invalid_argument("q35_mmtp: 1..8 rows, K a multiple of 256");
     const int nsb = K / 256, bx = (N + kW * 32 - 1) / (kW * 32);
-    int splits = std::max(1, std::min(std::min(64, nsb / 2), (8 * sm_count() + bx - 1) / bx));
+    // super-block splits: as many as fill one wave of resident blocks (the SMs x the kernel's blocks a SM), not more -
+    // a second, part-filled wave or more partials to reduce cost more than they gain (mmt_bench, V100, 1-8 tokens:
+    // Q4_K 17408 x 5120 2 splits, 5120 x 17408 10, Q6_K 6, Q8_0 1 - each the sweep's best or within 2%)
+    static int per_sm[16] = {};
+    const int ti = ggml_type & 15;
+    if (per_sm[ti] == 0) {
+        int b = 0;
+        switch (ggml_type) {
+        case 12: cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, mmtp_kernel<12>, kW * 32, 0); break;
+        case 13: cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, mmtp_kernel<13>, kW * 32, 0); break;
+        case 14: cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, mmtp_kernel<14>, kW * 32, 0); break;
+        case 8: cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, mmtp_kernel<8>, kW * 32, 0); break;
+        default: break;
+        }
+        per_sm[ti] = std::max(1, b);
+    }
+    static const bool wave = !std::getenv("STRATA_DENSE_MMTP_WAVE") || std::atoi(std::getenv("STRATA_DENSE_MMTP_WAVE")) != 0;
+    int splits = wave ? std::max(1, std::min(std::min(64, nsb / 2), sm_count() * per_sm[ti] / bx))
+                      : std::max(1, std::min(std::min(64, nsb / 2), (8 * sm_count() + bx - 1) / bx));   // (the old rule)
+    if (g_mmtp_splits > 0) splits = std::min(g_mmtp_splits, nsb);   // (mmt_bench's sweep)
     const int per = (nsb + splits - 1) / splits;
     splits = (nsb + per - 1) / per;
     float* dst = splits == 1 ? y : part;
@@ -729,10 +754,17 @@ void q35_mmtp(int ggml_type, const void* packed, const uint16_t* xh8, float* y, 
     const uint4* P = (const uint4*) packed;
     const __half* X = (const __half*) xh8;
     switch (ggml_type) {
-    case 12: mmtp_kernel<12><<<grid, kW * 32, 0, s>>>(P, X, K, N, M, per, dst); break;
-    case 13: mmtp_kernel<13><<<grid, kW * 32, 0, s>>>(P, X, K, N, M, per, dst); break;
-    case 14: mmtp_kernel<14><<<grid, kW * 32, 0, s>>>(P, X, K, N, M, per, dst); break;
-    case 8: mmtp_kernel<8><<<grid, kW * 32, 0, s>>>(P, X, K, N, M, per, dst); break;
+#define Q35_MMTP(T)                                                                                              \
+        do {                                                                                                     \
+            if (g_mmtp_probe == 1) mmtp_kernel<T, 1><<<grid, kW * 32, 0, s>>>(P, X, K, N, M, per, dst);          \
+            else if (g_mmtp_probe == 2) mmtp_kernel<T, 2><<<grid, kW * 32, 0, s>>>(P, X, K, N, M, per, dst);     \
+            else mmtp_kernel<T><<<grid, kW * 32, 0, s>>>(P, X, K, N, M, per, dst);                              \
+        } while (0)
+    case 12: Q35_MMTP(12); break;
+    case 13: Q35_MMTP(13); break;
+    case 14: Q35_MMTP(14); break;
+    case 8: Q35_MMTP(8); break;
+#undef Q35_MMTP
     default: throw std::invalid_argument("q35_mmtp: weight type");
     }
     check("q35_mmtp");

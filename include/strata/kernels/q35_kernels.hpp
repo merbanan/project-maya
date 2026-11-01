@@ -144,6 +144,9 @@ void q35_mmt(int ggml_type, const void* W, const uint16_t* xh8, float* y, int K,
 /// repacking of a GGUF matrix (W N rows of K) into it, and the GEMV over it (as q35_mmt).
 uint64_t q35_mmt_packed_bytes(int ggml_type, int K, int N);
 void q35_mmt_pack(int ggml_type, const void* W, void* packed, int K, int N, void* stream);
+/// (mmt_bench) q35_mmtp's kernel with only its weight loads (1) or only its math (2), 0: whole; splits > 0: that
+/// many super-block splits instead of the heuristic's.
+void q35_mmtp_set_probe(int probe, int splits = 0);
 /// A packed matrix of the rows ids[0..n) of another packed matrix (both K inputs; dst row j = src row ids[j]).
 void q35_mmt_gather_packed(int ggml_type, const void* packed, int K, const int* ids, int n, void* dst, void* stream);
 void q35_mmt_unpack(int ggml_type, const void* packed, void* W, int K, int N, void* stream);
