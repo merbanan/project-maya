@@ -22,6 +22,12 @@
 namespace strata::kernels {
 namespace {
 
+// the GEMVs' packed weight loads: streaming (evict-first) - each weight is read once a pass, and through the
+// read-only path it pushed the reused data out of L2 (chain 280, same tokens: MTP 2K 80.0 -> 83.2, 35K 66.0 -> 67.2,
+// plain 2K 35.0 -> 35.2 tok/s; the prompt path's dequantization keeps __ldg, PP unchanged)
+__device__ __forceinline__ uint4 ldw(const uint4* p) { return __ldcs(p); }
+
+
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
@@ -440,7 +446,7 @@ __global__ void __launch_bounds__(kW * 32) mmtp_kernel(const uint4* __restrict__
         const uint4* t = P + ((size_t) g * nsb + sb) * 32 * CH + lane;
 #pragma unroll
         for (int k = 0; k < CH; ++k) {
-            const uint4 v = __ldg(t + k * 32);
+            const uint4 v = ldw(t + k * 32);
             d[4 * k] = v.x; d[4 * k + 1] = v.y; d[4 * k + 2] = v.z; d[4 * k + 3] = v.w;
         }
     };
@@ -573,7 +579,7 @@ __global__ void __launch_bounds__(128) mmtp_dp4a_kernel(const uint4* __restrict_
         const uint4* tp = P + ((size_t) g * nsb + sb) * 32 * CH + lane;
 #pragma unroll
         for (int k = 0; k < CH; ++k) {
-            const uint4 v = __ldg(tp + k * 32);
+            const uint4 v = ldw(tp + k * 32);
             w[4 * k] = v.x; w[4 * k + 1] = v.y; w[4 * k + 2] = v.z; w[4 * k + 3] = v.w;
         }
 #pragma unroll
