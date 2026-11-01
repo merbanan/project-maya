@@ -72,6 +72,7 @@ struct Layer {
     float *state = nullptr, *conv_state = nullptr;
     // a verify pass's inputs of the recurrence (kMaxCols tokens): raw conv input, conv output (q, k normed), g, b
     float *st_raw = nullptr, *st_conv = nullptr, *st_ab = nullptr;   // st_ab rows: [g (h_v) | b (h_v)]
+    float* st_d = nullptr;                          // the verify pass's recurrence updates [kMaxCols][h_v][128] (commit)
     // attention mixer
     QMat q, k, v, o;
     float *q_norm = nullptr, *k_norm = nullptr;
@@ -132,6 +133,13 @@ struct Dflash {
     std::vector<DfLayer> layers;
     int64_t* ring_pos = nullptr;
     std::vector<float> conf_h;                        // the last draft's confidences (host)
+    // a sampled request's draft (dflash_sample): the walk draws with u_h's uniforms at temp; q_h / cand_h the
+    // drawn positions' proposal distributions [K][top_k] and their candidates' ids
+    bool sample = false;
+    float temp = 1.0f;
+    std::vector<float> u_h, q_h;
+    std::vector<int32_t> cand_h;
+    float *u_dev = nullptr, *q_dev = nullptr;
     // buffers
     float *feat = nullptr, *h = nullptr, *dyn = nullptr, *a = nullptr, *hf = nullptr, *logits = nullptr, *gate = nullptr;
     float* cand_v = nullptr;
@@ -721,6 +729,8 @@ struct DenseModel::Impl {
     // (decode / verify) the GEMV input's FP16 rows written by the kernel that made x: no conversion pass
     // (STRATA_DENSE_FUSE=0: the separate passes); rows past T keep stale finite values - their products are dropped
     bool fuse = true;
+    // commit from the verify pass's recorded recurrence updates (STRATA_DENSE_COMMIT_REC=0: recomputed)
+    bool commit_rec = true;
     uint16_t* h8_out(int T) const { return fuse && T <= kMaxCols ? xh8 : nullptr; }
     void prep_h8(const float* x, int n_in, int T) {
         prep(x, n_in, T);
@@ -733,7 +743,10 @@ struct DenseModel::Impl {
                 const int64_t step = std::max<int64_t>(32, gemm.scratch_elems() / w.n_in / 32 * 32);
                 for (int64_t r0 = 0; r0 < w.n_out; r0 += step) {
                     const int rows = (int) std::min<int64_t>(step, w.n_out - r0);
-                    q35_mmt_dequant_packed(w.type, w.dev, w.n_in, w.n_out, (int) r0, rows, gemm.scratch(), stream);
+                    // (STRATA_DENSE_PP_NODQ=1: a measurement only - the GEMM over a stale scratch, wrong output - the
+                    // weights' decode left out, what reusing decoded weights across chunks could save at most)
+                    static const bool nodq = std::getenv("STRATA_DENSE_PP_NODQ") && std::atoi(std::getenv("STRATA_DENSE_PP_NODQ")) != 0;
+                    if (!nodq) q35_mmt_dequant_packed(w.type, w.dev, w.n_in, w.n_out, (int) r0, rows, gemm.scratch(), stream);
                     gemm.f16(xh, gemm.scratch(), y + r0, cur_T, rows, w.n_in, w.n_out);
                 }
             } else {
@@ -1233,7 +1246,8 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                 if (!I.alloc(&L.state, sbytes, err, "GDN state") || !I.alloc(&L.conv_state, cbytes, err, "conv state") ||
                     !I.alloc(&L.st_raw, (uint64_t) kMaxCols * C * 4, err, "verify stash") ||
                     !I.alloc(&L.st_conv, (uint64_t) kMaxCols * C * 4, err, "verify stash") ||
-                    !I.alloc(&L.st_ab, (uint64_t) kMaxCols * 2 * cfg_.ssm_v_heads * 4, err, "verify stash"))
+                    !I.alloc(&L.st_ab, (uint64_t) kMaxCols * 2 * cfg_.ssm_v_heads * 4, err, "verify stash") ||
+                    !I.alloc(&L.st_d, (uint64_t) kMaxCols * cfg_.ssm_v_heads * cfg_.ssm_state * 4, err, "verify stash"))
                     return false;
             } else if (!load_attn(L, p)) {
                 return false;
@@ -1347,6 +1361,9 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         if (const char* e = std::getenv("STRATA_DENSE_MMT1")) I.mmt1 = std::atoi(e) != 0;
         if (const char* e = std::getenv("STRATA_DENSE_MMT_MIN")) I.mmt_min = std::max(1, std::atoi(e));
         if (const char* e = std::getenv("STRATA_DENSE_FUSE")) I.fuse = std::atoi(e) != 0;
+        if (const char* e = std::getenv("STRATA_DENSE_COMMIT_REC")) I.commit_rec = std::atoi(e) != 0;
+        if (const char* e = std::getenv("STRATA_DENSE_GDN_PIPE"); e && std::atoi(e) == 0) I.commit_rec = false;   // (records: pipelined kernel)
+        if (const char* e = std::getenv("STRATA_DENSE_GDN_OLD"); e && std::atoi(e) != 0) I.commit_rec = false;
         if (const char* e = std::getenv("STRATA_DENSE_GRAPH")) I.graphs = std::atoi(e) != 0;
         if (const char* e = std::getenv("STRATA_DENSE_PACKED_DP4A")) I.packed_dp4a = std::atoi(e) != 0;
         I.pairs_mma = std::getenv("STRATA_DENSE_PAIRS_MMA") != nullptr;
@@ -1635,7 +1652,7 @@ bool DenseModel::forward(const int32_t* tokens, int T, bool verify, int want, st
                     q35_gate_beta(ab, ab + VH, 2 * VH, L.dt, L.ssm_a, T, VH, s);
                 }
                 I.stage("gdn_conv", s);
-                q35_gdn_seq(L.state, cv, C, ab, ab + VH, 2 * VH, I.o, T, KH, VH, !verify, s);
+                q35_gdn_seq(L.state, cv, C, ab, ab + VH, 2 * VH, I.o, T, KH, VH, !verify, s, verify && I.commit_rec ? L.st_d : nullptr);
                 I.stage("gdn_rec", s);
                 q35_gdn_out(I.o, I.z, L.ssm_norm, I.y, T * VH, eps, s);
                 I.prep(I.y, V, T);
@@ -1720,7 +1737,7 @@ bool DenseModel::commit(int n, std::string& err) {
         if (!old && !I.commit_tab && I.commit_n >= 0) {
             std::vector<strata::kernels::Q35CommitLayer> tab;
             for (Layer& L : I.layers)
-                if (!L.attn) tab.push_back({L.conv_state, L.st_raw, L.state, L.st_conv, L.st_ab});
+                if (!L.attn) tab.push_back({L.conv_state, L.st_raw, L.state, L.st_conv, L.st_ab, L.st_d});
             if (tab.empty()) I.commit_n = -1;   // (no GDN layer: nothing to commit)
             else if (cudaMalloc(&I.commit_tab, tab.size() * sizeof(tab[0])) != cudaSuccess ||
                 cudaMemcpy(I.commit_tab, tab.data(), tab.size() * sizeof(tab[0]), cudaMemcpyHostToDevice) != cudaSuccess)
@@ -1728,7 +1745,7 @@ bool DenseModel::commit(int n, std::string& err) {
             if (!tab.empty()) I.commit_n = (int) tab.size();
         }
         if (!old) {
-            if (I.commit_n > 0) q35_commit_all(I.commit_tab, I.commit_n, n, C, KH, VH, I.stream);
+            if (I.commit_n > 0) q35_commit_all(I.commit_tab, I.commit_n, n, C, KH, VH, I.stream, I.commit_rec);
         } else {
             for (Layer& L : I.layers) {
                 if (L.attn) continue;
@@ -2043,6 +2060,7 @@ bool DenseModel::dflash_load(const std::string& path, std::string& err) {
             !I.alloc(&F.gate, W * F.rank * 4, err, "dflash") ||
             !I.alloc(&F.cand_v, W * F.top_k * 4, err, "dflash") || !I.alloc(&F.cand_i, W * F.top_k * 4, err, "dflash") ||
             !I.alloc(&F.tok, W * 4, err, "dflash") || !I.alloc(&F.conf, W * 4, err, "dflash") ||
+            !I.alloc(&F.u_dev, W * 4, err, "dflash") || !I.alloc(&F.q_dev, W * F.top_k * 4, err, "dflash") ||
             !I.alloc(&F.kc, std::max(R, W) * kvd * 4, err, "dflash k") || !I.alloc(&F.vc, std::max(R, W) * kvd * 4, err, "dflash v") ||
             !I.alloc(&F.attn_part, (uint64_t) q35_df_attn_scratch(F.n_head, (int) W, F.window), err, "dflash attn") ||
             !I.alloc(&F.topk_scratch, (uint64_t) q35_df_topk_scratch((int) W, F.top_k), err, "dflash"))
@@ -2108,6 +2126,17 @@ bool DenseModel::dflash_inject(int n, int64_t p0, std::string& err) {
 }
 
 const std::vector<float>& DenseModel::dflash_conf() const { return impl_->df.conf_h; }
+bool DenseModel::dflash_samples() const { return impl_->df.on && !impl_->df.dspark && !impl_->df.plain; }
+void DenseModel::dflash_sample(const std::vector<float>& u, float temperature) {
+    impl_->df.sample = true;
+    impl_->df.u_h = u;
+    impl_->df.temp = temperature;
+}
+void DenseModel::dflash_proposals(std::vector<float>& q, std::vector<int32_t>& cand, int& k) const {
+    q = impl_->df.q_h;
+    cand = impl_->df.cand_h;
+    k = impl_->df.top_k;
+}
 
 const char* DenseModel::dflash_kind() const { return impl_->df.dspark ? "DSpark" : impl_->df.plain ? "DFlash" : "DFlash2"; }
 
@@ -2227,7 +2256,18 @@ bool DenseModel::dflash_draft(int32_t anchor, int K, std::vector<int32_t>& out, 
         q35_df_topk(F.logits, dh.n_out, std::min(F.n_cand, dh.n_out), K, F.top_k, F.cand_i, F.cand_v, F.topk_scratch, s);
         if (I.head_mtp.dev) q35_map_ids(F.cand_i, I.mtp_ids_dev, K * F.top_k, s);
         I.mm(F.hproj, F.gate);
-        q35_df_walk(F.cand_i, F.cand_v, F.gate, F.top_k, F.rank, F.pred, F.succ, anchor, K, F.tok, F.conf, s);
+        if (F.sample && (int) F.u_h.size() >= K) {   // (a sampled request: drawn, with the proposal distributions)
+            cudaMemcpyAsync(F.u_dev, F.u_h.data(), (size_t) K * 4, cudaMemcpyHostToDevice, s);
+            q35_df_walk_sample(F.cand_i, F.cand_v, F.gate, F.top_k, F.rank, F.pred, F.succ, anchor, K, F.u_dev, F.temp,
+                               F.tok, F.conf, F.q_dev, s);
+            F.q_h.resize((size_t) K * F.top_k);
+            F.cand_h.resize((size_t) K * F.top_k);
+            cudaMemcpyAsync(F.q_h.data(), F.q_dev, F.q_h.size() * 4, cudaMemcpyDeviceToHost, s);
+            cudaMemcpyAsync(F.cand_h.data(), F.cand_i, F.cand_h.size() * 4, cudaMemcpyDeviceToHost, s);
+        } else {
+            q35_df_walk(F.cand_i, F.cand_v, F.gate, F.top_k, F.rank, F.pred, F.succ, anchor, K, F.tok, F.conf, s);
+        }
+        F.sample = false;
         out.resize((size_t) K);
         cudaMemcpyAsync(out.data(), F.tok, (size_t) K * 4, cudaMemcpyDeviceToHost, s);
         F.conf_h.resize((size_t) K);

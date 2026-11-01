@@ -53,8 +53,9 @@ bool q35_gdn_prep(float* conv_state, const float* raw, int ld, const float* w, f
 /// The GDN value heads' order: 0 (default) GGUF's tiled one (value head h reads key head h % h_k), g > 0 the model's
 /// grouped one (h / g, g = h_v / h_k) - the EXL3 checkpoints keep it.
 void q35_set_gdn_grouped(int group);
+/// d_rec (a verify pass; with the pipelined kernel): each token's update d [T][h_v][128] recorded for commit
 void q35_gdn_seq(float* state, const float* x, int ld, const float* g, const float* b, int ldg, float* o, int T,
-                 int h_k, int h_v, bool commit, void* stream);
+                 int h_k, int h_v, bool commit, void* stream, float* d_rec = nullptr);
 
 /// One GDN layer's commit inputs: its conv state (3 x C) and recurrent state, the verify window's stashed raw conv
 /// input and conv output rows (stride C), and its [g | b] rows (stride 2 * h_v).
@@ -64,10 +65,13 @@ struct Q35CommitLayer {
     float* state;
     const float* conv;
     const float* ab;
+    const float* d = nullptr;   // the verify pass's recorded updates (commit with rec)
 };
 /// commit of n kept tokens for every layer of tab_dev (a device array): conv states, then the recurrence (the result
 /// of q35_conv_seq + q35_gdn_seq with commit on, without their outputs) - two launches for all layers
-void q35_commit_all(const Q35CommitLayer* tab_dev, int n_layers, int n, int C, int h_k, int h_v, void* stream);
+/// rec: the recurrence from the recorded updates (Q35CommitLayer::d), not recomputed - the same bits
+void q35_commit_all(const Q35CommitLayer* tab_dev, int n_layers, int n, int C, int h_k, int h_v, void* stream,
+                    bool rec = false);
 
 /// rms(o) * w * silu(z) per 128-wide head (`rows` heads in all, dense)
 void q35_gdn_out(const float* o, const float* z, const float* w, float* y, int rows, float eps, void* stream);

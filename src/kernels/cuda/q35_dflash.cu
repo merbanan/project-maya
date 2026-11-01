@@ -376,6 +376,53 @@ __global__ void walk_kernel(const int* __restrict__ cand, const float* __restric
     }
 }
 
+// walk_kernel drawing instead of taking the best: at position i the candidates' scores s (as walk_kernel's) give
+// q_i = softmax(s / T); u[i] (a uniform from the host's generator) picks one by its cumulative q; q_i's k values
+// (in cand's order) go to qp - the proposal distribution a sampled request's exact test needs
+__global__ void walk_sample_kernel(const int* __restrict__ cand, const float* __restrict__ lg, const float* __restrict__ gate,
+                                   int k, int rank, const __half* __restrict__ pt, const __half* __restrict__ st, int anchor,
+                                   int n, const float* __restrict__ u, float inv_t, int* __restrict__ tok,
+                                   float* __restrict__ conf, float* __restrict__ qp) {
+    __shared__ float as[1024];
+    __shared__ float s[kTopKMax];
+    __shared__ int pred;
+    const int r = threadIdx.x, lane = r & 31, w = r >> 5, nw = (int) (blockDim.x >> 5);
+    if (r == 0) pred = anchor;
+    __syncthreads();
+    for (int i = 0; i < n; ++i) {
+        as[r] = __half2float(pt[(size_t) pred * rank + r]) * gate[(size_t) i * rank + r];
+        __syncthreads();
+        for (int j = w; j < k; j += nw) {
+            const int c = cand[(size_t) i * k + j];
+            float t = 0.0f;
+            for (int e = lane; e < rank; e += 32) t += as[e] * __half2float(st[(size_t) c * rank + e]);
+            t = warp_sum(t);
+            if (lane == 0) s[j] = lg[(size_t) i * k + j] + t;
+        }
+        __syncthreads();
+        if (r == 0) {
+            int b = 0;
+            for (int j = 1; j < k; ++j)
+                if (s[j] > s[b]) b = j;
+            float z = 0.0f;
+            for (int j = 0; j < k; ++j) z += __expf((s[j] - s[b]) * inv_t);
+            const float target = u[i] * z;
+            float cum = 0.0f;
+            int pick = k - 1;
+            for (int j = 0; j < k; ++j) {
+                const float e = __expf((s[j] - s[b]) * inv_t);
+                qp[(size_t) i * k + j] = e / z;
+                cum += e;
+                if (pick == k - 1 && cum >= target) pick = j;
+            }
+            tok[i] = cand[(size_t) i * k + pick];
+            conf[i] = qp[(size_t) i * k + pick];
+            pred = tok[i];
+        }
+        __syncthreads();
+    }
+}
+
 }  // namespace
 
 void q35_df_head_norm_rope(float* x, int rows, int n_heads, const float* w, float eps, int64_t pos0, float theta,
@@ -472,6 +519,15 @@ __global__ void gather_f16_kernel(const __half* __restrict__ tab, int rank, cons
     for (int i = threadIdx.x; i < rank; i += blockDim.x) out[i] = __half2float(tab[r * rank + i]);
 }
 }  // namespace
+
+void q35_df_walk_sample(const int* cand, const float* lg, const float* gate, int k, int rank, const uint16_t* pred_tab,
+                        const uint16_t* succ_tab, int anchor, int n, const float* u, float temperature, int* tok,
+                        float* conf, float* qprob, void* stream) {
+    walk_sample_kernel<<<1, rank, 0, (cudaStream_t) stream>>>(cand, lg, gate, k, rank, (const __half*) pred_tab,
+                                                              (const __half*) succ_tab, anchor, n, u,
+                                                              1.0f / std::max(temperature, 1e-3f), tok, conf, qprob);
+    check("q35_df_walk_sample");
+}
 
 void q35_df_gather_f16(const uint16_t* tab, int rank, const int* tok, float* out, void* stream) {
     gather_f16_kernel<<<1, 256, 0, (cudaStream_t) stream>>>((const __half*) tab, rank, tok, out);

@@ -297,7 +297,8 @@ __global__ void __launch_bounds__(128) gdn_seq4_kernel(float* __restrict__ state
 // path.  The same arithmetic in the same order (the same bits)
 __global__ void __launch_bounds__(128) gdn_seq4p_kernel(float* __restrict__ state, const float* __restrict__ x, int ld,
                                                         const float* __restrict__ g, const float* __restrict__ b, int ldg,
-                                                        float* __restrict__ o, int T, int h_k, int h_v, int commit) {
+                                                        float* __restrict__ o, int T, int h_k, int h_v, int commit,
+                                                        float* __restrict__ d_rec) {
     constexpr int S = 128, R = 32;
     const int h = blockIdx.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5, kh = gdn_kh(h, h_k);
     const int j = blockIdx.y * 32 + lane, i0 = w * R;
@@ -332,6 +333,7 @@ __global__ void __launch_bounds__(128) gdn_seq4p_kernel(float* __restrict__ stat
         sk[cb ^ 1][tid] = nk;
         const float skd = ((rs[0][lane] + rs[1][lane]) + rs[2][lane]) + rs[3][lane];
         const float d = (v - skd) * beta;
+        if (d_rec && w == 0) d_rec[((size_t) t * h_v + h) * S + j] = d;   // (a verify pass: the update, for commit)
         float acc = 0.0f;
 #pragma unroll
         for (int i = 0; i < R; ++i) { st[i] += sk[cb][i0 + i] * d; acc += st[i] * sq[cb][i0 + i]; }
@@ -1650,7 +1652,7 @@ void q35_gate_beta(float* alpha, float* beta, int ld, const float* dt, const flo
 void q35_set_gdn_grouped(int group) { cudaMemcpyToSymbol(c_gdn_group, &group, sizeof group); }
 
 void q35_gdn_seq(float* state, const float* x, int ld, const float* g, const float* b, int ldg, float* o, int T,
-                 int h_k, int h_v, bool commit, void* stream) {
+                 int h_k, int h_v, bool commit, void* stream, float* d_rec) {
     if (T <= 0) return;
     static const bool old = std::getenv("STRATA_DENSE_GDN_OLD") && std::atoi(std::getenv("STRATA_DENSE_GDN_OLD")) != 0;
     // (STRATA_DENSE_GDN_PIPE=0: gdn_seq4_kernel, the next token's loads not overlapped)
@@ -1658,17 +1660,50 @@ void q35_gdn_seq(float* state, const float* x, int ld, const float* g, const flo
     if (old)
         gdn_seq_kernel<<<h_v, 128, 0, (cudaStream_t) stream>>>(state, x, ld, g, b, ldg, o, T, h_k, h_v, commit);
     else if (pipe)
-        gdn_seq4p_kernel<<<dim3(h_v, 4), 128, 0, (cudaStream_t) stream>>>(state, x, ld, g, b, ldg, o, T, h_k, h_v, commit);
+        gdn_seq4p_kernel<<<dim3(h_v, 4), 128, 0, (cudaStream_t) stream>>>(state, x, ld, g, b, ldg, o, T, h_k, h_v, commit,
+                                                                          d_rec);
     else
         gdn_seq4_kernel<<<dim3(h_v, 4), 128, 0, (cudaStream_t) stream>>>(state, x, ld, g, b, ldg, o, T, h_k, h_v, commit);
     check("q35_gdn_seq");
 }
 
-void q35_commit_all(const Q35CommitLayer* tab_dev, int n_layers, int n, int C, int h_k, int h_v, void* stream) {
+// commit_gdn_kernel with the verify pass's recorded updates d (Q35CommitLayer::d): no dot product, cross-warp sum or
+// its barrier a token - st = st dec + k d in the same order as commit_gdn_kernel's (the same bits)
+__global__ void __launch_bounds__(128) commit_gdn_rec_kernel(const Q35CommitLayer* __restrict__ tab, int n, int C,
+                                                             int h_k, int h_v) {
+    constexpr int S = 128, R = 32;
+    const Q35CommitLayer& L = tab[blockIdx.z];
+    float* __restrict__ state = L.state;
+    const float* __restrict__ x = L.conv;
+    const float* __restrict__ g = L.ab;
+    const int ldg = 2 * h_v;
+    const int h = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5, kh = gdn_kh(h, h_k);
+    const int j = blockIdx.y * 32 + lane, i0 = w * R;
+    __shared__ float sk[2][S];
+    float st[R];
+#pragma unroll
+    for (int i = 0; i < R; ++i) st[i] = state[((size_t) (i0 + i) * h_v + h) * S + j];
+    for (int t = 0; t < n; ++t) {
+        float* skb = sk[t & 1];
+        skb[threadIdx.x] = x[(size_t) t * C + h_k * S + kh * S + threadIdx.x];
+        __syncthreads();
+        const float dec = expf(g[(size_t) t * ldg + h]);
+        const float d = L.d[((size_t) t * h_v + h) * S + j];
+#pragma unroll
+        for (int i = 0; i < R; ++i) st[i] *= dec;
+#pragma unroll
+        for (int i = 0; i < R; ++i) st[i] += skb[i0 + i] * d;
+    }
+#pragma unroll
+    for (int i = 0; i < R; ++i) state[((size_t) (i0 + i) * h_v + h) * S + j] = st[i];
+}
+
+void q35_commit_all(const Q35CommitLayer* tab_dev, int n_layers, int n, int C, int h_k, int h_v, void* stream, bool rec) {
     if (n <= 0 || n_layers <= 0) return;
     commit_conv_kernel<<<dim3(blocks(C, 128), n_layers), 128, 0, (cudaStream_t) stream>>>(tab_dev, n, C);
     check("q35_commit_conv");
-    commit_gdn_kernel<<<dim3(h_v, 4, n_layers), 128, 0, (cudaStream_t) stream>>>(tab_dev, n, C, h_k, h_v);
+    if (rec) commit_gdn_rec_kernel<<<dim3(h_v, 4, n_layers), 128, 0, (cudaStream_t) stream>>>(tab_dev, n, C, h_k, h_v);
+    else commit_gdn_kernel<<<dim3(h_v, 4, n_layers), 128, 0, (cudaStream_t) stream>>>(tab_dev, n, C, h_k, h_v);
     check("q35_commit_gdn");
 }
 

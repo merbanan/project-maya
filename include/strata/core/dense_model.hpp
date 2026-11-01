@@ -152,6 +152,11 @@ public:
     /// The last dflash_draft's confidence of each draft (its top-1 probability as the drafter scores it; empty: the
     /// drafter gives none) - what STRATA_DENSE_P_CUM's floor reads.
     const std::vector<float>& dflash_conf() const;
+    /// DFlash2 for a sampled request: the next dflash_draft draws its tokens (u: a uniform a draft, temperature) and
+    /// keeps their proposal distributions - dflash_proposals: q [K][k] over the candidates cand [K][k]
+    bool dflash_samples() const;
+    void dflash_sample(const std::vector<float>& u, float temperature);
+    void dflash_proposals(std::vector<float>& q, std::vector<int32_t>& cand, int& k) const;
     /// "DSpark" or "DFlash2" (the loaded drafter's kind)
     const char* dflash_kind() const;
 

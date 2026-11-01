@@ -704,7 +704,9 @@ int main(int argc, char** argv) {
         // 27B lost 2-3%: off there)
         static const bool spec_env = std::getenv("STRATA_DENSE_SPEC_SAMPLE") ? std::atoi(std::getenv("STRATA_DENSE_SPEC_SAMPLE")) != 0
                                                                               : cfg.n_expert > 0;
-        const bool spec_s = spec_env && !sp.greedy && !use_df && K > 0 && sp.top_k >= 1 && sp.top_k <= 32;
+        // (DFlash2 too: its walk then draws the drafts and reports their proposal distributions - ideas.md 36)
+        const bool spec_s = spec_env && !sp.greedy && (!use_df || model.dflash_samples()) && K > 0 && sp.top_k >= 1 &&
+                            sp.top_k <= 32;
         // STRATA_DENSE_BLOCK_VERIFY=0: sampled drafts tested token by token instead of as a block
         static const bool block_verify = !(std::getenv("STRATA_DENSE_BLOCK_VERIFY") && std::atoi(std::getenv("STRATA_DENSE_BLOCK_VERIFY")) == 0);
         static const double p_cum_env = std::getenv("STRATA_DENSE_P_CUM") ? std::atof(std::getenv("STRATA_DENSE_P_CUM")) : -1.0;
@@ -817,6 +819,11 @@ int main(int argc, char** argv) {
             } else if (k > 0 && use_df) {
                 std::vector<int32_t> d;
                 const auto t_d = Clock::now();
+                if (spec_s) {   // a uniform a draft from the request's generator; the walk draws with them
+                    std::vector<float> u((size_t) k);
+                    for (float& x : u) x = (float) std::uniform_real_distribution<double>(0.0, 1.0)(srng);
+                    model.dflash_sample(u, sp.temperature);
+                }
                 if (!model.dflash_draft(anchor, k, d, err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
                 draft_ms += ms_since(t_d);
                 // the confidence floor (STRATA_DENSE_P_CUM, as for MTP below): the drafts after the one whose running
@@ -829,6 +836,19 @@ int main(int argc, char** argv) {
                     for (size_t j = 0; j < d.size(); ++j) {
                         pr *= cf[j];
                         if (pr < p_cut_df && j + 1 < d.size()) { d.resize(j + 1); ++conf_stops; break; }
+                    }
+                }
+                if (spec_s) {   // the drafts' proposal distributions, for the exact test
+                    std::vector<float> q;
+                    std::vector<int32_t> cand;
+                    int kq = 0;
+                    model.dflash_proposals(q, cand, kq);
+                    qd.clear();
+                    for (size_t j = 0; j < d.size() && (j + 1) * (size_t) kq <= q.size(); ++j) {
+                        SparseDist sd;
+                        sd.n = std::min(kq, 32);
+                        for (int i = 0; i < sd.n; ++i) { sd.ids[i] = cand[j * kq + i]; sd.p[i] = q[j * kq + i]; }
+                        qd.push_back(sd);
                     }
                 }
                 win.insert(win.end(), d.begin(), d.end());

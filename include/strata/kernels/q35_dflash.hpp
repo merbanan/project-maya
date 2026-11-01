@@ -41,6 +41,11 @@ void q35_df_topk(const float* x, int64_t ld, int n, int rows, int k, int* ids, f
 /// the selector walk: tok[i], conf[i] for the rows 0..n-1 (see the header); tables FP16 rows of `rank`
 void q35_df_walk(const int* cand, const float* lg, const float* gate, int k, int rank, const uint16_t* pred_tab,
                  const uint16_t* succ_tab, int anchor, int n, int* tok, float* conf, void* stream);
+/// the walk drawing each token from q_i = softmax(score / temperature) over its k candidates (u: n device uniforms):
+/// tok, conf (q of the drawn one) and qprob [n][k] (q_i in cand's order) - a sampled request's proposal distribution
+void q35_df_walk_sample(const int* cand, const float* lg, const float* gate, int k, int rank, const uint16_t* pred_tab,
+                        const uint16_t* succ_tab, int anchor, int n, const float* u, float temperature, int* tok,
+                        float* conf, float* qprob, void* stream);
 
 /// out (rank floats) = row tok[0] (a device int) of an FP16 table of rows of `rank` (DSpark's Markov W1)
 void q35_df_gather_f16(const uint16_t* tab, int rank, const int* tok, float* out, void* stream);
