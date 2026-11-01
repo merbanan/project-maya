@@ -255,6 +255,59 @@ __global__ void __launch_bounds__(128) gdn_seq4_kernel(float* __restrict__ state
     }
 }
 
+// gdn_seq4_kernel with the next token's inputs (q / k / v / gate / beta) loaded into registers during this token's
+// sums and q / k double-buffered in shared memory: two barriers a token instead of three, the loads off the critical
+// path.  The same arithmetic in the same order (the same bits)
+__global__ void __launch_bounds__(128) gdn_seq4p_kernel(float* __restrict__ state, const float* __restrict__ x, int ld,
+                                                        const float* __restrict__ g, const float* __restrict__ b, int ldg,
+                                                        float* __restrict__ o, int T, int h_k, int h_v, int commit) {
+    constexpr int S = 128, R = 32;
+    const int h = blockIdx.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5, kh = h % h_k;
+    const int j = blockIdx.y * 32 + lane, i0 = w * R;
+    __shared__ float sq[2][S], sk[2][S], rs[4][32], ra[4][32];
+    float st[R];
+#pragma unroll
+    for (int i = 0; i < R; ++i) st[i] = state[((size_t) (i0 + i) * h_v + h) * S + j];
+    const float qscale = 1.0f / sqrtf((float) S);
+    // token 0's inputs
+    float nv = x[2 * h_k * S + h * S + j], ng = g[h], nb = b[h];
+    sq[0][tid] = x[kh * S + tid];
+    sk[0][tid] = x[h_k * S + kh * S + tid];
+    __syncthreads();
+    for (int t = 0; t < T; ++t) {
+        const int cb = t & 1;
+        const float v = nv, dec = expf(ng), beta = nb;
+        float nq = 0.0f, nk = 0.0f;
+        if (t + 1 < T) {   // (the next token's, in flight while this one sums)
+            const float* xn = x + (size_t) (t + 1) * ld;
+            nq = xn[kh * S + tid];
+            nk = xn[h_k * S + kh * S + tid];
+            nv = xn[2 * h_k * S + h * S + j];
+            ng = g[(size_t) (t + 1) * ldg + h];
+            nb = b[(size_t) (t + 1) * ldg + h];
+        }
+        float p = 0.0f;
+#pragma unroll
+        for (int i = 0; i < R; ++i) { st[i] *= dec; p += st[i] * sk[cb][i0 + i]; }
+        rs[w][lane] = p;
+        __syncthreads();
+        sq[cb ^ 1][tid] = nq;   // (the other buffer: last read before the barrier above)
+        sk[cb ^ 1][tid] = nk;
+        const float skd = ((rs[0][lane] + rs[1][lane]) + rs[2][lane]) + rs[3][lane];
+        const float d = (v - skd) * beta;
+        float acc = 0.0f;
+#pragma unroll
+        for (int i = 0; i < R; ++i) { st[i] += sk[cb][i0 + i] * d; acc += st[i] * sq[cb][i0 + i]; }
+        ra[w][lane] = acc;
+        __syncthreads();
+        if (w == 0) o[(size_t) t * h_v * S + h * S + j] = (((ra[0][lane] + ra[1][lane]) + ra[2][lane]) + ra[3][lane]) * qscale;
+    }
+    if (commit) {
+#pragma unroll
+        for (int i = 0; i < R; ++i) state[((size_t) (i0 + i) * h_v + h) * S + j] = st[i];
+    }
+}
+
 // ---- commit of every GDN layer in two launches (a verify window's kept n tokens): the conv states take the last 3
 // of [state | raw rows], the recurrence runs gdn_seq4's arithmetic over the stashed conv rows (no output)
 __global__ void commit_conv_kernel(const Q35CommitLayer* __restrict__ tab, int n, int C) {
@@ -1542,8 +1595,12 @@ void q35_gdn_seq(float* state, const float* x, int ld, const float* g, const flo
                  int h_k, int h_v, bool commit, void* stream) {
     if (T <= 0) return;
     static const bool old = std::getenv("STRATA_DENSE_GDN_OLD") && std::atoi(std::getenv("STRATA_DENSE_GDN_OLD")) != 0;
+    // (STRATA_DENSE_GDN_PIPE=0: gdn_seq4_kernel, the next token's loads not overlapped)
+    static const bool pipe = !std::getenv("STRATA_DENSE_GDN_PIPE") || std::atoi(std::getenv("STRATA_DENSE_GDN_PIPE")) != 0;
     if (old)
         gdn_seq_kernel<<<h_v, 128, 0, (cudaStream_t) stream>>>(state, x, ld, g, b, ldg, o, T, h_k, h_v, commit);
+    else if (pipe)
+        gdn_seq4p_kernel<<<dim3(h_v, 4), 128, 0, (cudaStream_t) stream>>>(state, x, ld, g, b, ldg, o, T, h_k, h_v, commit);
     else
         gdn_seq4_kernel<<<dim3(h_v, 4), 128, 0, (cudaStream_t) stream>>>(state, x, ld, g, b, ldg, o, T, h_k, h_v, commit);
     check("q35_gdn_seq");
