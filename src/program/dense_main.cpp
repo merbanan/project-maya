@@ -584,7 +584,7 @@ int main(int argc, char** argv) {
                 if (!model.dflash_inject(T, i, err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
             } else if (K > 0) {
                 const int rows = last ? T - 1 : T;   // row t pairs with token i + t + 1
-                if (rows > 0 && !model.mtp_forward(ids.data() + i + 1, model.hidden_norm(), i, rows, false, err)) {
+                if (rows > 0 && !model.mtp_fill(ids.data() + i + 1, model.hidden_norm(), i, rows, err)) {
                     std::printf("ERR %s\n", err.c_str()); failed = true; break;
                 }
                 if (last)   // the prompt's last hidden row: the first draft step reads it
@@ -777,7 +777,7 @@ int main(int argc, char** argv) {
                 win.insert(win.end(), lk, lk + nl);
                 ++lookup_rounds;
                 // the MTP block still reads its pending rows (its cache follows the trunk)
-                if (!use_df && !model.mtp_forward(mtp_tok.data(), d_hrows, mtp_p0, (int) mtp_tok.size(), false, err)) {
+                if (!use_df && !model.mtp_fill(mtp_tok.data(), d_hrows, mtp_p0, (int) mtp_tok.size(), err)) {
                     std::printf("ERR %s\n", err.c_str()); failed = true; break;
                 }
             } else if (k > 0 && use_df) {

@@ -9,6 +9,9 @@
 #include <random>
 #include <string>
 #include <vector>
+#ifdef Q35_STREAM_PROBE
+namespace strata::kernels { void q35_set_attn_stream_probe(int probe); }
+#endif
 
 using namespace strata::kernels;
 
@@ -47,12 +50,12 @@ int main(int argc, char** argv) {
     std::mt19937 rng(3);
     std::normal_distribution<float> nd(0.f, 1.f);
     // K and V rows of the context, written through q35_attn_prep in chunks (both formats)
-    Q35Kv kv[2];
-    for (int m = 0; m < 2; ++m) {
+    Q35Kv kv[3];   // FP16, K8V4, K8V8
+    for (int m = 0; m < 3; ++m) {
         kv[m].mode = m; kv[m].max_ctx = max_ctx;
         const size_t cells = (size_t) HK * max_ctx;
         cudaMalloc(&kv[m].k, m ? cells * D : cells * D * 2);
-        cudaMalloc(&kv[m].v, m ? cells * D / 2 : cells * D * 2);
+        cudaMalloc(&kv[m].v, m == 1 ? cells * D / 2 : m == 2 ? cells * D : cells * D * 2);
         if (m) { cudaMalloc(&kv[m].ks, cells * 8 * 2); cudaMalloc(&kv[m].vs, cells * 8 * 2); }
     }
     const int CH = 1024;
@@ -71,7 +74,7 @@ int main(int argc, char** argv) {
         cudaMemcpy(kk, kh.data(), kh.size() * 4, cudaMemcpyHostToDevice);
         for (auto& x : kh) x = nd(rng);
         cudaMemcpy(vv, kh.data(), kh.size() * 4, cudaMemcpyHostToDevice);
-        for (int m = 0; m < 2; ++m)
+        for (int m = 0; m < 3; ++m)
             q35_attn_prep(qf, H * 2 * D, kk, vv, HK * D, nw, nw, 1e-6f, 1e7f, 64, p, T, H, HK, D, qo, kv[m], s);
     }
     for (auto& x : h) x = nd(rng) * 3.0f;   // the queries (sharper softmax)
@@ -82,12 +85,39 @@ int main(int argc, char** argv) {
         printf("streaming read (the ceiling): K cache %.0f GB/s, V cache %.0f GB/s (%.0f MB each)\n", read_gbs(kv[0].k, kb, s),
                read_gbs(kv[0].v, kb, s), kb / 1e6);
     }
+#ifdef Q35_STREAM_PROBE
+    // `attn_bench N probe` (built with -DQ35_STREAM_PROBE): the stream kernel whole (0), its loads and stores alone (1),
+    // its math alone over register-held tiles (2) - FP16 and K8V8
+    if (argc > 2 && std::string(argv[2]) == "probe") {
+        for (int m : {0, 2})
+            for (int T : {1, 2, 4, 8})
+                for (int sk : {32, 64}) {
+                    printf("N %d %s T %d sk %d:", N, m ? "k8v8" : "fp16", T, sk);
+                    for (int pr = 0; pr < 3; ++pr) {
+                        q35_set_attn_stream_probe(pr);
+                        q35_set_attn_stream(1, 0, sk);
+                        const int p0 = N - T;
+                        q35_attn(qo, kv[m], p0, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
+                        cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+                        cudaEventRecord(a, s);
+                        for (int r = 0; r < 20; ++r) q35_attn(qo, kv[m], p0, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
+                        cudaEventRecord(b, s); cudaEventSynchronize(b);
+                        float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= 20;
+                        const double gb = m == 0 ? (double) N * HK * D * 4 / 1e9 : (double) N * HK * (2 * D + 32) / 1e9;
+                        printf("  %s %.3f ms (%.0f GB/s)", pr == 0 ? "whole" : pr == 1 ? "loads" : "math", ms, gb / ms * 1e3);
+                    }
+                    printf("  %s\n", cudaGetErrorString(cudaGetLastError()));
+                }
+        q35_set_attn_stream_probe(0);
+        return 0;
+    }
+#endif
     // `attn_bench N pp`: the prompt path - a 1024-row chunk (as the engine's, no splits) at a few depths, TFLOP/s of the
     // causal QK^T + PV work
     if (argc > 2 && std::string(argv[2]) == "pp") {
         float* pout;
         cudaMalloc(&pout, (size_t) CH * H * D * 4);
-        for (int m = 0; m < 2; ++m)
+        for (int m : {0, 2})   // (FP16, K8V8)
             for (int p0 : {N / 4, N / 2, N - CH}) {
                 q35_attn(qo, kv[m], p0, CH, H, HK, D, qf, H * 2 * D, pout, scr, 1, s);
                 cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
@@ -96,7 +126,7 @@ int main(int argc, char** argv) {
                 cudaEventRecord(b, s); cudaEventSynchronize(b);
                 float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= 5;
                 const double fl = 4.0 * H * D * CH * (p0 + CH / 2.0);
-                printf("pp %s chunk %d at %d: %.2f ms (%.1f TFLOP/s, %.3f ms a row)  %s\n", m ? "k8v4" : "fp16", CH, p0, ms,
+                printf("pp %s chunk %d at %d: %.2f ms (%.1f TFLOP/s, %.3f ms a row)  %s\n", m == 2 ? "k8v8" : m ? "k8v4" : "fp16", CH, p0, ms,
                        fl / ms / 1e9, ms / CH, cudaGetErrorString(cudaGetLastError()));
             }
         return 0;
@@ -104,7 +134,7 @@ int main(int argc, char** argv) {
     // the streaming kernel (FP16 and K8V4): its tile choices, against the tile kernel's output in the same format
     for (int T : {1, 2, 4, 5, 8}) {
         const int p0 = N - T;
-        for (int m = 0; m < 2; ++m) {
+        for (int m : {0, 2}) {   // (FP16, K8V8)
             q35_set_attn_stream(0, 0, 0);
             q35_set_attn_dec_max_tokens(0);
             q35_set_attn_var(0);
@@ -125,8 +155,9 @@ int main(int argc, char** argv) {
                 for (int rep = 0; rep < 20; ++rep) q35_attn(qo, kv[m], p0, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
                 cudaEventRecord(b, s); cudaEventSynchronize(b);
                 float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= 20;
-                const double gb = m == 0 ? (double) N * HK * D * 2 * 2 / 1e9 : (double) N * HK * (D + D / 2 + 32) / 1e9;
-                printf("N %d T %d stream %s sk %d: %.3f ms (%.0f GB/s)  vs tile rel err %.2e  %s\n", N, T, m ? "k8v4" : "fp16",
+                const double gb = m == 0 ? (double) N * HK * D * 2 * 2 / 1e9 : m == 2 ? (double) N * HK * (2 * D + 32) / 1e9
+                                                                     : (double) N * HK * (D + D / 2 + 32) / 1e9;
+                printf("N %d T %d stream %s sk %d: %.3f ms (%.0f GB/s)  vs tile rel err %.2e  %s\n", N, T, m == 2 ? "k8v8" : m ? "k8v4" : "fp16",
                        sk, ms, gb / ms * 1e3, sqrt(e / r), cudaGetErrorString(cudaGetLastError()));
             }
             q35_set_attn_stream(0, 0, 0);

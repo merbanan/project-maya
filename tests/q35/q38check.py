@@ -76,6 +76,8 @@ def main():
     env = dict(kv.split("=", 1) for kv in a.env)
     mine = eng_tokens(a.bin, ids, a.new, a.ctx, env, a.arg)
     print("engine :", repr(tok.decode(mine))[:400])
+    import hashlib
+    print("engine ids:", len(mine), hashlib.sha1(",".join(map(str, mine)).encode()).hexdigest()[:16])
     if a.no_ref: return
     ref, margins = ref_tokens(ids, a.new, a.ctx)
     print("llama  :", repr(tok.decode(ref))[:400])

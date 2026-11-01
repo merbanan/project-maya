@@ -120,6 +120,9 @@ public:
     bool mtp_forward(const int32_t* toks, const float* hidden, int64_t p0, int T, bool all_logits, std::string& err);
     /// one MTP row whose token is on the device (*d_tok - a draft's argmax): no host round trip between drafts
     bool mtp_forward_dev(const int32_t* d_tok, const float* hidden, int64_t p0, std::string& err);
+    // the MTP block's K / V of T rows into its cache only (rows whose MTP output nobody reads: a prompt's, a lookup
+    // round's) - the same cache as mtp_forward's
+    bool mtp_fill(const int32_t* toks, const float* hidden, int64_t p0, int T, std::string& err);
     bool mtp_dev_ok() const;
     float* mtp_logits() const;         ///< rows of draft_vocab()
     /// The vocabulary drafts come from: the first N ids of the head (STRATA_DENSE_DRAFT_VOCAB, NInfer's reduced

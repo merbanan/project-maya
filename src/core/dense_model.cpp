@@ -227,7 +227,7 @@ struct DenseModel::Impl {
     }
     int chunk = 512;                                // the largest T of a forward pass
     int max_in = 0;                                 // the widest input the activation conversions are sized for
-    int kv_mode = 0;                                // the K / V cache: 0 FP16, 1 K8V4 (STRATA_DENSE_KV / --kv)
+    int kv_mode = 0;                                // the K / V cache: 0 FP16, 1 K8V4, 2 K8V8 (STRATA_DENSE_KV / --kv)
 
     // Gemma 4: the per-layer embeddings (the token table, the model projection and its norm), rope bases, window
     bool gemma = false, muse = false;
@@ -616,7 +616,8 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
     if (const char* e = std::getenv("STRATA_DENSE_PACK")) I.pack_on = std::atoi(e) != 0;
     if (const char* e = std::getenv("STRATA_DENSE_KV")) {
         if (std::string(e) == "k8v4") I.kv_mode = 1;
-        else if (std::string(e) != "fp16") { err = std::string("dense model: STRATA_DENSE_KV=") + e + " (fp16 | k8v4)"; return false; }
+        else if (std::string(e) == "k8v8") I.kv_mode = 2;
+        else if (std::string(e) != "fp16") { err = std::string("dense model: STRATA_DENSE_KV=") + e + " (fp16 | k8v4 | k8v8)"; return false; }
     }
     I.prof.on = std::getenv("STRATA_DENSE_PROF") != nullptr && std::atoi(std::getenv("STRATA_DENSE_PROF")) != 0;
     try {
@@ -750,7 +751,8 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                     return false;
                 cudaMemset(L.kv.k, 0, (cells + 32) * D * 2);
                 cudaMemset(L.kv.v, 0, (cells + 32) * D * 2);
-            } else if (!I.alloc(&L.kv.k, cells * D, err, "K cache") || !I.alloc(&L.kv.v, cells * D / 2, err, "V cache") ||
+            } else if (!I.alloc(&L.kv.k, cells * D, err, "K cache") ||
+                       !I.alloc(&L.kv.v, I.kv_mode == 2 ? cells * D : cells * D / 2, err, "V cache") ||
                        !I.alloc(&L.kv.ks, cells * (D / 32) * 2, err, "K scales") ||
                        !I.alloc(&L.kv.vs, cells * (D / 32) * 2, err, "V scales")) {
                 return false;
@@ -1451,6 +1453,42 @@ bool DenseModel::mtp_forward(const int32_t* toks, const float* hidden, int64_t p
         const int rows = all_logits ? T : 1;
         I.prep(all_logits ? I.mtp_h : I.mtp_h + (size_t) (T - 1) * E, E, rows);
         I.mm(I.head_draft, I.mtp_logits);
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("dense model: ") + e.what();
+        return false;
+    }
+}
+
+bool DenseModel::mtp_fill(const int32_t* toks, const float* hidden, int64_t p0, int T, std::string& err) {
+    Impl& I = *impl_;
+    Layer& M = I.mtp;
+    // STRATA_DENSE_MTP_FILL=0: the full block (for A/B)
+    static const bool fill = !std::getenv("STRATA_DENSE_MTP_FILL") || std::atoi(std::getenv("STRATA_DENSE_MTP_FILL")) != 0;
+    if (I.gemma || !M.attn || !fill || I.mtp_dev_tok) return mtp_forward(toks, hidden, p0, T, false, err);
+    if (T < 1 || T > I.chunk || p0 + T > max_context_) { err = "dense model: MTP rows outside the context"; return false; }
+    cudaStream_t s = I.stream;
+    const int E = cfg_.n_embd, H = cfg_.n_head, HK = cfg_.n_head_kv, D = cfg_.head_dim;
+    const float eps = cfg_.rms_eps;
+    try {
+        I.mark(s);
+        // as mtp_forward up to the K / V projections; no Q, attention, output, FFN or logits
+        for (int t = 0; t < T; ++t) dequant_f32(I.embd.type, I.embd.dev, toks[t], 1, E, I.y + (size_t) t * E, s);
+        float* cat = I.mtp_cat;
+        q35_rms_rows(I.y, E, M.enorm, I.xn, nullptr, T, E, eps, s);
+        cudaMemcpy2DAsync(cat, (size_t) 2 * E * 4, I.xn, (size_t) E * 4, (size_t) E * 4, T, cudaMemcpyDeviceToDevice, s);
+        q35_rms_rows(hidden, E, M.hnorm, I.xn, nullptr, T, E, eps, s);
+        cudaMemcpy2DAsync(cat + E, (size_t) 2 * E * 4, I.xn, (size_t) E * 4, (size_t) E * 4, T, cudaMemcpyDeviceToDevice, s);
+        I.prep(cat, 2 * E, T);
+        float* x = T <= kMaxCols ? I.mtp_x : I.x;
+        I.mm(M.eh_proj, x);
+        q35_rms_rows(x, E, M.attn_norm, I.xn, nullptr, T, E, eps, s);
+        I.prep(I.xn, E, T);
+        I.mm(M.k, I.kcur);
+        I.mm(M.v, I.vcur);
+        q35_attn_prep(nullptr, H * 2 * D, I.kcur, I.vcur, HK * D, M.q_norm, M.k_norm, eps, cfg_.rope_base, cfg_.n_rot,
+                      (int) p0, T, H, HK, D, I.qcur, M.kv, s);
+        I.stage("mtp_fill", s);
         return true;
     } catch (const std::exception& e) {
         err = std::string("dense model: ") + e.what();

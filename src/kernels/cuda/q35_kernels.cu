@@ -328,13 +328,21 @@ __global__ void attn_prep_kernel(const float* __restrict__ q_full, int ldq, cons
         ((__half*) kv.v)[cell * D + d] = __float2half(vv);
         return;
     }
-    // K8V4: K codes with a scale per 32 (a warp), V rotated then 4-bit codes with a scale per 32
+    // K8V4: K codes with a scale per 32 (a warp), V rotated then 4-bit codes with a scale per 32 (K8V8: V as K)
     {
         const float amax = warp_max(fabsf(r));
         const float sc = amax / 127.0f;
         const int q = sc > 0.0f ? max(-127, min(127, __float2int_rn(r / sc))) : 0;
         ((int8_t*) kv.k)[cell * D + d] = (int8_t) q;
         if ((d & 31) == 0) ((__half*) kv.ks)[cell * (D / 32) + d / 32] = __float2half(sc);
+    }
+    if (kv.mode == 2) {   // K8V8: V codes as K's, not rotated
+        const float amax = warp_max(fabsf(vv));
+        const float sc = amax / 127.0f;
+        const int q = sc > 0.0f ? max(-127, min(127, __float2int_rn(vv / sc))) : 0;
+        ((int8_t*) kv.v)[cell * D + d] = (int8_t) q;
+        if ((d & 31) == 0) ((__half*) kv.vs)[cell * (D / 32) + d / 32] = __float2half(sc);
+        return;
     }
     __syncthreads();   // (row is reused)
     row[d] = vv;
@@ -473,11 +481,16 @@ __global__ void __launch_bounds__(AW_ * 32) attn_tc_kernel(const float* __restri
                 if (MODE == 0) {
                     pk[j] = __ldg((const uint4*) ((const __half*) kv.k + cell * AD + d));
                     pv[j] = __ldg((const uint4*) ((const __half*) kv.v + cell * AD + d));
-                } else {   // K: 8 codes + its scale's bits; V: 8 nibbles + its scale's bits
+                } else {   // K: 8 codes + its scale's bits; V: 8 nibbles (K8V8: 8 codes) + its scale's bits
                     const uint2 kc = __ldg((const uint2*) ((const int8_t*) kv.k + cell * AD + d));
                     pk[j] = make_uint4(kc.x, kc.y, __ldg((const unsigned short*) kv.ks + cell * (AD / 32) + d / 32), 0);
-                    pv[j] = make_uint4(__ldg((const uint32_t*) ((const uint8_t*) kv.v + cell * (AD / 2) + d / 2)),
-                                       __ldg((const unsigned short*) kv.vs + cell * (AD / 32) + d / 32), 0, 0);
+                    if (MODE == 2) {
+                        const uint2 vc = __ldg((const uint2*) ((const int8_t*) kv.v + cell * AD + d));
+                        pv[j] = make_uint4(vc.x, vc.y, __ldg((const unsigned short*) kv.vs + cell * (AD / 32) + d / 32), 0);
+                    } else {
+                        pv[j] = make_uint4(__ldg((const uint32_t*) ((const uint8_t*) kv.v + cell * (AD / 2) + d / 2)),
+                                           __ldg((const unsigned short*) kv.vs + cell * (AD / 32) + d / 32), 0, 0);
+                    }
                 }
             }
         }
@@ -495,7 +508,8 @@ __global__ void __launch_bounds__(AW_ * 32) attn_tc_kernel(const float* __restri
             uint4 kv4 = pk[j], vv4 = pv[j];
             if (MODE != 0) {
                 kv4 = deq_k8(make_uint2(pk[j].x, pk[j].y), __ushort_as_half((unsigned short) pk[j].z));
-                vv4 = deq_v4(pv[j].x, __ushort_as_half((unsigned short) pv[j].y));
+                vv4 = MODE == 2 ? deq_k8(make_uint2(pv[j].x, pv[j].y), __ushort_as_half((unsigned short) pv[j].z))
+                                : deq_v4(pv[j].x, __ushort_as_half((unsigned short) pv[j].y));
             }
             *(uint4*) (sK + r * LDQ + d) = kv4;
             *(uint4*) (sV + r * LDQ + d) = vv4;
@@ -586,7 +600,7 @@ __global__ void __launch_bounds__(AW_ * 32) attn_tc_kernel(const float* __restri
                 float* o = out + (size_t) tok * qld + (size_t) head * AD + d0;
                 const float* gt = q_full + (size_t) tok * ldq + (size_t) head * 2 * AD + AD + d0;
 #pragma unroll
-                for (int j = 0; j < 8; ++j) o[j] = Sw[ri * LDS + hi * 8 + j] * inv_l * (MODE == 0 ? sigm(gt[j]) : 1.0f);
+                for (int j = 0; j < 8; ++j) o[j] = Sw[ri * LDS + hi * 8 + j] * inv_l * (MODE != 1 ? sigm(gt[j]) : 1.0f);
             } else {
                 float* o = part_o + (((size_t) split * gridDim.y + kvh) * rows + row) * AD + d0;
 #pragma unroll
@@ -640,14 +654,20 @@ __global__ void __launch_bounds__(128, MINB) attn_dec_kernel(const float* __rest
         } else {
             const uint2 kc = __ldg((const uint2*) ((const int8_t*) kv.k + cell * AD + lane * 8));
             kr = make_uint4(kc.x, kc.y, __ldg((const unsigned short*) kv.ks + cell * (AD / 32) + lane / 4), 0);
-            vr = make_uint4(__ldg((const uint32_t*) ((const uint8_t*) kv.v + cell * (AD / 2) + lane * 4)),
-                            __ldg((const unsigned short*) kv.vs + cell * (AD / 32) + lane / 4), 0, 0);
+            if (MODE == 2) {
+                const uint2 vc = __ldg((const uint2*) ((const int8_t*) kv.v + cell * AD + lane * 8));
+                vr = make_uint4(vc.x, vc.y, __ldg((const unsigned short*) kv.vs + cell * (AD / 32) + lane / 4), 0);
+            } else {
+                vr = make_uint4(__ldg((const uint32_t*) ((const uint8_t*) kv.v + cell * (AD / 2) + lane * 4)),
+                                __ldg((const unsigned short*) kv.vs + cell * (AD / 32) + lane / 4), 0, 0);
+            }
         }
     };
     auto step = [&](uint4 kr, uint4 vr) {
         if (MODE != 0) {
             kr = deq_k8(make_uint2(kr.x, kr.y), __ushort_as_half((unsigned short) kr.z));
-            vr = deq_v4(vr.x, __ushort_as_half((unsigned short) vr.y));
+            vr = MODE == 2 ? deq_k8(make_uint2(vr.x, vr.y), __ushort_as_half((unsigned short) vr.z))
+                           : deq_v4(vr.x, __ushort_as_half((unsigned short) vr.y));
         }
         float kf[8], vf[8];
         const __half2* k2 = (const __half2*) &kr;
@@ -709,7 +729,7 @@ __global__ void __launch_bounds__(128, MINB) attn_dec_kernel(const float* __rest
         const int head = kvh * G + g, row = t * G + g;
         if (n_split == 1) {
             const float gt = q_full[(size_t) t * ldq + (size_t) head * 2 * AD + AD + d];
-            out[(size_t) t * qld + (size_t) head * AD + d] = (L > 0.0f ? a / L : 0.0f) * (MODE == 0 ? sigm(gt) : 1.0f);
+            out[(size_t) t * qld + (size_t) head * AD + d] = (L > 0.0f ? a / L : 0.0f) * (MODE != 1 ? sigm(gt) : 1.0f);
         } else {
             part_o[(((size_t) split * n_kv + kvh) * rows + row) * AD + d] = a;
             if (d == 0) {
@@ -744,6 +764,14 @@ template <int RT, int SK_> struct StreamGeo {
     // (2 a SM only for 32-key tiles: 16 rows x 64 keys also fits, but its register cap made it slower - 706 vs 762 GB/s)
     static constexpr int per_sm = SK == 32 && smem <= 48 * 1024 ? 2 : 1;
 };
+#ifdef Q35_STREAM_PROBE
+// (attn_bench's -DQ35_STREAM_PROBE build only) 1: no math (the tiles' loads and stores alone), 2: no global loads (the
+// math over the last tile's registers again) - the memory and the compute floors of the stream kernel
+__constant__ int c_stream_probe;
+#define Q35_PROBE(bit) ((c_stream_probe & (bit)) != 0)
+#else
+#define Q35_PROBE(bit) false
+#endif
 template <int RT, int SK_, int MODE = 0>
 __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream_kernel(const float* __restrict__ q,
                                                               Q35Kv kv, int p0, int T, int G,
@@ -778,7 +806,7 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
     }
     // the tile's loads: FP16 - 16-byte chunks of K / V rows (32 a row); K8V4 - K: 16 INT8 codes a chunk (16 a row) with
     // their group's scale, V: 32 4-bit codes a chunk (8 a row) with theirs - unpacked to FP16 when stored
-    constexpr int NUK = MODE == 0 ? SK * 32 / SNT : SK * 16 / SNT, NUV = MODE == 0 ? SK * 32 / SNT : SK * 8 / SNT;
+    constexpr int NUK = MODE == 0 ? SK * 32 / SNT : SK * 16 / SNT, NUV = MODE == 0 ? SK * 32 / SNT : MODE == 2 ? SK * 16 / SNT : SK * 8 / SNT;
     const size_t cell0 = (size_t) kvh * max_ctx;
     uint4 rk[NUK], rv[NUV];
     unsigned short sk_[MODE == 0 ? 1 : NUK], sv_[MODE == 0 ? 1 : NUV];
@@ -808,6 +836,15 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
             if (MODE == 0) {
                 const int key = k0 + u / 32, c = u % 32;
                 rv[i] = key < ke ? __ldg((const uint4*) ((const __half*) kv.v + (cell0 + key) * AD) + c) : make_uint4(0, 0, 0, 0);
+            } else if (MODE == 2) {   // (K8V8: V's codes as K's)
+                const int key = k0 + u / 16, c = u % 16;
+                if (key < ke) {
+                    rv[i] = __ldg((const uint4*) ((const int8_t*) kv.v + (cell0 + key) * AD) + c);
+                    sv_[i] = __ldg((const unsigned short*) kv.vs + (cell0 + key) * (AD / 32) + c / 2);
+                } else {
+                    rv[i] = make_uint4(0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u);
+                    sv_[i] = 0;
+                }
             } else {
                 const int key = k0 + u / 8, c = u % 8;
                 if (key < ke) {
@@ -840,6 +877,11 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
             const int u = tid + SNT * i;
             if (MODE == 0) {
                 *(uint4*) (KV + (u / 32) * SLD + (u % 32) * 8) = rv[i];
+            } else if (MODE == 2) {
+                const __half sc = __ushort_as_half(sv_[i]);
+                __half* dst = KV + (u / 16) * SLD + (u % 16) * 16;
+                *(uint4*) dst = deq_k8(make_uint2(rv[i].x, rv[i].y), sc);
+                *(uint4*) (dst + 8) = deq_k8(make_uint2(rv[i].z, rv[i].w), sc);
             } else {
                 const __half sc = __ushort_as_half(sv_[i]);
                 __half* dst = KV + (u / 8) * SLD + (u % 8) * 32;
@@ -863,7 +905,8 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
         store_k();
         if (tid == 0) *any = 0;
         __syncthreads();
-        if (k0 + SK < ke) issue_k(k0 + SK);
+        if (k0 + SK < ke && !Q35_PROBE(2)) issue_k(k0 + SK);
+        if (!Q35_PROBE(1)) {
         // S = Q K^T: RT x SK / 16 fragments over the warps (with fewer than 8, each one's head dimension split in KS
         // parts, summed in the softmax); two accumulators a warp so the mma chain is half as deep
         for (int f = w; f < NFR * KS; f += SNT / 32) {
@@ -943,6 +986,7 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
                 }
             }
         }
+        }   // (!Q35_PROBE(1))
         __syncthreads();
         if (*any != 0) {   // (rare: a row's reference max moved - its O rows scaled through the tile buffer, K done)
 #pragma unroll
@@ -960,7 +1004,8 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
         }
         store_v();   // V over K
         __syncthreads();
-        if (k0 + SK < ke) issue_v(k0 + SK);
+        if (k0 + SK < ke && !Q35_PROBE(2)) issue_v(k0 + SK);
+        if (!Q35_PROBE(1)) {
         // O += P V: each V fragment loaded once for the warp's RT row tiles
 #pragma unroll
         for (int kk = 0; kk < SK / 16; ++kk) {
@@ -975,6 +1020,7 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
                 for (int h = 0; h < 2; ++h) wmma::mma_sync(fo[mi * 2 + h], fp, fv[h], fo[mi * 2 + h]);
             }
         }
+        }   // (!Q35_PROBE(1))
         __syncthreads();
     }
     // the partials (unnormalised O, its reference max and total) through the tile buffer
@@ -1212,7 +1258,7 @@ void q35_gdn_out(const float* o, const float* z, const float* w, float* y, int r
 
 uint64_t q35_kv_bytes(int mode, int n_kv, int D, int max_ctx) {
     const uint64_t cells = (uint64_t) n_kv * max_ctx;
-    return mode == 0 ? cells * D * 2 * 2 : cells * (D + D / 32 * 2 + D / 2 + D / 32 * 2);
+    return mode == 0 ? cells * D * 2 * 2 : mode == 2 ? cells * (D + D / 32 * 2) * 2 : cells * (D + D / 32 * 2 + D / 2 + D / 32 * 2);
 }
 
 void q35_attn_prep(const float* q_full, int ldq, const float* k, const float* v, int ldk, const float* q_norm,
@@ -1253,6 +1299,9 @@ namespace {
 int g_dec_pf = -1, g_dec_blocks = -1, g_dec_minb = -1;
 int g_attn_stream = -1, g_stream_blocks = -1, g_stream_sk = -1;
 }
+#ifdef Q35_STREAM_PROBE
+void q35_set_attn_stream_probe(int probe) { cudaMemcpyToSymbol(c_stream_probe, &probe, sizeof probe); }
+#endif
 void q35_set_attn_stream(int on, int blocks, int sk) {
     g_attn_stream = on;
     g_stream_blocks = blocks;
@@ -1269,7 +1318,8 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
     if (D != AD || n_head % n_kv != 0 || n_head / n_kv > 8) throw std::invalid_argument("q35_attn: geometry");
     static const bool attr_ok =
         cudaFuncSetAttribute(attn_tc_kernel<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kAttnSmem) == cudaSuccess &&
-        cudaFuncSetAttribute(attn_tc_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kAttnSmem) == cudaSuccess;
+        cudaFuncSetAttribute(attn_tc_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kAttnSmem) == cudaSuccess &&
+        cudaFuncSetAttribute(attn_tc_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kAttnSmem) == cudaSuccess;
     if (!attr_ok) throw std::runtime_error("q35_attn: shared memory attribute");
     const int max_ctx = kv.max_ctx;
     const int G = n_head / n_kv, rows = T * G;
@@ -1308,6 +1358,8 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
 #define Q35_SATTR(RTV, SKV) cudaFuncSetAttribute(attn_stream_kernel<RTV, SKV, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, \
                                                  (int) StreamGeo<RTV, SKV>::smem);                                       \
                             cudaFuncSetAttribute(attn_stream_kernel<RTV, SKV, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, \
+                                                 (int) StreamGeo<RTV, SKV>::smem);                                       \
+                            cudaFuncSetAttribute(attn_stream_kernel<RTV, SKV, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, \
                                                  (int) StreamGeo<RTV, SKV>::smem)
             Q35_SATTR(1, 32); Q35_SATTR(1, 64); Q35_SATTR(2, 32); Q35_SATTR(2, 64); Q35_SATTR(3, 32); Q35_SATTR(3, 64);
 #undef Q35_SATTR
@@ -1332,6 +1384,9 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
             if (kv.mode == 0)                                                                                        \
                 attn_stream_kernel<RTV, SKV, 0><<<grid, SNT, StreamGeo<RTV, SKV>::smem, (cudaStream_t) stream>>>(     \
                     q, kv, p0, T, G, n_head, max_ctx, split_len, sc, part_o, part_ml);                               \
+            else if (kv.mode == 2)                                                                                   \
+                attn_stream_kernel<RTV, SKV, 2><<<grid, SNT, StreamGeo<RTV, SKV>::smem, (cudaStream_t) stream>>>(     \
+                    q, kv, p0, T, G, n_head, max_ctx, split_len, sc, part_o, part_ml);                               \
             else                                                                                                     \
                 attn_stream_kernel<RTV, SKV, 1><<<grid, SNT, StreamGeo<RTV, SKV>::smem, (cudaStream_t) stream>>>(     \
                     q, kv, p0, T, G, n_head, max_ctx, split_len, sc, part_o, part_ml);                               \
@@ -1342,9 +1397,9 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
 #undef Q35_STREAM
         check("q35_attn_stream");
         attn_merge_kernel<<<dim3(rows, n_kv), D, 0, (cudaStream_t) stream>>>(part_o, part_ml, rows, n_split, G, n_head,
-                                                                             q_full, ldq, out, p0, split_len, kv.mode == 0);
+                                                                             q_full, ldq, out, p0, split_len, kv.mode != 1);
         check("q35_attn_merge");
-        if (kv.mode != 0) {   // (K8V4: the output still rotated - back by H, then the gate)
+        if (kv.mode == 1) {   // (K8V4: the output still rotated - back by H, then the gate)
             unrotate_gate_kernel<<<dim3(T, n_head), 256, 0, (cudaStream_t) stream>>>(out, n_head, q_full, ldq);
             check("q35_attn_unrotate");
         }
@@ -1373,6 +1428,9 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
         if (kv.mode == 0) {
             if (minb >= 4) { if (pf >= 4) Q35_DEC(0, 4, 4); else Q35_DEC(0, 2, 4); }
             else if (pf >= 8) Q35_DEC(0, 8, 1); else if (pf >= 4) Q35_DEC(0, 4, 1); else Q35_DEC(0, 2, 1);
+        } else if (kv.mode == 2) {
+            if (minb >= 4) { if (pf >= 4) Q35_DEC(2, 4, 4); else Q35_DEC(2, 2, 4); }
+            else if (pf >= 8) Q35_DEC(2, 8, 1); else if (pf >= 4) Q35_DEC(2, 4, 1); else Q35_DEC(2, 2, 1);
         } else {
             if (minb >= 4) { if (pf >= 4) Q35_DEC(1, 4, 4); else Q35_DEC(1, 2, 4); }
             else if (pf >= 8) Q35_DEC(1, 8, 1); else if (pf >= 4) Q35_DEC(1, 4, 1); else Q35_DEC(1, 2, 1);
@@ -1382,10 +1440,10 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
         if (n_split > 1) {
             attn_merge_kernel<<<dim3(rows, n_kv), D, 0, (cudaStream_t) stream>>>(part_o, part_ml, rows, n_split, G, n_head,
                                                                                  q_full, ldq, out, p0, split_len,
-                                                                                 kv.mode == 0);
+                                                                                 kv.mode != 1);
             check("q35_attn_merge");
         }
-        if (kv.mode != 0) {
+        if (kv.mode == 1) {
             unrotate_gate_kernel<<<dim3(T, n_head), 256, 0, (cudaStream_t) stream>>>(out, n_head, q_full, ldq);
             check("q35_attn_unrotate");
         }
@@ -1412,15 +1470,20 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
     };
     if (v == 1) {
         if (kv.mode == 0) go(attn_tc_kernel<0, 32, 32, 2>, attn_smem<32, 32, 2>(), 64);
+        else if (kv.mode == 2) go(attn_tc_kernel<2, 32, 32, 2>, attn_smem<32, 32, 2>(), 64);
         else go(attn_tc_kernel<1, 32, 32, 2>, attn_smem<32, 32, 2>(), 64);
     } else if (v == 2) {
         if (kv.mode == 0) go(attn_tc_kernel<0, 32, 16, 2>, attn_smem<32, 16, 2>(), 64);
+        else if (kv.mode == 2) go(attn_tc_kernel<2, 32, 16, 2>, attn_smem<32, 16, 2>(), 64);
         else go(attn_tc_kernel<1, 32, 16, 2>, attn_smem<32, 16, 2>(), 64);
     } else if (kv.mode == 0 && direct) {
         attn_tc_kernel<0, AR, AK, AW, true><<<grid, AW * 32, attn_smem<AR, AK, AW, true>(), (cudaStream_t) stream>>>(
             q, kv, p0, T, n_head, G, max_ctx, split_len, sc, q_full, ldq, out, part_o, part_ml);
     } else if (kv.mode == 0) {
         attn_tc_kernel<0><<<grid, AW * 32, kAttnSmem, (cudaStream_t) stream>>>(
+            q, kv, p0, T, n_head, G, max_ctx, split_len, sc, q_full, ldq, out, part_o, part_ml);
+    } else if (kv.mode == 2) {
+        attn_tc_kernel<2><<<grid, AW * 32, kAttnSmem, (cudaStream_t) stream>>>(
             q, kv, p0, T, n_head, G, max_ctx, split_len, sc, q_full, ldq, out, part_o, part_ml);
     } else {
         attn_tc_kernel<1><<<grid, AW * 32, kAttnSmem, (cudaStream_t) stream>>>(
@@ -1430,10 +1493,10 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
     if (n_split > 1) {
         attn_merge_kernel<<<dim3(rows, n_kv), D, 0, (cudaStream_t) stream>>>(part_o, part_ml, rows, n_split, G, n_head,
                                                                              q_full, ldq, out, p0, split_len,
-                                                                             kv.mode == 0);
+                                                                             kv.mode != 1);
         check("q35_attn_merge");
     }
-    if (kv.mode != 0) {
+    if (kv.mode == 1) {
         unrotate_gate_kernel<<<dim3(T, n_head), 256, 0, (cudaStream_t) stream>>>(out, n_head, q_full, ldq);
         check("q35_attn_unrotate");
     }
