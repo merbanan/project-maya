@@ -142,12 +142,13 @@ int main(int argc, char** argv) {
         for (int pi = 0; pi < 3; ++pi) {
             const int p0 = pi == 0 ? N / 4 : pi == 1 ? N / 2 : N - CH;
             std::vector<float> a((size_t) CH * H * D), b2(a.size());
-            float tms[2];
-            for (int k = 0; k < 2; ++k) {
+            float tms[3];
+            std::vector<float> c3(a.size());
+            for (int k = 0; k < 3; ++k) {
                 q35_set_attn_pp(k);
                 cudaMemset(pout, 0xff, a.size() * 4);   // (NaN: an output not written shows)
                 q35_attn(qo, kv[0], p0, CH, H, HK, D, qf, H * 2 * D, pout, scr, 1, s);
-                cudaMemcpy(k ? b2.data() : a.data(), pout, a.size() * 4, cudaMemcpyDeviceToHost);
+                cudaMemcpy(k == 2 ? c3.data() : k ? b2.data() : a.data(), pout, a.size() * 4, cudaMemcpyDeviceToHost);
                 cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
                 cudaEventRecord(e0, s);
                 for (int r = 0; r < 5; ++r) q35_attn(qo, kv[0], p0, CH, H, HK, D, qf, H * 2 * D, pout, scr, 1, s);
@@ -162,7 +163,10 @@ int main(int argc, char** argv) {
                 same += b2[i] == a[i];
                 e += pow(b2[i] - a[i], 2); r += a[i] * a[i];
             }
-            printf("(%zu NaN, %zu of %zu equal) ", nan, same, a.size());
+            size_t same3 = 0;
+            for (size_t i = 0; i < a.size(); ++i) same3 += c3[i] == a[i];
+            printf("(%zu NaN, %zu / %zu of %zu equal; halves %.2f ms %.1f TFLOP/s) ", nan, same, same3, a.size(), tms[2],
+                   4.0 * H * D * CH * (p0 + CH / 2.0) / tms[2] / 1e9);
             const double fl = 4.0 * H * D * CH * (p0 + CH / 2.0);
             printf("pp fp16 at %d: tc %.2f ms (%.1f TFLOP/s)  pp8 %.2f ms (%.1f TFLOP/s)  rel err %.2e  %s\n", p0, tms[0],
                    fl / tms[0] / 1e9, tms[1], fl / tms[1] / 1e9, sqrt(e / r), cudaGetErrorString(cudaGetLastError()));

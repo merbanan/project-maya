@@ -707,6 +707,9 @@ __global__ void __launch_bounds__(AW_ * 32) attn_tc_kernel(const float* __restri
 constexpr int PP_AR = 64, PP_AK = 32, PP_W = 8, PP_LDS = PP_AK + 4, PP_LDP = PP_AK + 8;
 constexpr size_t kPpSmem = (size_t) PP_AR * LDQ * 2 + 2 * (size_t) PP_AK * LDQ * 2 + 2 * (size_t) PP_AR * PP_LDS * 4 +
                            (size_t) PP_AR * PP_LDP * 2 + 4 * (size_t) PP_AR * 4 + 16;
+// HALVES: the rows 0-31 (warps 0-3) and 32-63 (warps 4-7) synchronise their S / softmax / P V phases with their own
+// named barrier, so one half's softmax overlaps the other half's products (only the K / V tile swap is block-wide)
+template <bool HALVES>
 __global__ void __launch_bounds__(PP_W * 32) attn_pp_kernel(const float* __restrict__ q, Q35Kv kv, int p0, int T,
                                                            int n_head, int G, int max_ctx, int split_len, float scale,
                                                            const float* __restrict__ q_full, int ldq,
@@ -728,6 +731,10 @@ __global__ void __launch_bounds__(PP_W * 32) attn_pp_kernel(const float* __restr
     const int rows = T * G, r0 = blockIdx.x * AR;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, rt = w >> 1, hf = w & 1;
     const int qld = n_head * AD;
+    auto phase_sync = [&] {
+        if (HALVES) asm volatile("bar.sync %0, 128;" ::"r"(1 + (rt >> 1)) : "memory");
+        else __syncthreads();
+    };
     for (int i = tid; i < AR * (AD / 4); i += PP_W * 32) {   // Q (scaled) -> sQ
         const int r = i / (AD / 4), d = (i % (AD / 4)) * 4, row = r0 + r;
         float4 f = make_float4(0.f, 0.f, 0.f, 0.f);
@@ -802,7 +809,7 @@ __global__ void __launch_bounds__(PP_W * 32) attn_pp_kernel(const float* __restr
                 wmma::store_matrix_sync(sS + (size_t) hf * AR * LDS + (rt * 16) * LDS + n * 16, acc[n], LDS,
                                         wmma::mem_row_major);
         }
-        __syncthreads();
+        phase_sync();
         if (tile_on) {   // the softmax of the warp's 8 rows
             float sv[8], mt = -INFINITY;
 #pragma unroll
@@ -836,10 +843,11 @@ __global__ void __launch_bounds__(PP_W * 32) attn_pp_kernel(const float* __restr
             if (sq == 0) sCorr[sr] = corr;
             if (__any_sync(0xffffffffu, need) && lane == 0) sNeed[rt] = 1;
         }
-        __syncthreads();
+        phase_sync();
         if (tile_on) {
             if (sNeed[rt]) {   // (rare after the first tile) the pair's O rows scaled by their factors
-                float* sc = sS + (size_t) w * 256;   // (a warp's 16 x 16 scratch, the partial scores are read)
+                // (a warp's 16 x 16 scratch inside its row tile's first partial: read, and within its half)
+                float* sc = sS + (size_t) (rt * 16) * LDS + hf * 256;
 #pragma unroll
                 for (int n = 0; n < 8; ++n) {
                     wmma::store_matrix_sync(sc, fo[n], 16, wmma::mem_row_major);
@@ -867,7 +875,7 @@ __global__ void __launch_bounds__(PP_W * 32) attn_pp_kernel(const float* __restr
     if (sq == 0) { sL[sr] = l; sM[sr] = m; }
     __syncthreads();
     if (!t_on) return;
-    float* sc = sS + (size_t) w * 256;
+    float* sc = sS + (size_t) (rt * 16) * LDS + hf * 256;
     const int ri = lane >> 1, hi = lane & 1, row = tr0 + ri;
     const bool row_ok = row < rows;
     const int tok = row_ok ? row / G : 0, head = kvh * G + (row_ok ? row % G : 0);
@@ -1707,8 +1715,10 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
     // staged tile), so off
     static const bool direct = std::getenv("STRATA_DENSE_ATTN_DIRECT") && std::atoi(std::getenv("STRATA_DENSE_ATTN_DIRECT")) != 0;
     // (STRATA_DENSE_ATTN_PP=0: prompt chunks on attn_tc_kernel's 4 warps)
-    static const bool pp_env = !std::getenv("STRATA_DENSE_ATTN_PP") || std::atoi(std::getenv("STRATA_DENSE_ATTN_PP")) != 0;
-    const bool pp_on = g_attn_pp >= 0 ? g_attn_pp != 0 : pp_env;
+    // (STRATA_DENSE_ATTN_PP: 0 attn_tc_kernel, 1 attn_pp_kernel, 2 attn_pp_kernel with its halves' own barriers)
+    static const int pp_env = std::getenv("STRATA_DENSE_ATTN_PP") ? std::atoi(std::getenv("STRATA_DENSE_ATTN_PP")) : 2;
+    const int pp_mode = g_attn_pp >= 0 ? g_attn_pp : pp_env;
+    const bool pp_on = pp_mode != 0;
     const int v = vsel == -2 ? (T >= 2 && T <= 4 ? 2 : 0) : (T >= 2 && T <= 8) ? vsel : 0;
     const int AR_v = v ? 32 : AR, AK_v = v == 2 ? 16 : AK, AW_v = v ? 2 : AW;
     const int tiles = (rows + AR_v - 1) / AR_v;
@@ -1855,10 +1865,15 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
             q, kv, p0, T, n_head, G, max_ctx, split_len, sc, q_full, ldq, out, part_o, part_ml);
     } else if (kv.mode == 0 && T > 8 && pp_on) {   // (a prompt chunk: the 8-warp kernel)
         static const bool pp_attr =
-            cudaFuncSetAttribute(attn_pp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kPpSmem) == cudaSuccess;
+            cudaFuncSetAttribute(attn_pp_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kPpSmem) == cudaSuccess &&
+            cudaFuncSetAttribute(attn_pp_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kPpSmem) == cudaSuccess;
         if (!pp_attr) throw std::runtime_error("q35_attn: attn_pp_kernel shared memory attribute");
-        attn_pp_kernel<<<grid, PP_W * 32, kPpSmem, (cudaStream_t) stream>>>(
-            q, kv, p0, T, n_head, G, max_ctx, split_len, sc, q_full, ldq, out, part_o, part_ml);
+        if (pp_mode == 2)
+            attn_pp_kernel<true><<<grid, PP_W * 32, kPpSmem, (cudaStream_t) stream>>>(
+                q, kv, p0, T, n_head, G, max_ctx, split_len, sc, q_full, ldq, out, part_o, part_ml);
+        else
+            attn_pp_kernel<false><<<grid, PP_W * 32, kPpSmem, (cudaStream_t) stream>>>(
+                q, kv, p0, T, n_head, G, max_ctx, split_len, sc, q_full, ldq, out, part_o, part_ml);
     } else if (kv.mode == 0) {
         attn_tc_kernel<0><<<grid, AW * 32, kAttnSmem, (cudaStream_t) stream>>>(
             q, kv, p0, T, n_head, G, max_ctx, split_len, sc, q_full, ldq, out, part_o, part_ml);
