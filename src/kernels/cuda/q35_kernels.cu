@@ -758,7 +758,11 @@ template <int RT, int SK_> struct StreamGeo {
     static constexpr int SSLD = SK + 4;                         // S row pitch (floats); P (halves) over it
     static constexpr int NF = RT * 16 / 8;                      // O fragments a warp (RT x 16 over 8 warps)
     static constexpr int NFR = RT * SK / 16;                    // S fragments a tile
-    static constexpr int KS = NFR >= 8 ? 1 : 8 / NFR;           // S's head dimension split so all 8 warps take part
+    // S's tasks (REUSE): a warp a (key column of 16, head-dimension part) - each K fragment loaded once for the RT row
+    // tiles; the head dimension split in KS parts so there are 8 (summed in the softmax).  32 rows x 32 keys keeps
+    // the per-fragment tasks instead (a warp a (row tile, key column, part), KS 2), whose S fits 2 blocks a SM
+    static constexpr bool REUSE = !(RT == 2 && SK == 32);
+    static constexpr int KS = REUSE ? 8 / (SK / 16) : (NFR >= 8 ? 1 : 8 / NFR);
     static constexpr size_t smem = (size_t) RT * 16 * SLD * 2 + (size_t) SK * SLD * 2 + (size_t) KS * RT * 16 * SSLD * 4 +
                                    3 * (size_t) RT * 16 * 4 + 16;
     // (2 a SM only for 32-key tiles: 16 rows x 64 keys also fits, but its register cap made it slower - 706 vs 762 GB/s)
@@ -923,27 +927,56 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
         Q35_MARK(0);
         if (k0 + SK < ke && !Q35_PROBE(2)) issue_k(k0 + SK);
         if (!Q35_PROBE(1)) {
-        // S = Q K^T: RT x SK / 16 fragments over the warps (with fewer than 8, each one's head dimension split in KS
-        // parts, summed in the softmax); two accumulators a warp so the mma chain is half as deep
-        for (int f = w; f < NFR * KS; f += SNT / 32) {
-            const int part = f / NFR, mi = (f % NFR) / (SK / 16), ni = f % (SK / 16);
-            constexpr int NKK = AD / 16 / KS;
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> fs[2];
-            wmma::fill_fragment(fs[0], 0.0f);
-            wmma::fill_fragment(fs[1], 0.0f);
+        // S = Q K^T: warp w the key column ni of 16 over the head-dimension part `part` (KS parts, summed in the
+        // softmax), all RT row tiles - each K fragment loaded once for them; with one row tile two accumulators so the
+        // mma chain is half as deep
+        if (GE::REUSE) {
+            const int part = w / (SK / 16), ni = w % (SK / 16);
+            constexpr int NKK = AD / 16 / KS, NA = RT == 1 ? 2 : RT;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> fs[NA];
+#pragma unroll
+            for (int i = 0; i < NA; ++i) wmma::fill_fragment(fs[i], 0.0f);
 #pragma unroll
             for (int k = 0; k < NKK; ++k) {
                 const int kk = part * NKK + k;
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
-                wmma::load_matrix_sync(fa, Qs + mi * 16 * SLD + kk * 16, SLD);
                 wmma::load_matrix_sync(fb, KV + ni * 16 * SLD + kk * 16, SLD);
-                wmma::mma_sync(fs[k & 1], fa, fb, fs[k & 1]);
-            }
 #pragma unroll
-            for (int e = 0; e < fs[0].num_elements; ++e) fs[0].x[e] += fs[1].x[e];
-            wmma::store_matrix_sync(Ss + (size_t) part * RR * SSLD + mi * 16 * SSLD + ni * 16, fs[0], SSLD,
-                                    wmma::mem_row_major);
+                for (int mi = 0; mi < RT; ++mi) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                    wmma::load_matrix_sync(fa, Qs + mi * 16 * SLD + kk * 16, SLD);
+                    const int a = RT == 1 ? (k & 1) : mi;
+                    wmma::mma_sync(fs[a], fa, fb, fs[a]);
+                }
+            }
+            if (RT == 1)
+#pragma unroll
+                for (int e = 0; e < fs[0].num_elements; ++e) fs[0].x[e] += fs[NA - 1].x[e];
+#pragma unroll
+            for (int mi = 0; mi < RT; ++mi)
+                wmma::store_matrix_sync(Ss + (size_t) part * RR * SSLD + mi * 16 * SSLD + ni * 16, fs[mi], SSLD,
+                                        wmma::mem_row_major);
+        } else {
+            for (int f = w; f < NFR * KS; f += SNT / 32) {
+                const int part = f / NFR, mi = (f % NFR) / (SK / 16), ni = f % (SK / 16);
+                constexpr int NKK = AD / 16 / KS;
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> fs[2];
+                wmma::fill_fragment(fs[0], 0.0f);
+                wmma::fill_fragment(fs[1], 0.0f);
+#pragma unroll
+                for (int k = 0; k < NKK; ++k) {
+                    const int kk = part * NKK + k;
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+                    wmma::load_matrix_sync(fa, Qs + mi * 16 * SLD + kk * 16, SLD);
+                    wmma::load_matrix_sync(fb, KV + ni * 16 * SLD + kk * 16, SLD);
+                    wmma::mma_sync(fs[k & 1], fa, fb, fs[k & 1]);
+                }
+#pragma unroll
+                for (int e = 0; e < fs[0].num_elements; ++e) fs[0].x[e] += fs[1].x[e];
+                wmma::store_matrix_sync(Ss + (size_t) part * RR * SSLD + mi * 16 * SSLD + ni * 16, fs[0], SSLD,
+                                        wmma::mem_row_major);
+            }
         }
         __syncthreads();
         Q35_MARK(1);
