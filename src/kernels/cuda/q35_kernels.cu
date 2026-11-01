@@ -769,7 +769,15 @@ template <int RT, int SK_> struct StreamGeo {
 // math over the last tile's registers again) - the memory and the compute floors of the stream kernel
 __constant__ int c_stream_probe;
 #define Q35_PROBE(bit) ((c_stream_probe & (bit)) != 0)
+// cycles a block spends in each phase of the tile loop (thread 0, between the barriers): K store, S = Q K^T, the
+// softmax, the rescale, V store, O += P V - summed over the blocks
+__device__ unsigned long long g_stream_phase[6];
+#define Q35_MARK(i)                                                                                              \
+    do {                                                                                                         \
+        if (tid == 0) { const long long c_ = clock64(); ph[i] += c_ - ph_last; ph_last = c_; }                   \
+    } while (0)
 #else
+#define Q35_MARK(i) do { } while (0)
 #define Q35_PROBE(bit) false
 #endif
 template <int RT, int SK_, int MODE = 0>
@@ -901,10 +909,18 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
         issue_v(ks);
     }
     __syncthreads();
+    constexpr int RPW = RR / (SNT / 32), KPL = SK / 32;   // rows a warp, keys a lane a tile
+    float mrow[RPW], lsum[RPW];
+#pragma unroll
+    for (int i = 0; i < RPW; ++i) { mrow[i] = -INFINITY; lsum[i] = 0.0f; }
+#ifdef Q35_STREAM_PROBE
+    long long ph[6] = {}, ph_last = clock64();
+#endif
     for (int k0 = ks; k0 < ke; k0 += SK) {
         store_k();
         if (tid == 0) *any = 0;
         __syncthreads();
+        Q35_MARK(0);
         if (k0 + SK < ke && !Q35_PROBE(2)) issue_k(k0 + SK);
         if (!Q35_PROBE(1)) {
         // S = Q K^T: RT x SK / 16 fragments over the warps (with fewer than 8, each one's head dimension split in KS
@@ -930,15 +946,17 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
                                     wmma::mem_row_major);
         }
         __syncthreads();
-        // the softmax: warp w the rows w, w + 8, ..; lane the keys lane, lane + 32; P over the row's own S.  A warp's
-        // rows side by side, so their reductions' shuffles overlap
+        Q35_MARK(1);
+        // the softmax: warp w the rows w, w + 8, ..; lane the keys lane, lane + 32; P over the row's own S.  Each lane
+        // keeps its part of a row's total (lsum) and the row's reference max (mrow) in registers across the tiles; one
+        // warp vote asks whether a score passes mrow + SRES - only then (the first tile, rarely after) the row's max
+        // is reduced and mrow moves.  The totals are reduced once, after the last tile
         {
-            constexpr int RPW = RR / (SNT / 32), KPL = SK / 32;
-            float sv[RPW][KPL], mx[RPW], sum[RPW], m[RPW], corr[RPW];
+            float sv[RPW][KPL];
 #pragma unroll
             for (int i = 0; i < RPW; ++i) {
                 const int r = w + 8 * i, last = r < R ? p0 + r / G : -1;
-                mx[i] = -INFINITY;
+                float lmx = -INFINITY;
 #pragma unroll
                 for (int j = 0; j < KPL; ++j) {
                     const int key = k0 + lane + 32 * j;
@@ -946,48 +964,34 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
 #pragma unroll
                     for (int pt = 1; pt < KS; ++pt) sc += Ss[pt * RR * SSLD + r * SSLD + lane + 32 * j];
                     sv[i][j] = (key <= last && key < ke) ? sc : -INFINITY;
-                    mx[i] = fmaxf(mx[i], sv[i][j]);
+                    lmx = fmaxf(lmx, sv[i][j]);
                 }
+                float corr = 1.0f;
+                if (__any_sync(0xffffffffu, lmx > mrow[i] + SRES)) {   // (mrow -inf: any finite score)
+#pragma unroll
+                    for (int o = 16; o > 0; o >>= 1) lmx = fmaxf(lmx, __shfl_xor_sync(0xffffffffu, lmx, o));
+                    corr = mrow[i] == -INFINITY ? 0.0f : __expf(mrow[i] - lmx);
+                    mrow[i] = lmx;
+                    lsum[i] *= corr;
+                    if (lane == 0) *any = 1;
+                }
+                if (lane == 0) cs[r] = corr;
             }
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1)
-#pragma unroll
-                for (int i = 0; i < RPW; ++i) mx[i] = fmaxf(mx[i], __shfl_xor_sync(0xffffffffu, mx[i], o));
             __syncwarp();   // (the rows' S read by every lane before P goes over them)
 #pragma unroll
             for (int i = 0; i < RPW; ++i) {
                 const int r = w + 8 * i;
-                m[i] = ms[r];
-                corr[i] = 1.0f;
-                if (mx[i] > m[i] + SRES || (m[i] == -INFINITY && mx[i] != -INFINITY)) {
-                    corr[i] = m[i] == -INFINITY ? 0.0f : __expf(m[i] - mx[i]);
-                    m[i] = mx[i];
-                }
-                sum[i] = 0.0f;
 #pragma unroll
                 for (int j = 0; j < KPL; ++j) {
-                    const float pr = sv[i][j] == -INFINITY ? 0.0f : __expf(sv[i][j] - m[i]);
+                    const float pr = sv[i][j] == -INFINITY ? 0.0f : __expf(sv[i][j] - mrow[i]);
                     Ps[r * PLD + lane + 32 * j] = __float2half_rn(pr);
-                    sum[i] += pr;
-                }
-            }
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1)
-#pragma unroll
-                for (int i = 0; i < RPW; ++i) sum[i] += __shfl_xor_sync(0xffffffffu, sum[i], o);
-            if (lane == 0) {
-#pragma unroll
-                for (int i = 0; i < RPW; ++i) {
-                    const int r = w + 8 * i;
-                    ls[r] = ls[r] * corr[i] + sum[i];
-                    ms[r] = m[i];
-                    cs[r] = corr[i];
-                    if (corr[i] != 1.0f) *any = 1;
+                    lsum[i] += pr;
                 }
             }
         }
         }   // (!Q35_PROBE(1))
         __syncthreads();
+        Q35_MARK(2);
         if (*any != 0) {   // (rare: a row's reference max moved - its O rows scaled through the tile buffer, K done)
 #pragma unroll
             for (int i = 0; i < NF; ++i) {
@@ -1002,8 +1006,10 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
             }
             __syncthreads();
         }
+        Q35_MARK(3);
         store_v();   // V over K
         __syncthreads();
+        Q35_MARK(4);
         if (k0 + SK < ke && !Q35_PROBE(2)) issue_v(k0 + SK);
         if (!Q35_PROBE(1)) {
         // O += P V: each V fragment loaded once for the warp's RT row tiles
@@ -1022,7 +1028,21 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
         }
         }   // (!Q35_PROBE(1))
         __syncthreads();
+        Q35_MARK(5);
     }
+#ifdef Q35_STREAM_PROBE
+    if (tid == 0)
+        for (int i = 0; i < 6; ++i) atomicAdd(&g_stream_phase[i], (unsigned long long) ph[i]);
+#endif
+    // the rows' totals and reference maxima
+#pragma unroll
+    for (int i = 0; i < RPW; ++i) {
+        float t = lsum[i];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) t += __shfl_xor_sync(0xffffffffu, t, o);
+        if (lane == 0) { ms[w + 8 * i] = mrow[i]; ls[w + 8 * i] = t; }
+    }
+    __syncthreads();
     // the partials (unnormalised O, its reference max and total) through the tile buffer
 #pragma unroll
     for (int i = 0; i < NF; ++i) {
@@ -1301,6 +1321,13 @@ int g_attn_stream = -1, g_stream_blocks = -1, g_stream_sk = -1;
 }
 #ifdef Q35_STREAM_PROBE
 void q35_set_attn_stream_probe(int probe) { cudaMemcpyToSymbol(c_stream_probe, &probe, sizeof probe); }
+void q35_stream_phases(unsigned long long* out, bool reset) {
+    cudaMemcpyFromSymbol(out, g_stream_phase, 6 * sizeof(unsigned long long));
+    if (reset) {
+        const unsigned long long z[6] = {};
+        cudaMemcpyToSymbol(g_stream_phase, z, sizeof z);
+    }
+}
 #endif
 void q35_set_attn_stream(int on, int blocks, int sk) {
     g_attn_stream = on;

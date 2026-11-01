@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 #ifdef Q35_STREAM_PROBE
-namespace strata::kernels { void q35_set_attn_stream_probe(int probe); }
+namespace strata::kernels { void q35_set_attn_stream_probe(int probe); void q35_stream_phases(unsigned long long* out, bool reset); }
 #endif
 
 using namespace strata::kernels;
@@ -106,6 +106,20 @@ int main(int argc, char** argv) {
                         const double gb = m == 0 ? (double) N * HK * D * 4 / 1e9 : (double) N * HK * (2 * D + 32) / 1e9;
                         printf("  %s %.3f ms (%.0f GB/s)", pr == 0 ? "whole" : pr == 1 ? "loads" : "math", ms, gb / ms * 1e3);
                     }
+                    // the phases of one whole run (cycles summed over blocks, as a share)
+                    q35_set_attn_stream_probe(0);
+                    q35_attn(qo, kv[m], N - T, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
+                    cudaStreamSynchronize(s);
+                    unsigned long long ph[6];
+                    q35_stream_phases(ph, true);
+                    q35_attn(qo, kv[m], N - T, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
+                    cudaStreamSynchronize(s);
+                    q35_stream_phases(ph, true);
+                    double tot = 0;
+                    for (unsigned long long v : ph) tot += (double) v;
+                    const char* nm[6] = {"Kst", "QK", "smax", "resc", "Vst", "PV"};
+                    printf("  |");
+                    for (int i = 0; i < 6; ++i) printf(" %s %.0f%%", nm[i], 100.0 * ph[i] / tot);
                     printf("  %s\n", cudaGetErrorString(cudaGetLastError()));
                 }
         q35_set_attn_stream_probe(0);
@@ -163,6 +177,7 @@ int main(int argc, char** argv) {
             q35_set_attn_stream(0, 0, 0);
         }
     }
+    // the older kernels (stream off), FP16 and K8V8 (index 1 below)
     // the decode kernel's tuning: keys in flight a warp x target blocks, at T 1 and 2
     for (int T : {1}) {
         q35_set_attn_dec_max_tokens(8);
@@ -175,15 +190,15 @@ int main(int argc, char** argv) {
                 q35_set_attn_dec_tune(pf, bl, mb);
                 float ms[2] = {0, 0};
                 for (int m = 0; m < 2; ++m) {
-                    q35_attn(qo, kv[m], p0, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
+                    q35_attn(qo, kv[m ? 2 : 0], p0, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
                     cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
                     cudaEventRecord(a, s);
-                    for (int r = 0; r < 20; ++r) q35_attn(qo, kv[m], p0, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
+                    for (int r = 0; r < 20; ++r) q35_attn(qo, kv[m ? 2 : 0], p0, T, H, HK, D, qf, H * 2 * D, out, scr, 0, s);
                     cudaEventRecord(b, s); cudaEventSynchronize(b);
                     cudaEventElapsedTime(&ms[m], a, b); ms[m] /= 20;
                 }
-                const double gb16 = (double) N * HK * D * 2 * 2 / 1e9, gb8 = (double) N * HK * (D + D / 2 + 32) / 1e9;
-                printf("N %d T %d dec minb %d pf %d blocks %4d: fp16 %.3f ms (%.0f GB/s)  k8v4 %.3f ms (%.0f GB/s)  %s\n", N, T, mb, pf, bl,
+                const double gb16 = (double) N * HK * D * 2 * 2 / 1e9, gb8 = (double) N * HK * (2 * D + 32) / 1e9;
+                printf("N %d T %d dec minb %d pf %d blocks %4d: fp16 %.3f ms (%.0f GB/s)  k8v8 %.3f ms (%.0f GB/s)  %s\n", N, T, mb, pf, bl,
                        ms[0], gb16 / ms[0] * 1e3, ms[1], gb8 / ms[1] * 1e3, cudaGetErrorString(cudaGetLastError()));
             }
         q35_set_attn_dec_tune(0, 0, 0);
@@ -197,12 +212,12 @@ int main(int argc, char** argv) {
             q35_set_attn_var(dec > 100 ? dec - 100 : 0);
             float ms[2] = {0, 0};
             for (int m = 0; m < 2; ++m) {
-                q35_attn_prep(qf, H * 2 * D, kk, vv, HK * D, nw, nw, 1e-6f, 1e7f, 64, p0, T, H, HK, D, qo, kv[m], s);
-                q35_attn(qo, kv[m], p0, T, H, HK, D, qf, H * 2 * D, out + (size_t) m * 8 * H * D, scr, 0, s);
+                q35_attn_prep(qf, H * 2 * D, kk, vv, HK * D, nw, nw, 1e-6f, 1e7f, 64, p0, T, H, HK, D, qo, kv[m ? 2 : 0], s);
+                q35_attn(qo, kv[m ? 2 : 0], p0, T, H, HK, D, qf, H * 2 * D, out + (size_t) m * 8 * H * D, scr, 0, s);
                 cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
                 cudaEventRecord(a, s);
                 for (int r = 0; r < 20; ++r)
-                    q35_attn(qo, kv[m], p0, T, H, HK, D, qf, H * 2 * D, out + (size_t) m * 8 * H * D, scr, 0, s);
+                    q35_attn(qo, kv[m ? 2 : 0], p0, T, H, HK, D, qf, H * 2 * D, out + (size_t) m * 8 * H * D, scr, 0, s);
                 cudaEventRecord(b, s); cudaEventSynchronize(b);
                 cudaEventElapsedTime(&ms[m], a, b); ms[m] /= 20;
             }
@@ -212,8 +227,8 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < (size_t) T * H * D; ++i) { e += pow(o[i] - o[8 * H * D + i], 2); r += o[i] * o[i]; }
             if (dec == 0) ref = o;
             else for (size_t i = 0; i < (size_t) T * H * D; ++i) e2 += pow(o[i] - ref[i], 2) + pow(o[8 * H * D + i] - ref[8 * H * D + i], 2);
-            const double gb16 = (double) N * HK * D * 2 * 2 / 1e9, gb8 = (double) N * HK * (D + D / 2 + 32) / 1e9;
-            printf("N %d T %d %s: fp16 %.3f ms (%.0f GB/s)  k8v4 %.3f ms (%.0f GB/s)  k8v4 rel err %.4f  dec vs tile %.2e  cuda %s\n",
+            const double gb16 = (double) N * HK * D * 2 * 2 / 1e9, gb8 = (double) N * HK * (2 * D + 32) / 1e9;
+            printf("N %d T %d %s: fp16 %.3f ms (%.0f GB/s)  k8v8 %.3f ms (%.0f GB/s)  k8v8 rel err %.4f  dec vs tile %.2e  cuda %s\n",
                    N, T, dec == 8 ? "dec  " : dec > 100 ? (dec == 101 ? "var1 " : "var2 ") : "tile ", ms[0], gb16 / ms[0] * 1e3, ms[1], gb8 / ms[1] * 1e3, sqrt(e / r),
                    dec ? sqrt(e2 / (2 * r)) : 0.0, cudaGetErrorString(cudaGetLastError()));
         }
