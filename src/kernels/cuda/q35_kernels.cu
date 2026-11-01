@@ -44,8 +44,18 @@ __global__ void rms_rows_kernel(const float* __restrict__ x, int ldx, const floa
     __shared__ float sh[32];
     const float* xr = x + (size_t) blockIdx.x * ldx;
     float acc = 0.0f;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) acc += xr[i] * xr[i];
+    // (4 strided loads in flight a thread, summed in the same order: the same bits, without a load latency an element)
+    const int bd = blockDim.x;
+    for (int i0 = threadIdx.x; i0 < cols; i0 += 4 * bd) {
+        float v[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) v[k] = i0 + k * bd < cols ? xr[i0 + k * bd] : 0.0f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+            if (i0 + k * bd < cols) acc += v[k] * v[k];
+    }
     const float scale = rsqrtf(block_sum(acc, sh) / (float) cols + eps);
+#pragma unroll 4
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         const float v = xr[i] * scale * (w ? w[i] : 1.0f);   // (no weight: a plain rms norm)
         if (of) of[(size_t) blockIdx.x * cols + i] = v;
@@ -61,12 +71,17 @@ __global__ void add_rms_rows_kernel(float* __restrict__ x, int ldx, const float*
     float* xr = x + (size_t) blockIdx.x * ldx;
     const float* ar = a + (size_t) blockIdx.x * cols;
     float acc = 0.0f;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        const float v = xr[i] + ar[i];
-        xr[i] = v;
-        acc += v * v;
+    const int bd = blockDim.x;
+    for (int i0 = threadIdx.x; i0 < cols; i0 += 4 * bd) {   // (4 elements in flight a thread, the same order)
+        float v[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) v[k] = i0 + k * bd < cols ? xr[i0 + k * bd] + ar[i0 + k * bd] : 0.0f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+            if (i0 + k * bd < cols) { xr[i0 + k * bd] = v[k]; acc += v[k] * v[k]; }
     }
     const float scale = rsqrtf(block_sum(acc, sh) / (float) cols + eps);
+#pragma unroll 4
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         const float v = xr[i] * scale * (w ? w[i] : 1.0f);
         if (of) of[(size_t) blockIdx.x * cols + i] = v;
