@@ -1291,10 +1291,15 @@ bool DenseModel::forward(const int32_t* tokens, int T, bool verify, int want, st
     const float eps = cfg_.rms_eps;
     const int64_t p0 = pos_;
     try {
-        // ---- the embedding rows, dequantized on the device
+        // ---- the embedding rows, dequantized on the device (a prompt chunk's in one launch, its ids copied over)
         I.mark(s);
-        for (int t = 0; t < T; ++t)
-            dequant_f32(I.embd.type, I.embd.dev, tokens[t], 1, E, I.x + (size_t) t * E, s);
+        if (T > kMaxCols && dequant_f32_dev_supported(I.embd.type)) {
+            cudaMemcpyAsync(I.tok_dev, tokens, (size_t) T * 4, cudaMemcpyHostToDevice, s);
+            dequant_f32_rows_dev(I.embd.type, I.embd.dev, I.tok_dev, T, E, I.x, s);
+        } else {
+            for (int t = 0; t < T; ++t)
+                dequant_f32(I.embd.type, I.embd.dev, tokens[t], 1, E, I.x + (size_t) t * E, s);
+        }
         I.stage("embed", s);
 
         auto post = [&](int l) {   // the layer from the mixer's output: the residual add, the FFN, the drafter taps
@@ -1333,6 +1338,8 @@ bool DenseModel::forward(const int32_t* tokens, int T, bool verify, int want, st
                                       cudaMemcpyDeviceToDevice, s);
                     cudaMemcpy2DAsync(ab + VH, (size_t) 2 * VH * 4, I.ab_tmp + (size_t) T * VH, (size_t) VH * 4,
                                       (size_t) VH * 4, T, cudaMemcpyDeviceToDevice, s);
+                } else if (T > kMaxCols) {   // (a prompt chunk: one F32 GEMM - the GEMV re-read the rows 8 tokens at a time)
+                    I.gemm.f32(I.xn, E, L.ab_w, ab, T, 2 * VH, E, 2 * VH);
                 } else {
                     q35_gemv_f32_cols(L.ab_w, I.xn, E, ab, E, 2 * VH, T, s);
                 }
@@ -1563,7 +1570,12 @@ bool DenseModel::mtp_fill(const int32_t* toks, const float* hidden, int64_t p0, 
     try {
         I.mark(s);
         // as mtp_forward up to the K / V projections; no Q, attention, output, FFN or logits
-        for (int t = 0; t < T; ++t) dequant_f32(I.embd.type, I.embd.dev, toks[t], 1, E, I.y + (size_t) t * E, s);
+        if (T > kMaxCols && dequant_f32_dev_supported(I.embd.type)) {
+            cudaMemcpyAsync(I.tok_dev, toks, (size_t) T * 4, cudaMemcpyHostToDevice, s);
+            dequant_f32_rows_dev(I.embd.type, I.embd.dev, I.tok_dev, T, E, I.y, s);
+        } else {
+            for (int t = 0; t < T; ++t) dequant_f32(I.embd.type, I.embd.dev, toks[t], 1, E, I.y + (size_t) t * E, s);
+        }
         float* cat = I.mtp_cat;
         q35_rms_rows(I.y, E, M.enorm, I.xn, nullptr, T, E, eps, s);
         cudaMemcpy2DAsync(cat, (size_t) 2 * E * 4, I.xn, (size_t) E * 4, (size_t) E * 4, T, cudaMemcpyDeviceToDevice, s);

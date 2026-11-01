@@ -156,9 +156,10 @@ __global__ void dequant_kernel(const uint8_t* __restrict__ blocks, int64_t row_b
                                int64_t groups_per_row, T* __restrict__ out, const int32_t* __restrict__ d_row0 = nullptr) {
     const int64_t g = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (g >= rows * groups_per_row) return;
-    if (d_row0 != nullptr) row0 = *d_row0;   // (dequant_f32_dev: the row named on the device)
     const int64_t r = g / groups_per_row, gi = g % groups_per_row;
-    group32<TYPE>(blocks + (row0 + r) * row_bytes, (int) gi, out + r * groups_per_row * 32 + gi * 32);
+    // (d_row0: the rows named on the device - output row r is source row d_row0[r])
+    const int64_t src = d_row0 != nullptr ? (int64_t) d_row0[r] : row0 + r;
+    group32<TYPE>(blocks + src * row_bytes, (int) gi, out + r * groups_per_row * 32 + gi * 32);
 }
 
 // Q8_0 -> f16, 8 values a thread: one 16-byte store each, so a warp writes 512 contiguous bytes (the generic kernel's
@@ -364,6 +365,11 @@ bool dequant_f32_dev_supported(int ggml_type) noexcept { return dequant_bf16_sup
 
 void dequant_f32_dev(int ggml_type, const void* blocks, const int32_t* d_row, int64_t cols, float* out, void* stream) {
     launch<float>(ggml_type, blocks, 0, 1, cols, out, stream, d_row);
+}
+
+void dequant_f32_rows_dev(int ggml_type, const void* blocks, const int32_t* d_rows, int64_t rows, int64_t cols, float* out,
+                          void* stream) {
+    launch<float>(ggml_type, blocks, 0, rows, cols, out, stream, d_rows);
 }
 
 }  // namespace strata::kernels

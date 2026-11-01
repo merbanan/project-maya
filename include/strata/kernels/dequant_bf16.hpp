@@ -28,5 +28,8 @@ void dequant_f32(int ggml_type, const void* blocks, int64_t row0, int64_t rows, 
 /// one row as dequant_f32, its index read on the device from *d_row (no host round trip; not the i-quant formats)
 bool dequant_f32_dev_supported(int ggml_type) noexcept;
 void dequant_f32_dev(int ggml_type, const void* blocks, const int32_t* d_row, int64_t cols, float* out, void* stream);
+/// Rows d_rows[0 .. rows) (device ids) of a matrix to F32, one launch (an embedding lookup of a prompt chunk).
+void dequant_f32_rows_dev(int ggml_type, const void* blocks, const int32_t* d_rows, int64_t rows, int64_t cols, float* out,
+                          void* stream);
 
 }  // namespace strata::kernels
