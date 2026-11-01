@@ -560,7 +560,9 @@ __global__ void __launch_bounds__(kThreads) mvt_kernel(const KBatch b) {
         const uint32_t* src = J.tr + ((size_t) ks * J.ld + g * 8) * W;
         __syncwarp();
 #pragma unroll
-        for (int i = lane; i < TW; i += 32) st[i] = src[i];
+        // (the trellis streaming / evict-first in mvt / mvr - each tile read once a pass: MTP / DFlash2 +1%; block_gemv's
+        // one-row path slower with it, chain 282 / 283)
+        for (int i = lane; i < TW; i += 32) st[i] = __ldcs(src + i);
         __syncwarp();
         wmma::fragment<wmma::matrix_a, 8, 32, 16, __half, wmma::row_major> fa;
         wmma::load_matrix_sync(fa, xs + (ks - ks0) * 16, kMaxKR);
@@ -686,7 +688,7 @@ __global__ void __launch_bounds__(kThreads) mvr_kernel(const KBatch b) {
     int ks = ks0 + kh;
     if (ks < ks1)
 #pragma unroll
-        for (int u = 0; u < NWL; ++u) nx[u] = lane + 32 * u < W2 ? __ldg(base + (size_t) ks * J.ld * W + lane + 32 * u) : 0u;
+        for (int u = 0; u < NWL; ++u) nx[u] = lane + 32 * u < W2 ? __ldcs(base + (size_t) ks * J.ld * W + lane + 32 * u) : 0u;
     for (; ks < ks1; ks += 2) {
         __syncwarp();
 #pragma unroll
@@ -696,7 +698,7 @@ __global__ void __launch_bounds__(kThreads) mvr_kernel(const KBatch b) {
         if (ks + 2 < ks1)
 #pragma unroll
             for (int u = 0; u < NWL; ++u)
-                nx[u] = lane + 32 * u < W2 ? __ldg(base + (size_t) (ks + 2) * J.ld * W + lane + 32 * u) : 0u;
+                nx[u] = lane + 32 * u < W2 ? __ldcs(base + (size_t) (ks + 2) * J.ld * W + lane + 32 * u) : 0u;
         const __half* xk = xr + (ks - ks0) * 16;
         const uint32_t a0 = *(const uint32_t*) xk, a1 = *(const uint32_t*) (xk + 8);
 #pragma unroll
