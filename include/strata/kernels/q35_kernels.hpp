@@ -83,6 +83,9 @@ uint64_t q35_kv_bytes(int mode, int n_kv, int D, int max_ctx);
 ///   q rows (from q_full: per head [q | gate] of 2 * D, stride ldq): rms * q_norm, NeoX rope on the first n_rot dims
 ///   -> q_out (rows of n_head * D, dense);  k rows (stride ldk): rms * k_norm, rope -> K cache cell p0 + t;  v rows
 ///   (stride ldk) -> V cache cell.  Caches [n_kv][max_ctx][D] FP16.
+/// A K8V8 cache's keys [0, n_keys) unpacked to FP16 at the same cells of k16 / v16 (an FP16 cache's layout, n_kv x
+/// max_ctx rows of D) - the same values the attention kernels unpack (the prompt path then reads them as FP16).
+void q35_kv_expand_f16(const Q35Kv& kv, int n_keys, int n_kv, int D, uint16_t* k16, uint16_t* v16, void* stream);
 void q35_attn_prep(const float* q_full, int ldq, const float* k, const float* v, int ldk, const float* q_norm,
                    const float* k_norm, float eps, float rope_base, int n_rot, int p0, int T, int n_head, int n_kv,
                    int D, float* q_out, const Q35Kv& kv, void* stream);

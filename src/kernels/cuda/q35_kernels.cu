@@ -1062,6 +1062,24 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
     }
 }
 
+// K8V8's keys [0, n_keys) of every KV head, unpacked to FP16 at the same cells (16 threads a cell, each 16 values of
+// K and of V): the prompt path's attention then reads the FP16 copy instead of unpacking every tile once a query tile
+__global__ void kv_expand_kernel(Q35Kv kv, int n_keys, __half* __restrict__ k16, __half* __restrict__ v16) {
+    const int key = blockIdx.x * 16 + threadIdx.x / 16, c = threadIdx.x % 16, kvh = blockIdx.y;
+    if (key >= n_keys) return;
+    const size_t cell = (size_t) kvh * kv.max_ctx + key;
+    const uint4 kc = __ldg((const uint4*) ((const int8_t*) kv.k + cell * AD) + c);
+    const uint4 vc = __ldg((const uint4*) ((const int8_t*) kv.v + cell * AD) + c);
+    const __half ks = __ushort_as_half(__ldg((const unsigned short*) kv.ks + cell * (AD / 32) + c / 2));
+    const __half vs = __ushort_as_half(__ldg((const unsigned short*) kv.vs + cell * (AD / 32) + c / 2));
+    uint4* kd = (uint4*) (k16 + cell * AD + c * 16);
+    uint4* vd = (uint4*) (v16 + cell * AD + c * 16);
+    kd[0] = deq_k8(make_uint2(kc.x, kc.y), ks);
+    kd[1] = deq_k8(make_uint2(kc.z, kc.w), ks);
+    vd[0] = deq_k8(make_uint2(vc.x, vc.y), vs);
+    vd[1] = deq_k8(make_uint2(vc.z, vc.w), vs);
+}
+
 // block = row, AD threads: fold the splits' partials, then the output gate
 __global__ void attn_merge_kernel(const float* __restrict__ part_o, const float* __restrict__ part_ml, int rows,
                                   int n_split, int G, int n_head, const float* __restrict__ q_full, int ldq,
@@ -1366,11 +1384,11 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
     const int AR_v = v ? 32 : AR, AK_v = v == 2 ? 16 : AK, AW_v = v ? 2 : AW;
     const int tiles = (rows + AR_v - 1) / AR_v;
     const int n_keys = p0 + T;
-    // on by default for the FP16 cache (chain205, 512 greedy tokens: MTP 57.3 -> 61.2 tok/s at 35K, plain decode
-    // 16.7 -> 17.0 at 68K, the same tokens); K8V4 only when asked for until its end-to-end A/B
+    // on by default for the FP16 and K8V8 caches (FP16, chain205: MTP 57.3 -> 61.2 tok/s at 35K, the same tokens;
+    // K8V8 the fastest of its kernels at every width); K8V4 only when asked for
     static const int stream_env = std::getenv("STRATA_DENSE_ATTN_STREAM") ? std::atoi(std::getenv("STRATA_DENSE_ATTN_STREAM")) : -1;
     const int stream_sel = g_attn_stream >= 0 ? g_attn_stream : stream_env;
-    const bool stream_on = stream_sel > 0 || (stream_sel < 0 && kv.mode == 0);
+    const bool stream_on = stream_sel > 0 || (stream_sel < 0 && kv.mode != 1);
     if (stream_on && splits <= 0 && rows <= 48) {
         const int rt = rows <= 16 ? 1 : rows <= 32 ? 2 : 3;
         // keys a tile by rows (attn_bench, V100, FP16, 68K / 131K): 16 rows 64 (779 / 814 GB/s), 32 rows 32 at 2 blocks a
@@ -1527,6 +1545,14 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
         unrotate_gate_kernel<<<dim3(T, n_head), 256, 0, (cudaStream_t) stream>>>(out, n_head, q_full, ldq);
         check("q35_attn_unrotate");
     }
+}
+
+void q35_kv_expand_f16(const Q35Kv& kv, int n_keys, int n_kv, int D, uint16_t* k16, uint16_t* v16, void* stream) {
+    if (kv.mode != 2 || D != AD) throw std::invalid_argument("q35_kv_expand_f16: a K8V8 cache, head size 256");
+    if (n_keys <= 0) return;
+    kv_expand_kernel<<<dim3((n_keys + 15) / 16, n_kv), 256, 0, (cudaStream_t) stream>>>(kv, n_keys, (__half*) k16,
+                                                                                      (__half*) v16);
+    check("q35_kv_expand_f16");
 }
 
 void q35_gemv_f32_cols(const float* W, const float* x, int ldx, float* y, int n_in, int n_out, int T, void* stream) {

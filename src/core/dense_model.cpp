@@ -227,7 +227,9 @@ struct DenseModel::Impl {
     }
     int chunk = 512;                                // the largest T of a forward pass
     int max_in = 0;                                 // the widest input the activation conversions are sized for
-    int kv_mode = 0;                                // the K / V cache: 0 FP16, 1 K8V4, 2 K8V8 (STRATA_DENSE_KV / --kv)
+    // the K / V cache: 0 FP16, 1 K8V4, 2 K8V8 (STRATA_DENSE_KV / --kv).  K8V8 by default: Qwen3.8-27B, 512 greedy
+    // tokens, the same tokens as FP16 at 35K / 68K, TG 61.6 -> 62.6 (35K MTP), 35.9 -> 38.8 (68K MTP) at half the memory
+    int kv_mode = 2;
 
     // Gemma 4: the per-layer embeddings (the token table, the model projection and its norm), rope bases, window
     bool gemma = false, muse = false;
@@ -274,6 +276,8 @@ struct DenseModel::Impl {
     float *ffn_g = nullptr, *ffn_u = nullptr, *ffn_h = nullptr;
     float* logits = nullptr;                        // kMaxCols rows of n_vocab
     float* attn_scratch = nullptr;
+    // (K8V8) one layer's cache unpacked to FP16 for the prompt path's attention (STRATA_DENSE_KV_EXPAND, default on)
+    uint16_t *kv16_k = nullptr, *kv16_v = nullptr;
     float* conv_dummy = nullptr;
     int swa_ring = 0;          // Gemma: the sliding-window layers' ring cells (0: they hold the whole context)
     int64_t ring_hi = -1;      // the highest position written into the rings since the last reset
@@ -617,7 +621,8 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
     if (const char* e = std::getenv("STRATA_DENSE_KV")) {
         if (std::string(e) == "k8v4") I.kv_mode = 1;
         else if (std::string(e) == "k8v8") I.kv_mode = 2;
-        else if (std::string(e) != "fp16") { err = std::string("dense model: STRATA_DENSE_KV=") + e + " (fp16 | k8v4 | k8v8)"; return false; }
+        else if (std::string(e) == "fp16") I.kv_mode = 0;
+        else { err = std::string("dense model: STRATA_DENSE_KV=") + e + " (fp16 | k8v4 | k8v8)"; return false; }
     }
     I.prof.on = std::getenv("STRATA_DENSE_PROF") != nullptr && std::atoi(std::getenv("STRATA_DENSE_PROF")) != 0;
     try {
@@ -710,7 +715,8 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             int n_attn = want_mtp ? 1 : 0;
             for (int l = 0; l < NL; ++l)
                 if (I.find("blk." + std::to_string(l) + ".attn_q.weight")) ++n_attn;
-            const uint64_t kv_need = (uint64_t) n_attn * q35_kv_bytes(I.kv_mode, HK, D, (int) max_context);
+            const uint64_t kv_need = (uint64_t) n_attn * q35_kv_bytes(I.kv_mode, HK, D, (int) max_context) +
+                                     (I.kv_mode == 2 ? q35_kv_bytes(0, HK, D, (int) max_context) : 0);   // (+ the FP16 copy)
             const uint64_t act = (uint64_t) I.chunk * (uint64_t) (8 * E + 3 * C + 3 * V + 4 * H * D + 3 * cfg_.n_ff) * 4 +
                                  (uint64_t) cfg_.n_ff * E * 2 + (uint64_t) kMaxCols * cfg_.n_vocab * 4 * 2 +
                                  (uint64_t) q35_attn_scratch_floats(kMaxCols, H, D, (int) max_context) * 4;
@@ -758,6 +764,14 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                 return false;
             }
             kv_bytes_ += q35_kv_bytes(I.kv_mode, HK, D, (int) max_context);
+            static const bool expand = !std::getenv("STRATA_DENSE_KV_EXPAND") || std::atoi(std::getenv("STRATA_DENSE_KV_EXPAND")) != 0;
+            if (I.kv_mode == 2 && expand && !I.kv16_k) {   // (one layer's FP16 copy, shared by the layers: + 32 zero cells)
+                if (!I.alloc(&I.kv16_k, (cells + 32) * D * 2, err, "K cache FP16 copy") ||
+                    !I.alloc(&I.kv16_v, (cells + 32) * D * 2, err, "V cache FP16 copy"))
+                    return false;
+                cudaMemset(I.kv16_k, 0, (cells + 32) * D * 2);
+                cudaMemset(I.kv16_v, 0, (cells + 32) * D * 2);
+            }
             return true;
         };
         auto load_common = [&](Layer& L, const std::string& p) {
@@ -1042,7 +1056,12 @@ void attn_core(DenseModel::Impl& I, const DenseConfig& c, Layer& L, int64_t p0, 
     const int H = c.n_head, HK = c.n_head_kv, D = c.head_dim;
     q35_attn_prep(I.q_full, H * 2 * D, I.kcur, I.vcur, HK * D, L.q_norm, L.k_norm, c.rms_eps, c.rope_base, c.n_rot,
                   (int) p0, T, H, HK, D, I.qcur, L.kv, I.stream);
-    q35_attn(I.qcur, L.kv, (int) p0, T, H, HK, D, I.q_full, H * 2 * D, I.attn, I.attn_scratch,
+    Q35Kv kv = L.kv;
+    if (T > kMaxCols && L.kv.mode == 2 && I.kv16_k) {   // (a prompt chunk: its keys unpacked once, not once a query tile)
+        q35_kv_expand_f16(L.kv, (int) p0 + T, HK, D, I.kv16_k, I.kv16_v, I.stream);
+        kv = Q35Kv{I.kv16_k, I.kv16_v, nullptr, nullptr, 0, L.kv.max_ctx};
+    }
+    q35_attn(I.qcur, kv, (int) p0, T, H, HK, D, I.q_full, H * 2 * D, I.attn, I.attn_scratch,
              T <= kMaxCols ? 0 : 1, I.stream);
     I.stage("attn_core", I.stream);
 }

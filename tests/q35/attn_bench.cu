@@ -131,16 +131,41 @@ int main(int argc, char** argv) {
     if (argc > 2 && std::string(argv[2]) == "pp") {
         float* pout;
         cudaMalloc(&pout, (size_t) CH * H * D * 4);
-        for (int m : {0, 2})   // (FP16, K8V8)
-            for (int p0 : {N / 4, N / 2, N - CH}) {
-                q35_attn(qo, kv[m], p0, CH, H, HK, D, qf, H * 2 * D, pout, scr, 1, s);
+        uint16_t *k16, *v16;   // (K8V8's FP16 copy: m == 3 below)
+        cudaMalloc(&k16, ((size_t) HK * max_ctx + 32) * D * 2);
+        cudaMalloc(&v16, ((size_t) HK * max_ctx + 32) * D * 2);
+        cudaMemset(k16, 0, ((size_t) HK * max_ctx + 32) * D * 2);
+        cudaMemset(v16, 0, ((size_t) HK * max_ctx + 32) * D * 2);
+        const Q35Kv kv16{k16, v16, nullptr, nullptr, 0, max_ctx};
+        std::vector<float> ref8[3], got((size_t) CH * H * D);
+        for (int m : {0, 2, 3})   // (FP16, K8V8, K8V8 unpacked to FP16 first)
+            for (int pi = 0; pi < 3; ++pi) {
+                const int p0 = pi == 0 ? N / 4 : pi == 1 ? N / 2 : N - CH;
+                auto run = [&] {
+                    if (m == 3) {
+                        q35_kv_expand_f16(kv[2], p0 + CH, HK, D, k16, v16, s);
+                        q35_attn(qo, kv16, p0, CH, H, HK, D, qf, H * 2 * D, pout, scr, 1, s);
+                    } else {
+                        q35_attn(qo, kv[m], p0, CH, H, HK, D, qf, H * 2 * D, pout, scr, 1, s);
+                    }
+                };
+                run();
+                if (m >= 2) {   // (the copy's output against the K8V8 kernel's: the same bits expected)
+                    cudaMemcpy(got.data(), pout, got.size() * 4, cudaMemcpyDeviceToHost);
+                    if (m == 2) ref8[pi] = got;
+                    if (m == 3) {
+                        size_t diff = 0;
+                        for (size_t i = 0; i < got.size(); ++i) diff += got[i] != ref8[pi][i];
+                        printf("pp k8v8 FP16 copy at %d: %zu of %zu values differ from the K8V8 kernel's\n", p0, diff, got.size());
+                    }
+                }
                 cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
                 cudaEventRecord(a, s);
-                for (int r = 0; r < 5; ++r) q35_attn(qo, kv[m], p0, CH, H, HK, D, qf, H * 2 * D, pout, scr, 1, s);
+                for (int r = 0; r < 5; ++r) run();
                 cudaEventRecord(b, s); cudaEventSynchronize(b);
                 float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= 5;
                 const double fl = 4.0 * H * D * CH * (p0 + CH / 2.0);
-                printf("pp %s chunk %d at %d: %.2f ms (%.1f TFLOP/s, %.3f ms a row)  %s\n", m == 2 ? "k8v8" : m ? "k8v4" : "fp16", CH, p0, ms,
+                printf("pp %s chunk %d at %d: %.2f ms (%.1f TFLOP/s, %.3f ms a row)  %s\n", m == 3 ? "k8v8x" : m == 2 ? "k8v8" : m ? "k8v4" : "fp16", CH, p0, ms,
                        fl / ms / 1e9, ms / CH, cudaGetErrorString(cudaGetLastError()));
             }
         return 0;
