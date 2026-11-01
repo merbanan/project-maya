@@ -624,6 +624,146 @@ __global__ void __launch_bounds__(kThreads) mvt_kernel(const KBatch b) {
     if (threadIdx.x == 0) J.cnt[g] = 0u;
 }
 
+// ---------------------------------------------------------------- mvr: the tiles straight into Volta's mma fragments
+// mv for up to 8 activations with each tile decoded once and its weights moved by shuffles straight into the B
+// operands of mma.sync.m8n8k4 (no shared-memory round trip): decode8 gives lane L the k rows {2q, 2q+1, 2q+8, 2q+9}
+// (q = L & 3) of the columns L >> 2 and (L >> 2) + 8; a 4 x 4 transpose of lanes inside each half warp hands quadpair
+// q the k-set q of 8 columns, one a lane, so the warp's four quadpair MMAs cover the tile's 16 k rows in one
+// instruction a column half, each quadpair summing its own k-set (the four added by two shuffles at the end).  A warp
+// owns one of the block's 8 tiles over the slice's k rows; the activations' rotated rows in shared memory are the A
+// operands (rows past nc zero).  Not mv_kernel's bits.
+__device__ __forceinline__ void mma884x(float* c, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+                 "{%0,%1,%2,%3,%4,%5,%6,%7};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ uint32_t pack_h2(float a, float b) {
+    const __half2 h = __floats2half2_rn(a, b);
+    return *(const uint32_t*) &h;
+}
+template <int K2, int cb>
+__global__ void __launch_bounds__(kThreads) mvr_kernel(const KBatch b) {
+    constexpr int W = 4 * K2, W2 = 2 * W, NWL = (W2 + 31) / 32;   // two tiles' words, a lane's share
+    __shared__ __align__(16) __half xs[kMvtRows * kMaxKR];
+    __shared__ float red[kMvtRows * kCols];
+    __shared__ uint32_t stage[kWarps * W2];
+    __shared__ int last;
+    int ji = 0;
+    while ((int) blockIdx.x >= b.blk_end[ji]) ++ji;
+    const KJob& J = b.j[ji];
+    const int local = (int) blockIdx.x - (ji > 0 ? b.blk_end[ji - 1] : 0);
+    const int g = local / J.S, sp = local % J.S;
+    const int k0 = sp * J.kr, k1 = min(J.k, k0 + J.kr), kr = k1 - k0;
+    for (int c = 0; c < kMvtRows; ++c) {
+        if (c < J.nc) {
+            rotate_in(J.xf != nullptr ? J.xf + c * J.xf_cs : nullptr,
+                      J.xq != nullptr ? (const Q81*) ((const uint8_t*) J.xq + c * J.xq_cs) : nullptr, J.suh, k0, kr,
+                      xs + c * kMaxKR);
+        } else {
+            for (int i = threadIdx.x; i < kr; i += kThreads) xs[c * kMaxKR + i] = __float2half(0.0f);
+        }
+    }
+    for (int i = threadIdx.x; i < kMvtRows * kCols; i += kThreads) red[i] = 0.0f;
+    __syncthreads();
+    // warp w: the tiles 2 tp, 2 tp + 1 (tp = w % 4) over the slice's k rows of parity kh = w / 4
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tp = warp & 3, kh = warp >> 2;
+    const int q = (lane >> 2) & 3;                                 // the lane's quadpair: its k-set
+    const int tok = (lane & 3) + ((lane >> 4) << 2);               // its A row (an activation)
+    const int src = (lane & 16) | ((lane & 3) << 2) | ((lane >> 2) & 3);   // the lane whose column / k-set it takes
+    float c[2][2][8];
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) c[t][h][i] = 0.0f;
+    const __half* xr = xs + tok * kMaxKR + 2 * q;
+    const int ks0 = k0 / 16, ks1 = k1 / 16;
+    const uint32_t* base = J.tr + ((size_t) g * 8 + 2 * tp) * W;   // (+ ks ld W: the k row's two tiles, contiguous)
+    uint32_t* st = stage + warp * W2;
+    uint32_t nx[NWL];
+    int ks = ks0 + kh;
+    if (ks < ks1)
+#pragma unroll
+        for (int u = 0; u < NWL; ++u) nx[u] = lane + 32 * u < W2 ? __ldg(base + (size_t) ks * J.ld * W + lane + 32 * u) : 0u;
+    for (; ks < ks1; ks += 2) {
+        __syncwarp();
+#pragma unroll
+        for (int u = 0; u < NWL; ++u)
+            if (lane + 32 * u < W2) st[lane + 32 * u] = nx[u];
+        __syncwarp();
+        if (ks + 2 < ks1)
+#pragma unroll
+            for (int u = 0; u < NWL; ++u)
+                nx[u] = lane + 32 * u < W2 ? __ldg(base + (size_t) (ks + 2) * J.ld * W + lane + 32 * u) : 0u;
+        const __half* xk = xr + (ks - ks0) * 16;
+        const uint32_t a0 = *(const uint32_t*) xk, a1 = *(const uint32_t*) (xk + 8);
+#pragma unroll
+        for (int t = 0; t < 2; ++t) {
+            float v[8];
+            decode8<K2, cb>(st + t * W, lane, v);
+            const uint32_t p0 = pack_h2(v[0], v[1]), p1 = pack_h2(v[2], v[3]), p2 = pack_h2(v[4], v[5]), p3 = pack_h2(v[6], v[7]);
+            mma884x(c[t][0], a0, a1, __shfl_sync(0xffffffffu, p0, src), __shfl_sync(0xffffffffu, p1, src));
+            mma884x(c[t][1], a0, a1, __shfl_sync(0xffffffffu, p2, src), __shfl_sync(0xffffffffu, p3, src));
+        }
+    }
+    // the quadpairs' k-sets added (lanes differing in bits 2-3 hold the same (activation, column) entries)
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                c[t][h][i] += __shfl_xor_sync(0xffffffffu, c[t][h][i], 4);
+                c[t][h][i] += __shfl_xor_sync(0xffffffffu, c[t][h][i], 8);
+            }
+    // the two k-row parities in order (kh 0 then 1), each lane of quadpair 0 its entries (mmtp_kernel's map)
+    const int j = lane & 3, hi = lane >> 4;
+    const int r0 = (j & 1) + 16 * hi, cc = (j & 2);
+    const int rl[2] = {r0, r0 + 2}, cl[4] = {cc, cc + 1, cc + 16, cc + 17};
+    const int ci[8][2] = {{0, 0}, {0, 1}, {1, 0}, {1, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}};
+    for (int pass = 0; pass < 2; ++pass) {
+        if (kh == pass && q == 0)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int ra = rl[ci[i][0]], cb2 = cl[ci[i][1]];
+                const int t = (ra & 3) + ((ra >> 4) << 2);
+                const int col = (cb2 & 3) + 4 * ((cb2 >> 4) & 1);
+#pragma unroll
+                for (int tt = 0; tt < 2; ++tt) {
+                    red[t * kCols + (2 * tp + tt) * 16 + col] += c[tt][0][i];
+                    red[t * kCols + (2 * tp + tt) * 16 + 8 + col] += c[tt][1][i];
+                }
+            }
+        __syncthreads();
+    }
+    const float* bias = J.bias != nullptr ? J.bias + g * kCols : nullptr;
+    if (J.S == 1) {
+        if (warp < J.nc) epilogue(red + warp * kCols, J.svh + g * kCols, J.alpha, bias, J.y + warp * J.y_cs + g * kCols);
+        return;
+    }
+    if (threadIdx.x < kCols)
+        for (int c = 0; c < J.nc; ++c)
+            J.part[((size_t) c * J.S + sp) * J.n + g * kCols + threadIdx.x] = red[c * kCols + threadIdx.x];
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(&J.cnt[g], 1u) == (unsigned) (J.S - 1);
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    if (threadIdx.x < kCols)
+        for (int c = 0; c < J.nc; ++c) {
+            float s2 = 0.0f;
+            for (int i = 0; i < J.S; ++i)
+                s2 += *(volatile const float*) &J.part[((size_t) c * J.S + i) * J.n + g * kCols + threadIdx.x];
+            red[c * kCols + threadIdx.x] = s2;
+        }
+    __syncthreads();
+    if (warp < J.nc) epilogue(red + warp * kCols, J.svh + g * kCols, J.alpha, bias, J.y + warp * J.y_cs + g * kCols);
+    if (threadIdx.x == 0) J.cnt[g] = 0u;
+}
+
 // ---------------------------------------------------------------- the routed experts
 struct KMoe {
     const unsigned long long* plan_ptr;
@@ -886,6 +1026,9 @@ bool dispatch(int K2, int cb, A&&... args) {
 template <int K2, int cb> struct RunMv {
     static void run(const KBatch& b, int blocks, cudaStream_t s) { mv_kernel<K2, cb><<<blocks, kThreads, 0, s>>>(b); }
 };
+template <int K2, int cb> struct RunMvr {
+    static void run(const KBatch& b, int blocks, cudaStream_t s) { mvr_kernel<K2, cb><<<blocks, kThreads, 0, s>>>(b); }
+};
 template <int K2, int cb> struct RunMvt {
     static void run(const KBatch& b, int blocks, cudaStream_t s) {
         mvt_kernel<K2, cb><<<blocks, kThreads, mvt_smem_bytes(K2), s>>>(b);
@@ -1057,7 +1200,12 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     }();
     int max_cols = 0;
     for (int j = 0; j < n; ++j) max_cols = std::max(max_cols, jobs[j].ncol);
-    const bool use_mvt = mvt_ok && max_cols > mvt_min;
+    // mvr_kernel (the tiles shuffled straight into the mma fragments) for jobs of STRATA_EXL3_MVR or more activations
+    // (default 3; 0: off - then mvt_kernel above STRATA_EXL3_MVT_MIN). V100, K4 5120 x 17408: 2 rows 137 vs mv_n's
+    // 146 us, 4 rows 145 vs 184, 8 rows 160 vs mvt's 222; 1 row mv_kernel's 83 vs 134
+    static const int mvr_min = std::getenv("STRATA_EXL3_MVR") ? std::atoi(std::getenv("STRATA_EXL3_MVR")) : 3;
+    const bool use_mvr = mvr_min > 0 && max_cols >= mvr_min;
+    const bool use_mvt = use_mvr || (mvt_ok && max_cols > mvt_min);
     const int run = use_mvt ? kMvtRows : several && allow_smem_n() ? kNC : 1;
     for (int j = 0; j < n; ++j) {
         const Mat& m = *jobs[j].m;
@@ -1119,7 +1267,8 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             b.blk_end[nb++] = blocks;
         }
         b.n = nb;
-        if (!(use_mvt ? dispatch<RunMvt>(m0.k2, m0.cb, b, blocks, s)
+        if (!(use_mvr ? dispatch<RunMvr>(m0.k2, m0.cb, b, blocks, s)
+              : use_mvt ? dispatch<RunMvt>(m0.k2, m0.cb, b, blocks, s)
                      : multi ? dispatch<RunMvN>(m0.k2, m0.cb, b, blocks, s) : dispatch<RunMv>(m0.k2, m0.cb, b, blocks, s)))
             return false;
     }

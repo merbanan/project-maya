@@ -1728,6 +1728,7 @@ void q35_attn_prep(const float* q_full, int ldq, const float* k, const float* v,
 
 namespace {
 constexpr int kSplitLen = 128;   // the shortest split (a decode step at a short context still spreads)
+constexpr int kMaxCols8 = 8;     // (the engine sizes the attention scratch for 8 tokens)
 int g_dec_max = -1;
 int g_attn_var = -1;
 }
@@ -1921,8 +1922,12 @@ void q35_attn(const float* q, const Q35Kv& kv, int p0, int T, int n_head, int n_
     // splits: enough blocks to fill the GPU when the rows are few
     int n_split = splits;
     if (n_split <= 0) {
-        const int want = (v == 2 ? 320 : 160) / std::max(1, tiles * n_kv);   // (variant 2: two blocks a SM)
-        n_split = std::max(1, std::min(want, (n_keys + kSplitLen - 1) / kSplitLen));
+        // (rounded up: a short prompt chunk over a long cache - 256 rows of 6 heads, 96 blocks - takes 2 splits, not 1;
+        // capped by the partials' scratch.  ideas.md 38: a 16-128-token continuation at 68K 10.6 -> 1.2-7.2 ms)
+        const int blk = std::max(1, tiles * n_kv), target = v == 2 ? 320 : 160;
+        const int want = (target + blk - 1) / blk;
+        const int64_t room = q35_attn_scratch_floats(kMaxCols8, n_head, D, max_ctx) / ((int64_t) rows * n_kv * (D + 2));
+        n_split = std::max(1, std::min({want, (n_keys + kSplitLen - 1) / kSplitLen, (int) std::max<int64_t>(1, room)}));
     }
     const int split_len = n_split == 1 ? n_keys : ((n_keys + n_split - 1) / n_split + AK - 1) / AK * AK;   // (AK: 32)
     n_split = (n_keys + split_len - 1) / split_len;

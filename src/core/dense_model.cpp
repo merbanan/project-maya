@@ -1415,12 +1415,15 @@ void attn_core(DenseModel::Impl& I, const DenseConfig& c, Layer& L, int64_t p0, 
     q35_attn_prep(I.q_full, H * 2 * D, I.kcur, I.vcur, HK * D, L.q_norm, L.k_norm, c.rms_eps, c.rope_base, c.n_rot,
                   (int) p0, T, H, HK, D, I.qcur, L.kv, I.stream);
     Q35Kv kv = L.kv;
-    if (T > kMaxCols && L.kv.mode == 2 && I.kv16_k) {   // (a prompt chunk: its keys unpacked once, not once a query tile)
+    // (a prompt chunk of 64+ tokens: its keys unpacked once, not once a query tile; a shorter one reads K8V8 directly -
+    // 16 tokens at 68K 1.5 vs 2.1 ms)
+    if (T >= 64 && L.kv.mode == 2 && I.kv16_k) {
         q35_kv_expand_f16(L.kv, (int) p0 + T, HK, D, I.kv16_k, I.kv16_v, I.stream);
         kv = Q35Kv{I.kv16_k, I.kv16_v, nullptr, nullptr, 0, L.kv.max_ctx};
     }
-    q35_attn(I.qcur, kv, (int) p0, T, H, HK, D, I.q_full, H * 2 * D, I.attn, I.attn_scratch,
-             T <= kMaxCols ? 0 : 1, I.stream);
+    // (key splits: the automatic choice for every width - a short prompt chunk over a long cache fills the GPU with
+    // them, a long one gets 1; ideas.md 38)
+    q35_attn(I.qcur, kv, (int) p0, T, H, HK, D, I.q_full, H * 2 * D, I.attn, I.attn_scratch, 0, I.stream);
     I.stage("attn_core", I.stream);
 }
 void attn_out(DenseModel::Impl& I, const DenseConfig& c, Layer& L, int T) {

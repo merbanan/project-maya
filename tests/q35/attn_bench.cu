@@ -126,6 +126,43 @@ int main(int argc, char** argv) {
         return 0;
     }
 #endif
+    // `attn_bench N tail`: a short prompt chunk (a continuation) over N cached keys - one key split (the prompt path's)
+    // against the automatic choice (verify's), FP16; K8V8 direct against unpacked to FP16 first
+    if (argc > 2 && std::string(argv[2]) == "tail") {
+        float* pout;
+        cudaMalloc(&pout, (size_t) CH * H * D * 4);
+        uint16_t *k16, *v16;
+        cudaMalloc(&k16, ((size_t) HK * max_ctx + 32) * D * 2);
+        cudaMalloc(&v16, ((size_t) HK * max_ctx + 32) * D * 2);
+        const Q35Kv kv16{k16, v16, nullptr, nullptr, 0, max_ctx};
+        for (int T : {16, 32, 64, 128, 256, 512}) {
+            const int p0 = N - T;
+            auto t_of = [&](auto fn) {
+                fn();
+                cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+                cudaEventRecord(a, s);
+                for (int r = 0; r < 10; ++r) fn();
+                cudaEventRecord(b, s); cudaEventSynchronize(b);
+                float ms = 0; cudaEventElapsedTime(&ms, a, b);
+                return ms / 10;
+            };
+            std::vector<float> r1((size_t) T * H * D), r0(r1.size());
+            const float m1 = t_of([&] { q35_attn(qo, kv[0], p0, T, H, HK, D, qf, H * 2 * D, pout, scr, 1, s); });
+            cudaMemcpy(r1.data(), pout, r1.size() * 4, cudaMemcpyDeviceToHost);
+            const float m0 = t_of([&] { q35_attn(qo, kv[0], p0, T, H, HK, D, qf, H * 2 * D, pout, scr, 0, s); });
+            cudaMemcpy(r0.data(), pout, r0.size() * 4, cudaMemcpyDeviceToHost);
+            double e = 0, r = 0;
+            for (size_t i = 0; i < r1.size(); ++i) { e += pow(r0[i] - r1[i], 2); r += r1[i] * r1[i]; }
+            const float k8d = t_of([&] { q35_attn(qo, kv[2], p0, T, H, HK, D, qf, H * 2 * D, pout, scr, 0, s); });
+            const float k8x = t_of([&] {
+                q35_kv_expand_f16(kv[2], p0 + T, HK, D, k16, v16, s);
+                q35_attn(qo, kv16, p0, T, H, HK, D, qf, H * 2 * D, pout, scr, 0, s);
+            });
+            printf("tail T %3d at %d: fp16 1 split %.3f ms, auto splits %.3f ms (rel diff %.1e) | k8v8 direct %.3f ms, "
+                   "unpacked first %.3f ms  %s\n", T, p0, m1, m0, sqrt(e / r), k8d, k8x, cudaGetErrorString(cudaGetLastError()));
+        }
+        return 0;
+    }
     // `attn_bench N pp`: the prompt path - a 1024-row chunk (as the engine's, no splits) at a few depths, TFLOP/s of the
     // causal QK^T + PV work
     if (argc > 2 && std::string(argv[2]) == "pp") {
