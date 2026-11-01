@@ -56,6 +56,8 @@ void q35_set_gdn_grouped(int group);
 /// d_rec (a verify pass; with the pipelined kernel): each token's update d [T][h_v][128] recorded for commit
 void q35_gdn_seq(float* state, const float* x, int ld, const float* g, const float* b, int ldg, float* o, int T,
                  int h_k, int h_v, bool commit, void* stream, float* d_rec = nullptr);
+/// scratch for the chunked prompt form (STRATA_DENSE_GDN_CHUNK=1): ~(2 h_v 128 + 32 h_v) floats a token of a range
+void q35_set_gdn_scratch(float* p, int64_t floats);
 
 /// One GDN layer's commit inputs: its conv state (3 x C) and recurrent state, the verify window's stashed raw conv
 /// input and conv output rows (stride C), and its [g | b] rows (stride 2 * h_v).

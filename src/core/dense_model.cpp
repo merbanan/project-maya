@@ -1356,6 +1356,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             I.mmq.reset(new mmq::Context());
         }
         if (!I.gemm.init(I.stream, (int64_t) cfg_.n_ff * E, err)) return false;
+        q35_set_gdn_scratch((float*) I.gemm.scratch(), I.gemm.scratch_elems() / 2);   // (the chunked GDN prompt form)
         if (const char* e = std::getenv("STRATA_DENSE_MULTI_EXACT")) native_mmvq_set_multi_exact(std::atoi(e) != 0);
         if (const char* e = std::getenv("STRATA_DENSE_MMT")) I.mmt_on = std::atoi(e) != 0;
         if (const char* e = std::getenv("STRATA_DENSE_MMT1")) I.mmt1 = std::atoi(e) != 0;

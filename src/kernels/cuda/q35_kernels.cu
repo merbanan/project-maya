@@ -347,6 +347,188 @@ __global__ void __launch_bounds__(128) gdn_seq4p_kernel(float* __restrict__ stat
     }
 }
 
+// ---- chunked GDN prefill (STRATA_DENSE_GDN_CHUNK=1, prompt chunks): the gated delta rule over chunks of GC tokens
+// in its WY form, all F32 (only the summation order differs from gdn_seq4p_kernel).  With gamma_t the gate's running
+// sum inside a chunk, A_ts = beta_t e^(gamma_t - gamma_s) k_t.k_s (s < t), T = (I + A)^-1, U = T (beta v),
+// W = T (beta e^gamma k), M_ts = e^(gamma_t - gamma_s) q_t.k_s (s <= t):  D = U - W S0,
+// O = qscale (e^gamma (Q S0) + M D),  S = e^gamma_last S0 + K^T (e^(gamma_last - gamma) D).
+// Every decay factor is <= 1.  gdn_chunk_prep_kernel: U, W, M and the factors of every chunk at once;
+// gdn_chunk_scan_kernel: the chunks in order, a block a (value head, 32 state columns)
+// Measured (chains 284 / 285, opt-in only): the same 512 greedy tokens at 35K and 68K, but slower - a 4096-token
+// chunk's layer 6.2 ms scan + 2.0 ms prep against the sequential walk's 3.9 ms (PP 1046 -> 1000 at 35K, 781 -> 748
+// at 68K).  In F32 the chunked form does about as many FMAs as the walk (~3.5 vs 4 dk dv a token); it can only win
+// with the products on tensor cores, which needs FP16 state operands (rounding the state) or hi / lo splits (~3x).
+constexpr int GC = 32;
+__global__ void __launch_bounds__(256) gdn_chunk_prep_kernel(const float* __restrict__ x, int ld,
+                                                             const float* __restrict__ g, const float* __restrict__ b,
+                                                             int ldg, int R, int h_k, int h_v, float* __restrict__ U,
+                                                             float* __restrict__ W, float* __restrict__ M,
+                                                             float* __restrict__ F) {
+    constexpr int S = 128, KP = S + 1;
+    __shared__ float sK[GC][KP], sQ[GC][KP], sA[GC][GC + 1], sT[GC][GC + 1], sgam[GC], sbet[GC];
+    const int c = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, kh = gdn_kh(h, h_k);
+    const int tok0 = c * GC;
+    for (int e = tid; e < GC * S; e += 256) {
+        const int r = e / S, i = e % S, tok = tok0 + r;
+        const bool ok = tok < R;
+        sQ[r][i] = ok ? x[(size_t) tok * ld + kh * S + i] : 0.0f;
+        sK[r][i] = ok ? x[(size_t) tok * ld + h_k * S + kh * S + i] : 0.0f;
+    }
+    if (tid < 32) {   // the gate's running sum (log decays; padding rows 0) and beta
+        const int tok = tok0 + tid;
+        float gv = tok < R ? g[(size_t) tok * ldg + h] : 0.0f;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const float n = __shfl_up_sync(0xffffffffu, gv, o);
+            if (tid >= o) gv += n;
+        }
+        sgam[tid] = gv;
+        sbet[tid] = tok < R ? b[(size_t) tok * ldg + h] : 0.0f;
+    }
+    __syncthreads();
+    float* Mc = M + ((size_t) c * h_v + h) * GC * GC;
+    for (int e = tid; e < GC * GC; e += 256) {
+        const int t = e / GC, sidx = e % GC;
+        float kk = 0.0f, qk = 0.0f;
+        if (sidx <= t) {
+            for (int i = 0; i < S; ++i) { kk += sK[t][i] * sK[sidx][i]; qk += sQ[t][i] * sK[sidx][i]; }
+        }
+        const float dec = sidx <= t ? __expf(sgam[t] - sgam[sidx]) : 0.0f;
+        sA[t][sidx] = sidx < t ? sbet[t] * dec * kk : 0.0f;
+        Mc[e] = dec * qk;
+    }
+    __syncthreads();
+    // T = (I + A)^-1, unit lower triangular: lane c its column - T_tc = -sum_{s=c..t-1} A_ts T_sc (T_cc = 1); a lane
+    // reads A and its own column of T only, so no barrier between rows
+    if (tid < GC) {
+        const int col = tid;
+        for (int t = col + 1; t < GC; ++t) {
+            float v = -sA[t][col];   // (s = c: T_cc = 1)
+            for (int s2 = col + 1; s2 < t; ++s2) v -= sA[t][s2] * sT[s2][col];
+            sT[t][col] = v;
+        }
+    }
+    __syncthreads();
+    // U_tj = sum_{s<=t} T_ts beta_s v_sj, W_tj = sum_{s<=t} T_ts beta_s e^gamma_s k_sj: thread (j, half of the rows)
+    {
+        const int j = tid & (S - 1), half = tid >> 7;
+        float bv[GC], bk[GC];
+#pragma unroll
+        for (int s2 = 0; s2 < GC; ++s2) {
+            const int tok = tok0 + s2;
+            bv[s2] = tok < R ? sbet[s2] * x[(size_t) tok * ld + 2 * h_k * S + h * S + j] : 0.0f;
+            bk[s2] = sbet[s2] * __expf(sgam[s2]) * sK[s2][j];
+        }
+#pragma unroll
+        for (int tt = 0; tt < GC / 2; ++tt) {
+            const int t = half * (GC / 2) + tt;
+            float u = 0.0f, w = 0.0f;
+#pragma unroll
+            for (int s2 = 0; s2 < GC; ++s2) {   // (T_tt = 1; the arrays indexed by constants only)
+                const float tv = s2 < t ? sT[t][s2] : s2 == t ? 1.0f : 0.0f;
+                u += tv * bv[s2];
+                w += tv * bk[s2];
+            }
+            const size_t o = ((size_t) (tok0 + t) * h_v + h) * S + j;
+            U[o] = u;
+            W[o] = w;
+        }
+    }
+    if (tid < GC) {
+        float* Fc = F + ((size_t) c * h_v + h) * 2 * GC;
+        Fc[tid] = __expf(sgam[tid]);
+        Fc[GC + tid] = __expf(sgam[GC - 1] - sgam[tid]);
+    }
+}
+
+__global__ void __launch_bounds__(256) gdn_chunk_scan_kernel(float* __restrict__ state, const float* __restrict__ x,
+                                                             int ld, int R, int h_k, int h_v,
+                                                             const float* __restrict__ U, const float* __restrict__ W,
+                                                             const float* __restrict__ M, const float* __restrict__ F,
+                                                             float* __restrict__ o) {
+    constexpr int S = 128, CW = 32, KP = S + 4;
+    __shared__ __align__(16) float sS[S][CW];
+    __shared__ __align__(16) float sX[GC][KP];
+    __shared__ __align__(16) float sD[GC][CW];
+    __shared__ float sM[GC][GC + 1], sF[2 * GC];
+    const int h = blockIdx.x, j0 = blockIdx.y * CW, tid = threadIdx.x, kh = gdn_kh(h, h_k);
+    const float qscale = 1.0f / sqrtf((float) S);
+    for (int e = tid; e < S * CW; e += 256) sS[e / CW][e % CW] = state[((size_t) (e / CW) * h_v + h) * S + j0 + e % CW];
+    const int nch = (R + GC - 1) / GC;
+    const int dt = tid >> 3, dj = (tid & 7) * 4;          // D / O: row dt, columns dj .. dj + 3
+    const int si = tid >> 1, sj = (tid & 1) * 16;          // S: row si, columns sj .. sj + 15
+    for (int c = 0; c < nch; ++c) {
+        const int tok0 = c * GC;
+        __syncthreads();
+        for (int e = tid; e < GC * S / 4; e += 256) {     // W's rows (head h)
+            const int r = e / (S / 4), i4 = (e % (S / 4)) * 4;
+            *(float4*) &sX[r][i4] = *(const float4*) (W + ((size_t) (tok0 + r) * h_v + h) * S + i4);
+        }
+        for (int e = tid; e < GC * GC; e += 256) sM[e / GC][e % GC] = M[((size_t) c * h_v + h) * GC * GC + e];
+        if (tid < 2 * GC) sF[tid] = F[((size_t) c * h_v + h) * 2 * GC + tid];
+        __syncthreads();
+        {   // D = U - W S0
+            float4 d = *(const float4*) (U + ((size_t) (tok0 + dt) * h_v + h) * S + j0 + dj);
+            for (int i = 0; i < S; ++i) {
+                const float wv = sX[dt][i];
+                const float4 sv = *(const float4*) &sS[i][dj];
+                d.x -= wv * sv.x; d.y -= wv * sv.y; d.z -= wv * sv.z; d.w -= wv * sv.w;
+            }
+            *(float4*) &sD[dt][dj] = d;
+        }
+        __syncthreads();
+        for (int e = tid; e < GC * S / 4; e += 256) {     // Q's rows (key head kh)
+            const int r = e / (S / 4), i4 = (e % (S / 4)) * 4, tok = tok0 + r;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (tok < R) v = *(const float4*) (x + (size_t) tok * ld + kh * S + i4);
+            *(float4*) &sX[r][i4] = v;
+        }
+        __syncthreads();
+        {   // O = qscale (e^gamma Q S0 + M D)
+            float4 a = make_float4(0.f, 0.f, 0.f, 0.f), m = a;
+            for (int i = 0; i < S; ++i) {
+                const float qv = sX[dt][i];
+                const float4 sv = *(const float4*) &sS[i][dj];
+                a.x += qv * sv.x; a.y += qv * sv.y; a.z += qv * sv.z; a.w += qv * sv.w;
+            }
+            for (int s2 = 0; s2 <= dt; ++s2) {
+                const float mv = sM[dt][s2];
+                const float4 dv = *(const float4*) &sD[s2][dj];
+                m.x += mv * dv.x; m.y += mv * dv.y; m.z += mv * dv.z; m.w += mv * dv.w;
+            }
+            const float eg = sF[dt];
+            if (tok0 + dt < R) {
+                float* op = o + (size_t) (tok0 + dt) * h_v * S + h * S + j0 + dj;
+                *(float4*) op = make_float4((eg * a.x + m.x) * qscale, (eg * a.y + m.y) * qscale,
+                                            (eg * a.z + m.z) * qscale, (eg * a.w + m.w) * qscale);
+            }
+        }
+        __syncthreads();
+        for (int e = tid; e < GC * S / 4; e += 256) {     // K's rows
+            const int r = e / (S / 4), i4 = (e % (S / 4)) * 4, tok = tok0 + r;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (tok < R) v = *(const float4*) (x + (size_t) tok * ld + h_k * S + kh * S + i4);
+            *(float4*) &sX[r][i4] = v;
+        }
+        __syncthreads();
+        {   // S = e^gamma_last S0 + K^T (e^(gamma_last - gamma) D)
+            const float el = sF[GC - 1];
+            float acc[16];
+#pragma unroll
+            for (int q = 0; q < 16; ++q) acc[q] = el * sS[si][sj + q];
+            for (int s2 = 0; s2 < GC; ++s2) {
+                const float kv = sX[s2][si] * sF[GC + s2];
+#pragma unroll
+                for (int q = 0; q < 16; ++q) acc[q] += kv * sD[s2][sj + q];
+            }
+#pragma unroll
+            for (int q = 0; q < 16; ++q) sS[si][sj + q] = acc[q];
+        }
+    }
+    __syncthreads();
+    for (int e = tid; e < S * CW; e += 256) state[((size_t) (e / CW) * h_v + h) * S + j0 + e % CW] = sS[e / CW][e % CW];
+}
+
 // ---- commit of every GDN layer in two launches (a verify window's kept n tokens): the conv states take the last 3
 // of [state | raw rows], the recurrence runs gdn_seq4's arithmetic over the stashed conv rows (no output)
 __global__ void commit_conv_kernel(const Q35CommitLayer* __restrict__ tab, int n, int C) {
@@ -1675,9 +1857,38 @@ void q35_gate_beta(float* alpha, float* beta, int ld, const float* dt, const flo
 
 void q35_set_gdn_grouped(int group) { cudaMemcpyToSymbol(c_gdn_group, &group, sizeof group); }
 
+static float* g_gdn_scratch = nullptr;
+static int64_t g_gdn_scratch_floats = 0;
+void q35_set_gdn_scratch(float* p, int64_t floats) { g_gdn_scratch = p; g_gdn_scratch_floats = floats; }
+
 void q35_gdn_seq(float* state, const float* x, int ld, const float* g, const float* b, int ldg, float* o, int T,
                  int h_k, int h_v, bool commit, void* stream, float* d_rec) {
     if (T <= 0) return;
+    // (STRATA_DENSE_GDN_CHUNK=1: prompt chunks of 64+ tokens through the chunked F32 form, in ranges that fit the
+    // scratch q35_set_gdn_scratch gave)
+    static const bool chunked = std::getenv("STRATA_DENSE_GDN_CHUNK") && std::atoi(std::getenv("STRATA_DENSE_GDN_CHUNK")) != 0;
+    if (chunked && commit && !d_rec && T >= 64 && g_gdn_scratch && ld % 4 == 0) {
+        constexpr int S = 128;
+        const int64_t per_tok = (int64_t) 2 * h_v * S + (int64_t) h_v * GC + 2 * h_v + 8;
+        int R = (int) std::min<int64_t>(T, g_gdn_scratch_floats / per_tok / GC * GC);
+        if (R >= GC) {
+            cudaStream_t st = (cudaStream_t) stream;
+            for (int r0 = 0; r0 < T; r0 += R) {
+                const int n = std::min(R, T - r0), nch = (n + GC - 1) / GC;
+                float* U = g_gdn_scratch;
+                float* Wm = U + (size_t) nch * GC * h_v * S;
+                float* Mm = Wm + (size_t) nch * GC * h_v * S;
+                float* F = Mm + (size_t) nch * h_v * GC * GC;
+                gdn_chunk_prep_kernel<<<dim3(nch, h_v), 256, 0, st>>>(x + (size_t) r0 * ld, ld, g + (size_t) r0 * ldg,
+                                                                      b + (size_t) r0 * ldg, ldg, n, h_k, h_v, U, Wm,
+                                                                      Mm, F);
+                gdn_chunk_scan_kernel<<<dim3(h_v, S / 32), 256, 0, st>>>(state, x + (size_t) r0 * ld, ld, n, h_k, h_v,
+                                                                         U, Wm, Mm, F, o + (size_t) r0 * h_v * S);
+            }
+            check("q35_gdn_chunked");
+            return;
+        }
+    }
     static const bool old = std::getenv("STRATA_DENSE_GDN_OLD") && std::atoi(std::getenv("STRATA_DENSE_GDN_OLD")) != 0;
     // (STRATA_DENSE_GDN_PIPE=0: gdn_seq4_kernel, the next token's loads not overlapped)
     static const bool pipe = !std::getenv("STRATA_DENSE_GDN_PIPE") || std::atoi(std::getenv("STRATA_DENSE_GDN_PIPE")) != 0;
