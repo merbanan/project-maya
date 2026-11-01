@@ -743,10 +743,7 @@ __global__ void __launch_bounds__(AW_ * 32) attn_tc_kernel(const float* __restri
 // row (8 keys each), m and l in its registers, the rows' correction factors through shared memory; O += P V: each
 // warp its 8 of the 16 output fragments.  Twice the warps an SM (the old kernel: 4 a block, one block an SM - its
 // shared memory), the same tiles, splits and partial layout.
-#ifndef Q35_PP_LDP
-#define Q35_PP_LDP 40
-#endif
-constexpr int PP_AR = 64, PP_AK = 32, PP_W = 8, PP_LDS = PP_AK + 4, PP_LDP = Q35_PP_LDP;
+constexpr int PP_AR = 64, PP_AK = 32, PP_W = 8, PP_LDS = PP_AK + 4, PP_LDP = PP_AK + 8;
 constexpr size_t kPpSmem = (size_t) PP_AR * LDQ * 2 + 2 * (size_t) PP_AK * LDQ * 2 + 2 * (size_t) PP_AR * PP_LDS * 4 +
                            (size_t) PP_AR * PP_LDP * 2 + 4 * (size_t) PP_AR * 4 + 16;
 // HALVES: the rows 0-31 (warps 0-3) and 32-63 (warps 4-7) synchronise their S / softmax / P V phases with their own
@@ -802,6 +799,12 @@ __global__ void __launch_bounds__(PP_W * 32) attn_pp_kernel(const float* __restr
     constexpr float kLazy = 8.0f;
     float m = -INFINITY, l = 0.0f;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> fo[8];   // O rows of the tile, dims 128 hf + 16 n
+    // the warp's Q fragments (its rows, its half of the head dims) held in registers for every key tile: 13% faster
+    // than loading them from sQ each tile (235 registers, one block an SM either way)
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fqr[8];
+    __syncthreads();
+#pragma unroll
+    for (int kk = 0; kk < 8; ++kk) wmma::load_matrix_sync(fqr[kk], sQ + (rt * 16) * LDQ + (8 * hf + kk) * 16, LDQ);
 #pragma unroll
     for (int n = 0; n < 8; ++n) wmma::fill_fragment(fo[n], 0.0f);
     constexpr int PF = AK * (AD / 8) / (PP_W * 32);   // 16-byte chunks a thread a tile, K and V each
@@ -837,8 +840,7 @@ __global__ void __launch_bounds__(PP_W * 32) attn_pp_kernel(const float* __restr
             for (int n = 0; n < AK / 16; ++n) wmma::fill_fragment(acc[n], 0.0f);
 #pragma unroll
             for (int kk = 8 * hf; kk < 8 * hf + 8; ++kk) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fq;
-                wmma::load_matrix_sync(fq, sQ + (rt * 16) * LDQ + kk * 16, LDQ);
+                const auto& fq = fqr[kk - 8 * hf];
 #pragma unroll
                 for (int n = 0; n < AK / 16; ++n) {
                     wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
@@ -1255,6 +1257,15 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
 #ifdef Q35_STREAM_PROBE
     long long ph[6] = {}, ph_last = clock64();
 #endif
+    // one row tile (REUSE): the warp's head-dimension part of Q held in registers for every key tile, loaded on the
+    // first (K8V8 1 / 2 tokens at 68K 0.26 -> 0.23 ms; FP16 ~1%)
+#ifndef Q35_STREAM_QMAX
+#define Q35_STREAM_QMAX 8
+#endif
+    constexpr int QRN0 = GE::REUSE ? RT * (AD / 16 / KS) : 0;
+    constexpr bool QR = QRN0 > 0 && QRN0 <= Q35_STREAM_QMAX;   // (the fragments a warp, with its other registers)
+    constexpr int QRN = QR ? QRN0 : 1;
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fqr[QRN];
     for (int k0 = ks; k0 < ke; k0 += SK) {
         store_k();
         if (tid == 0) *any = 0;
@@ -1278,10 +1289,16 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
                 wmma::load_matrix_sync(fb, KV + ni * 16 * SLD + kk * 16, SLD);
 #pragma unroll
                 for (int mi = 0; mi < RT; ++mi) {
-                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
-                    wmma::load_matrix_sync(fa, Qs + mi * 16 * SLD + kk * 16, SLD);
                     const int a = RT == 1 ? (k & 1) : mi;
-                    wmma::mma_sync(fs[a], fa, fb, fs[a]);
+                    if (QR) {
+                        auto& fa = fqr[(k * RT + mi) % QRN];
+                        if (k0 == ks) wmma::load_matrix_sync(fa, Qs + mi * 16 * SLD + kk * 16, SLD);
+                        wmma::mma_sync(fs[a], fa, fb, fs[a]);
+                    } else {
+                        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                        wmma::load_matrix_sync(fa, Qs + mi * 16 * SLD + kk * 16, SLD);
+                        wmma::mma_sync(fs[a], fa, fb, fs[a]);
+                    }
                 }
             }
             if (RT == 1)
