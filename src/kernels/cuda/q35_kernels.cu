@@ -744,7 +744,9 @@ __global__ void __launch_bounds__(AW_ * 32) attn_tc_kernel(const float* __restri
 // warp its 8 of the 16 output fragments.  Twice the warps an SM (the old kernel: 4 a block, one block an SM - its
 // shared memory), the same tiles, splits and partial layout.
 constexpr int PP_AR = 64, PP_AK = 32, PP_W = 8, PP_LDS = PP_AK + 4, PP_LDP = PP_AK + 8;
-constexpr size_t kPpSmem = (size_t) PP_AR * LDQ * 2 + 2 * (size_t) PP_AK * LDQ * 2 + 2 * (size_t) PP_AR * PP_LDS * 4 +
+// (Q is staged over the K / V buffers: its fragments go to registers before the first tile's stores - 90 -> 57 KiB,
+// the same bits, ~0.3% faster; a 64 KiB carveout preference on top measured slower)
+constexpr size_t kPpSmem = 2 * (size_t) PP_AK * LDQ * 2 + 2 * (size_t) PP_AR * PP_LDS * 4 +
                            (size_t) PP_AR * PP_LDP * 2 + 4 * (size_t) PP_AR * 4 + 16;
 // HALVES: the rows 0-31 (warps 0-3) and 32-63 (warps 4-7) synchronise their S / softmax / P V phases with their own
 // named barrier, so one half's softmax overlaps the other half's products (only the K / V tile swap is block-wide)
@@ -757,8 +759,9 @@ __global__ void __launch_bounds__(PP_W * 32) attn_pp_kernel(const float* __restr
     using namespace nvcuda;
     constexpr int AR = PP_AR, AK = PP_AK, LDS = PP_LDS, LDP = PP_LDP;
     extern __shared__ __align__(32) unsigned char smem[];
-    __half* sQ = (__half*) smem;
-    __half* sK = sQ + AR * LDQ;
+    static_assert(PP_AR * LDQ <= 2 * PP_AK * LDQ + 2 * PP_AR * PP_LDS * 2, "Q staging fits the K / V / S area");
+    __half* sQ = (__half*) smem;   // (only until the warps hold their Q fragments)
+    __half* sK = sQ;
     __half* sV = sK + AK * LDQ;
     float* sS = (float*) (sV + AK * LDQ);            // [2 halves][AR][LDS] partial scores; the rescale's scratch
     __half* sP = (__half*) (sS + 2 * AR * LDS);      // [AR][LDP]
