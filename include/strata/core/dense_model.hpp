@@ -70,8 +70,8 @@ public:
 
     /// Reads the GGUF (single file or the first shard of a split), checks every tensor it needs, uploads the
     /// weights and allocates the KV cache for `max_context` cells and the recurrent state.  `chunk`: the largest
-    /// prompt chunk a forward pass takes (its activations are allocated for it).
-    bool load(const std::string& gguf_path, int64_t max_context, std::string& err, int chunk = 512);
+    /// prompt chunk a forward pass takes (its activations are allocated for it; <= 0: the model picks - see chunk()).
+    bool load(const std::string& gguf_path, int64_t max_context, std::string& err, int chunk = 0);
 
     const DenseConfig& config() const { return cfg_; }
     int64_t max_context() const { return max_context_; }

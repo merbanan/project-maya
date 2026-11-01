@@ -292,7 +292,7 @@ int main(int argc, char** argv) {
     std::string gguf;
     long long context = 32768;
     bool serve = false;
-    int draft = -1, chunk = 512;            // drafts a round (-1: STRATA_DENSE_DRAFT, else 3 / DFlash2 7; 0: off), prompt chunk
+    int draft = -1, chunk = 0;              // drafts a round (-1: STRATA_DENSE_DRAFT, else 3 / DFlash2 7; 0: off), prompt chunk (0: the model picks)
     std::string dflash;                     // a DFlash2 drafter GGUF (else STRATA_DENSE_DFLASH): it drafts, not the MTP block
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];

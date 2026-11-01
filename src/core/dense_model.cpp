@@ -20,6 +20,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <unordered_map>
 #include <cstdio>
 #include <cstring>
@@ -668,7 +669,11 @@ const float* DenseModel::mtp_hidden() const { return impl_->mtp_h; }
 
 bool DenseModel::load(const std::string& path, int64_t max_context, std::string& err, int chunk) {
     Impl& I = *impl_;
-    I.chunk = std::max(kMaxCols + 1, chunk);
+    // chunk <= 0: chosen here - the Qwen3.5/3.8 path takes the largest of 4096 / 2048 / 1024 whose activations still
+    // leave VRAM for all the weights (Qwen3.8-27B, 35K prompt: PP 755 tok/s at 512, 888 at 2048, 903 at 4096);
+    // the other paths 512
+    const bool auto_chunk = chunk <= 0;
+    I.chunk = auto_chunk ? 512 : std::max(kMaxCols + 1, chunk);
     if (const char* e = std::getenv("STRATA_DENSE_PACK")) I.pack_on = std::atoi(e) != 0;
     if (const char* e = std::getenv("STRATA_DENSE_KV")) {
         if (std::string(e) == "k8v4") I.kv_mode = 1;
@@ -769,12 +774,24 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                 if (I.find("blk." + std::to_string(l) + ".attn_q.weight")) ++n_attn;
             const uint64_t kv_need = (uint64_t) n_attn * q35_kv_bytes(I.kv_mode, HK, D, (int) max_context) +
                                      (I.kv_mode == 2 ? q35_kv_bytes(0, HK, D, (int) max_context) : 0);   // (+ the FP16 copy)
-            const uint64_t act = (uint64_t) I.chunk * (uint64_t) (8 * E + 3 * C + 3 * V + 4 * H * D + 3 * cfg_.n_ff) * 4 +
-                                 (uint64_t) cfg_.n_ff * E * 2 + (uint64_t) kMaxCols * cfg_.n_vocab * 4 * 2 +
-                                 (uint64_t) q35_attn_scratch_floats(kMaxCols, H, D, (int) max_context) * 4;
+            auto act_of = [&](int ch) {
+                return (uint64_t) ch * (uint64_t) (8 * E + 3 * C + 3 * V + 4 * H * D + 3 * cfg_.n_ff) * 4 +
+                       (uint64_t) cfg_.n_ff * E * 2 + (uint64_t) kMaxCols * cfg_.n_vocab * 4 * 2 +
+                       (uint64_t) q35_attn_scratch_floats(kMaxCols, H, D, (int) max_context) * 4;
+            };
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
             const uint64_t margin = 768ull << 20;
+            if (auto_chunk && !std::getenv("STRATA_DENSE_GPU_MIB")) {
+                uint64_t file_bytes = 0;   // (the weights' upper bound: the files, the host-side embedding included)
+                for (const std::string& p : shard_paths(path)) {
+                    std::error_code ec;
+                    file_bytes += (uint64_t) std::filesystem::file_size(p, ec);
+                }
+                for (const int ch : {4096, 2048, 1024})
+                    if ((uint64_t) free_b > kv_need + act_of(ch) + margin + file_bytes) { I.chunk = ch; break; }
+            }
+            const uint64_t act = act_of(I.chunk);
             if (const char* e = std::getenv("STRATA_DENSE_GPU_MIB")) {       // explicit cap for the weights, in MiB
                 I.budget = (uint64_t) std::atoll(e) << 20;
             } else if ((uint64_t) free_b > kv_need + act + margin) {
@@ -786,9 +803,9 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                 return false;
             }
             std::fprintf(stderr, "strata-dense: VRAM %zu MiB free of %zu; KV cache %llu MiB (context %lld), activations "
-                         "%llu MiB; %llu MiB of weights may go to the GPU\n",
+                         "%llu MiB (prompt chunk %d); %llu MiB of weights may go to the GPU\n",
                          free_b >> 20, total_b >> 20, (unsigned long long) (kv_need >> 20), (long long) max_context,
-                         (unsigned long long) (act >> 20), (unsigned long long) (I.budget >> 20));
+                         (unsigned long long) (act >> 20), I.chunk, (unsigned long long) (I.budget >> 20));
         }
         auto load_attn = [&](Layer& L, const std::string& p) {
             if (!I.upload_mat(I.find(p + "attn_q.weight"), p + "attn_q.weight", E, H * 2 * D, L.q, total, err) ||
