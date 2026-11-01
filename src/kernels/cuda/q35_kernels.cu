@@ -1259,11 +1259,9 @@ __global__ void __launch_bounds__(SNT, (StreamGeo<RT, SK_>::per_sm)) attn_stream
 #endif
     // one row tile (REUSE): the warp's head-dimension part of Q held in registers for every key tile, loaded on the
     // first (K8V8 1 / 2 tokens at 68K 0.26 -> 0.23 ms; FP16 ~1%)
-#ifndef Q35_STREAM_QMAX
-#define Q35_STREAM_QMAX 8
-#endif
     constexpr int QRN0 = GE::REUSE ? RT * (AD / 16 / KS) : 0;
-    constexpr bool QR = QRN0 > 0 && QRN0 <= Q35_STREAM_QMAX;   // (the fragments a warp, with its other registers)
+    // (at most 8: 48 rows x 32 keys with its 12 fragments held, 8 tokens 0.615 -> 0.558 ms, still slower than 64 keys' 0.511)
+    constexpr bool QR = QRN0 > 0 && QRN0 <= 8;
     constexpr int QRN = QR ? QRN0 : 1;
     wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fqr[QRN];
     for (int k0 = ks; k0 < ke; k0 += SK) {
