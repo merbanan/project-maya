@@ -504,6 +504,14 @@ struct DenseModel::Impl {
         cur_T = T; cur_x = x; cur_n = n_in; q8_ready = h8_ready = false;
         if (T > kMaxCols) q35_to_half(x, xh, (int64_t) T * n_in, stream);
     }
+    // (decode / verify) the GEMV input's FP16 rows written by the kernel that made x: no conversion pass
+    // (STRATA_DENSE_FUSE=0: the separate passes); rows past T keep stale finite values - their products are dropped
+    bool fuse = true;
+    uint16_t* h8_out(int T) const { return fuse && T <= kMaxCols ? xh8 : nullptr; }
+    void prep_h8(const float* x, int n_in, int T) {
+        prep(x, n_in, T);
+        if (h8_out(T)) h8_ready = true;
+    }
     void mm(const QMat& w, float* y) {
         if (cur_T > kMaxCols) {
             if (w.packed) {   // dequantized to FP16 straight from the packed layout, row slices that fit the scratch
@@ -623,7 +631,7 @@ int32_t DenseModel::draft_id(int slot) const { return impl_->head_mtp.dev ? impl
 bool DenseModel::mtp_vocab_select(const int32_t* prompt, size_t n, const int32_t* gen, size_t n_gen,
                                   std::string& err) {
     Impl& I = *impl_;
-    if (I.mtp_extra <= 0 || !I.mtp.attn || I.gemma || !I.head.packed) return true;
+    if (I.mtp_extra <= 0 || !(I.mtp.attn || I.df.on) || I.gemma || !I.head.packed) return true;
     const int N = I.head_draft.n_out, X = std::min(I.mtp_extra, N / 2), base = N - X, V = cfg_.n_vocab;
     // the prompt's tokens at or beyond `base`, the most frequent first (ties: the lower id)
     std::unordered_map<int32_t, int> cnt;
@@ -1077,6 +1085,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         if (const char* e = std::getenv("STRATA_DENSE_MMT")) I.mmt_on = std::atoi(e) != 0;
         if (const char* e = std::getenv("STRATA_DENSE_MMT1")) I.mmt1 = std::atoi(e) != 0;
         if (const char* e = std::getenv("STRATA_DENSE_MMT_MIN")) I.mmt_min = std::max(1, std::atoi(e));
+        if (const char* e = std::getenv("STRATA_DENSE_FUSE")) I.fuse = std::atoi(e) != 0;
         if (const char* e = std::getenv("STRATA_DENSE_GRAPH")) I.graphs = std::atoi(e) != 0;
         if (const char* e = std::getenv("STRATA_DENSE_PACKED_DP4A")) I.packed_dp4a = std::atoi(e) != 0;
         I.pairs_mma = std::getenv("STRATA_DENSE_PAIRS_MMA") != nullptr;
@@ -1257,17 +1266,24 @@ void moe_ffn(DenseModel::Impl& I, const DenseConfig& c, Layer& L, float* x, int 
     I.stage("moe_shared", s);
 }
 
-void ffn(DenseModel::Impl& I, const DenseConfig& c, Layer& L, float* x, int T) {
+// add: x += add first (the mixer's output), in the norm's kernel
+void ffn(DenseModel::Impl& I, const DenseConfig& c, Layer& L, float* x, int T, const float* add = nullptr) {
     const int E = c.n_embd;
-    q35_rms_rows(x, E, L.post_norm, I.xn, nullptr, T, E, c.rms_eps, I.stream);
-    I.prep(I.xn, E, T);
+    if (add) q35_add_rms_rows(x, E, add, L.post_norm, I.xn, I.h8_out(T), T, E, c.rms_eps, I.stream);
+    else q35_rms_rows(x, E, L.post_norm, I.xn, I.h8_out(T), T, E, c.rms_eps, I.stream);
+    I.prep_h8(I.xn, E, T);
     I.stage("norm_prep", I.stream);
     if (c.n_expert) { moe_ffn(I, c, L, x, T); return; }
     I.mm(L.ffn_gate, I.ffn_g);
     I.mm(L.ffn_up, I.ffn_u);
     I.stage("ffn_gate_up", I.stream);
-    dense_swiglu(I.ffn_g, I.ffn_u, I.ffn_h, (int64_t) T * c.n_ff, I.stream);
-    I.prep(I.ffn_h, c.n_ff, T);
+    if (I.h8_out(T)) {
+        q35_swiglu_h(I.ffn_g, I.ffn_u, I.ffn_h, I.xh8, (int64_t) T * c.n_ff, I.stream);
+        I.prep_h8(I.ffn_h, c.n_ff, T);
+    } else {
+        dense_swiglu(I.ffn_g, I.ffn_u, I.ffn_h, (int64_t) T * c.n_ff, I.stream);
+        I.prep(I.ffn_h, c.n_ff, T);
+    }
     I.mm(L.ffn_down, I.mix);
     q35_add(x, I.mix, (int64_t) T * E, I.stream);
 }
@@ -1305,8 +1321,12 @@ bool DenseModel::forward(const int32_t* tokens, int T, bool verify, int want, st
         auto post = [&](int l) {   // the layer from the mixer's output: the residual add, the FFN, the drafter taps
             Layer& L = I.layers[(size_t) l];
             if (L.attn) attn_out(I, cfg_, L, T);
-            q35_add(I.x, I.mix, (int64_t) T * E, s);
-            ffn(I, cfg_, L, I.x, T);
+            if (I.fuse && !cfg_.n_expert) {
+                ffn(I, cfg_, L, I.x, T, I.mix);   // (the residual add in the norm's kernel)
+            } else {
+                q35_add(I.x, I.mix, (int64_t) T * E, s);
+                ffn(I, cfg_, L, I.x, T);
+            }
             I.stage("ffn", s);
             if (I.df.on)   // the drafter's features: the residual after its target layers, in their order
                 for (size_t j = 0; j < I.df.target_layers.size(); ++j)
@@ -1319,8 +1339,8 @@ bool DenseModel::forward(const int32_t* tokens, int T, bool verify, int want, st
         // its kernels); the attention cores (their position, their grid) run as they are
         auto pre = [&](int l) {   // the layer up to the attention core (all of a GDN layer)
             Layer& L = I.layers[(size_t) l];
-            q35_rms_rows(I.x, E, L.attn_norm, I.xn, nullptr, T, E, eps, s);
-            I.prep(I.xn, E, T);
+            q35_rms_rows(I.x, E, L.attn_norm, I.xn, I.h8_out(T), T, E, eps, s);
+            I.prep_h8(I.xn, E, T);
             I.stage("norm_prep", s);
             if (L.attn) { attn_proj(I, L); return; }
             {
@@ -1940,9 +1960,11 @@ bool DenseModel::dflash_draft(int32_t anchor, int K, std::vector<int32_t>& out, 
         q35_rms_rows(F.h, E, F.out_norm, F.hf, nullptr, W, E, F.eps, s);
         // the mask rows' candidates through the target's head, their gates, the walk
         I.prep(F.hf + E, E, K);
-        I.mm(I.head_draft, F.logits);
-        q35_df_topk(F.logits, I.head_draft.n_out, std::min(F.n_cand, I.head_draft.n_out), K, F.top_k, F.cand_i,
-                    F.cand_v, F.topk_scratch, s);
+        // (the draft head: the picked vocabulary when there is one - its slots mapped back to ids for the walk)
+        const QMat& dh = I.head_mtp.dev ? I.head_mtp : I.head_draft;
+        I.mm(dh, F.logits);
+        q35_df_topk(F.logits, dh.n_out, std::min(F.n_cand, dh.n_out), K, F.top_k, F.cand_i, F.cand_v, F.topk_scratch, s);
+        if (I.head_mtp.dev) q35_map_ids(F.cand_i, I.mtp_ids_dev, K * F.top_k, s);
         I.mm(F.hproj, F.gate);
         q35_df_walk(F.cand_i, F.cand_v, F.gate, F.top_k, F.rank, F.pred, F.succ, anchor, K, F.tok, F.conf, s);
         out.resize((size_t) K);

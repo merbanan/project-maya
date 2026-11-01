@@ -53,6 +53,38 @@ __global__ void rms_rows_kernel(const float* __restrict__ x, int ldx, const floa
     }
 }
 
+// x += a first (the residual add), then rms_rows_kernel's arithmetic on the new x (the same bits as the two kernels)
+__global__ void add_rms_rows_kernel(float* __restrict__ x, int ldx, const float* __restrict__ a,
+                                    const float* __restrict__ w, float* __restrict__ of, __half* __restrict__ oh,
+                                    int cols, float eps) {
+    __shared__ float sh[32];
+    float* xr = x + (size_t) blockIdx.x * ldx;
+    const float* ar = a + (size_t) blockIdx.x * cols;
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        const float v = xr[i] + ar[i];
+        xr[i] = v;
+        acc += v * v;
+    }
+    const float scale = rsqrtf(block_sum(acc, sh) / (float) cols + eps);
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        const float v = xr[i] * scale * (w ? w[i] : 1.0f);
+        if (of) of[(size_t) blockIdx.x * cols + i] = v;
+        if (oh) oh[(size_t) blockIdx.x * cols + i] = __float2half(v);
+    }
+}
+
+// SwiGLU (dense_kernels.cu's arithmetic) writing F32 and FP16 rows
+__global__ void swiglu_h_kernel(const float* __restrict__ g, const float* __restrict__ u, float* __restrict__ o,
+                                __half* __restrict__ oh, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float a = g[i];
+    const float v = (a / (1.0f + __expf(-a))) * u[i];
+    o[i] = v;
+    oh[i] = __float2half(v);
+}
+
 __global__ void to_half_kernel(const float* __restrict__ s, __half* __restrict__ d, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) d[i] = __float2half(s[i]);
@@ -1559,6 +1591,17 @@ void q35_rms_rows(const float* x, int ldx, const float* w, float* out_f32, uint1
                   float eps, void* stream) {
     rms_rows_kernel<<<rows, 256, 0, (cudaStream_t) stream>>>(x, ldx, w, out_f32, (__half*) out_f16, cols, eps);
     check("q35_rms_rows");
+}
+
+void q35_add_rms_rows(float* x, int ldx, const float* a, const float* w, float* out_f32, uint16_t* out_f16, int rows,
+                      int cols, float eps, void* stream) {
+    add_rms_rows_kernel<<<rows, 256, 0, (cudaStream_t) stream>>>(x, ldx, a, w, out_f32, (__half*) out_f16, cols, eps);
+    check("q35_add_rms_rows");
+}
+
+void q35_swiglu_h(const float* gate, const float* up, float* out, uint16_t* out_f16, int64_t n, void* stream) {
+    swiglu_h_kernel<<<blocks(n, 256), 256, 0, (cudaStream_t) stream>>>(gate, up, out, (__half*) out_f16, n);
+    check("q35_swiglu_h");
 }
 
 void q35_to_half(const float* src, uint16_t* dst, int64_t n, void* stream) {

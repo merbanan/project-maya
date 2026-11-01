@@ -23,6 +23,11 @@ namespace strata::kernels {
 /// out_f32 / out_f16 (either may be null) = rms_norm(x row) * w, rows of `cols`, x row stride ldx, outputs dense.
 void q35_rms_rows(const float* x, int ldx, const float* w, float* out_f32, uint16_t* out_f16, int rows, int cols,
                   float eps, void* stream);
+/// x += a (rows of cols, a contiguous), then q35_rms_rows of the new x - the same bits as q35_add + q35_rms_rows.
+void q35_add_rms_rows(float* x, int ldx, const float* a, const float* w, float* out_f32, uint16_t* out_f16, int rows,
+                      int cols, float eps, void* stream);
+/// dense_swiglu's out, and its FP16 copy (the next GEMV's input rows).
+void q35_swiglu_h(const float* gate, const float* up, float* out, uint16_t* out_f16, int64_t n, void* stream);
 
 /// dst (FP16 bits) = src, n values.
 void q35_to_half(const float* src, uint16_t* dst, int64_t n, void* stream);

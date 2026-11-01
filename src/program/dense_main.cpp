@@ -561,7 +561,7 @@ int main(int argc, char** argv) {
             lookup.reset();
             lookup.append(ids.data(), ids.size());
             // the MTP draft head's vocabulary for this conversation (its first ids + the prompt's frequent later ones)
-            if (K > 0 && !use_df && !model.mtp_vocab_select(ids.data(), ids.size(), err)) {
+            if (K > 0 && !model.mtp_vocab_select(ids.data(), ids.size(), err)) {
                 std::printf("ERR %s\n", err.c_str());
                 std::fflush(stdout);
                 continue;
@@ -651,7 +651,7 @@ int main(int argc, char** argv) {
         auto emit = [&](int32_t t) -> bool {        // false: the answer ends here
             if (in_think && t == think_end) in_think = false;
             lookup.append(t);
-            if (K > 0 && !use_df) vgen.push_back(t);
+            if (K > 0) vgen.push_back(t);
             ++produced;
             std::printf("T %d\n", t);
             if (sp.penalty_last_n > 0) { hist.push_back(t); if ((int) hist.size() > sp.penalty_last_n) hist.erase(hist.begin()); }
@@ -747,7 +747,7 @@ int main(int argc, char** argv) {
         };
         while (going) {
             if (in.stop.load()) { cancelled = true; break; }
-            if (K > 0 && !use_df && produced >= vsel_at) {
+            if (K > 0 && produced >= vsel_at) {
                 vsel_at = produced + vsel_every;
                 if (!model.mtp_vocab_select(ids.data(), ids.size(), vgen.data(), vgen.size(), err)) {
                     std::printf("ERR %s\n", err.c_str()); failed = true; break;
