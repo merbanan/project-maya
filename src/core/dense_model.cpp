@@ -20,6 +20,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdlib>
+#include <unordered_map>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -263,6 +264,11 @@ struct DenseModel::Impl {
     float* output_norm = nullptr;
     QMat head;
     QMat head_draft;                                // the head's first draft_vocab rows (the drafts' vocabulary)
+    // the MTP draft head (packed rows of the head gathered: slot j = token mtp_ids[j]) - built by mtp_vocab_select
+    QMat head_mtp;
+    int32_t* mtp_ids_dev = nullptr;
+    std::vector<int32_t> mtp_ids;
+    int mtp_extra = 0;
     void* q8_1 = nullptr;                           // the GEMVs' quantized activations (kMaxCols columns)
     uint16_t* xh = nullptr;                         // the GEMMs' FP16 activations (chunk rows of the widest input)
     strata::prefill::Gemm gemm;
@@ -609,7 +615,50 @@ float* DenseModel::logits() const { return impl_->logits; }
 void* DenseModel::stream() const { return impl_->stream; }
 const float* DenseModel::hidden_norm() const { return impl_->hn; }
 int DenseModel::chunk() const { return impl_->chunk; }
-int DenseModel::draft_vocab() const { return impl_->head_draft.n_out; }
+int DenseModel::draft_vocab() const { return impl_->head_mtp.dev ? impl_->head_mtp.n_out : impl_->head_draft.n_out; }
+const int32_t* DenseModel::draft_ids() const { return impl_->head_mtp.dev ? impl_->mtp_ids_dev : nullptr; }
+int32_t DenseModel::draft_id(int slot) const { return impl_->head_mtp.dev ? impl_->mtp_ids[(size_t) slot] : slot; }
+
+bool DenseModel::mtp_vocab_select(const int32_t* prompt, size_t n, std::string& err) {
+    Impl& I = *impl_;
+    if (I.mtp_extra <= 0 || !I.mtp.attn || I.gemma || !I.head.packed) return true;
+    const int N = I.head_draft.n_out, X = std::min(I.mtp_extra, N / 2), base = N - X, V = cfg_.n_vocab;
+    // the prompt's tokens at or beyond `base`, the most frequent first (ties: the lower id)
+    std::unordered_map<int32_t, int> cnt;
+    for (size_t i = 0; i < n; ++i)
+        if (prompt[i] >= base && prompt[i] < V) ++cnt[prompt[i]];
+    std::vector<std::pair<int, int32_t>> by;
+    by.reserve(cnt.size());
+    for (const auto& kv : cnt) by.push_back({-kv.second, kv.first});
+    std::sort(by.begin(), by.end());
+    std::vector<int32_t> ids((size_t) N);
+    for (int j = 0; j < base; ++j) ids[(size_t) j] = j;
+    int j = base;
+    for (size_t k = 0; k < by.size() && j < N; ++k) ids[(size_t) j++] = by[k].second;
+    std::vector<int32_t> extra(ids.begin() + base, ids.begin() + j);
+    std::sort(extra.begin(), extra.end());
+    for (int t = base; j < N; ++t)   // (the rest: the next ids in order, skipping the ones already in)
+        if (!std::binary_search(extra.begin(), extra.end(), t)) ids[(size_t) j++] = t;
+    if (I.head_mtp.dev && ids == I.mtp_ids) return true;   // (the same rows as the last request's)
+    try {
+        if (!I.head_mtp.dev) {
+            I.head_mtp = I.head;
+            I.head_mtp.n_out = N;
+            void* p = nullptr;
+            if (!I.alloc(&p, q35_mmt_packed_bytes(I.head.type, I.head.n_in, N), err, "MTP draft head") ||
+                !I.alloc(&I.mtp_ids_dev, (uint64_t) N * 4, err, "MTP draft ids"))
+                return false;
+            I.head_mtp.dev = p;
+        }
+        cudaMemcpyAsync(I.mtp_ids_dev, ids.data(), (size_t) N * 4, cudaMemcpyHostToDevice, I.stream);
+        q35_mmt_gather_packed(I.head.type, I.head.dev, I.head.n_in, I.mtp_ids_dev, N, I.head_mtp.dev, I.stream);
+        I.mtp_ids.swap(ids);
+        return sync(err);
+    } catch (const std::exception& e) {
+        err = std::string("dense model: ") + e.what();
+        return false;
+    }
+}
 bool DenseModel::has_mtp() const { return impl_->mtp.attn; }
 float* DenseModel::mtp_logits() const { return impl_->mtp_logits; }
 const float* DenseModel::mtp_hidden() const { return impl_->mtp_h; }
@@ -941,6 +990,8 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             const char* e = std::getenv("STRATA_DENSE_DRAFT_VOCAB");
             const int dv = e ? std::atoi(e) : cfg_.n_expert == 0 ? 32768 : 0;
             if (dv > 0 && dv < cfg_.n_vocab) I.head_draft.n_out = dv / 128 * 128;   // (rows are contiguous blocks)
+            const char* x = std::getenv("STRATA_DENSE_MTP_VOCAB_EXTRA");
+            I.mtp_extra = I.head_draft.n_out < cfg_.n_vocab ? (x ? std::max(0, std::atoi(x)) / 32 * 32 : 4096) : 0;
         }
         weight_bytes_ = total;
         host_bytes_ = I.host_bytes;
@@ -1471,7 +1522,7 @@ bool DenseModel::mtp_forward(const int32_t* toks, const float* hidden, int64_t p
         q35_rms_rows(x, E, M.head_norm, I.mtp_h, nullptr, T, E, eps, s);
         const int rows = all_logits ? T : 1;
         I.prep(all_logits ? I.mtp_h : I.mtp_h + (size_t) (T - 1) * E, E, rows);
-        I.mm(I.head_draft, I.mtp_logits);
+        I.mm(I.head_mtp.dev ? I.head_mtp : I.head_draft, I.mtp_logits);
         return true;
     } catch (const std::exception& e) {
         err = std::string("dense model: ") + e.what();

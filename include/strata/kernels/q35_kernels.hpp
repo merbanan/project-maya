@@ -121,6 +121,8 @@ void q35_gemv_f32_cols(const float* W, const float* x, int ldx, float* y, int n_
 void q35_argmax_rows(const float* x, int64_t ld, int n, int T, int32_t* out, void* stream);
 /// *out = the softmax probability of x[*best] in the row x [n] (a draft's confidence: its top-1, *best its argmax).
 void q35_top1_prob(const float* x, int n, const int32_t* best, float* out, void* stream);
+/// x[i] = map[x[i]] for i < n (device): a draft head's slots to token ids.
+void q35_map_ids(int32_t* x, const int32_t* map, int n, void* stream);
 
 /// y += x, n values
 void q35_add(float* y, const float* x, int64_t n, void* stream);
@@ -142,6 +144,8 @@ void q35_mmt(int ggml_type, const void* W, const uint16_t* xh8, float* y, int K,
 /// repacking of a GGUF matrix (W N rows of K) into it, and the GEMV over it (as q35_mmt).
 uint64_t q35_mmt_packed_bytes(int ggml_type, int K, int N);
 void q35_mmt_pack(int ggml_type, const void* W, void* packed, int K, int N, void* stream);
+/// A packed matrix of the rows ids[0..n) of another packed matrix (both K inputs; dst row j = src row ids[j]).
+void q35_mmt_gather_packed(int ggml_type, const void* packed, int K, const int* ids, int n, void* dst, void* stream);
 void q35_mmt_unpack(int ggml_type, const void* packed, void* W, int K, int N, void* stream);
 /// rows row0 .. row0 + rows - 1 (row0 a multiple of 32) of a packed matrix to FP16 rows of K (the prompt's GEMMs)
 void q35_mmt_dequant_packed(int ggml_type, const void* packed, int K, int N, int row0, int rows, uint16_t* out,

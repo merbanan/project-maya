@@ -364,6 +364,19 @@ __global__ void pack_kernel(const uint8_t* __restrict__ src, size_t row_bytes, i
     dst[i] = *(const uint4*) b;
 }
 
+// rows of a packed matrix gathered into another: dst row j = src row ids[j] (a thread a 16-byte chunk of dst)
+__global__ void gather_packed_kernel(const uint4* __restrict__ src, const int* __restrict__ ids, int ch, int nsb, int n,
+                                     uint4* __restrict__ dst, size_t n_chunks) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_chunks) return;
+    const int lane = (int) (i % 32), c = (int) (i / 32 % ch);
+    const size_t tile = i / ((size_t) 32 * ch);
+    const int sb = (int) (tile % nsb), g = (int) (tile / nsb), j = g * 32 + lane;
+    if (j >= n) { dst[i] = make_uint4(0, 0, 0, 0); return; }
+    const int r = ids[j];
+    dst[i] = src[(((size_t) (r / 32) * nsb + sb) * ch + c) * 32 + r % 32];
+}
+
 // the inverse: a packed matrix back to GGUF rows (a thread per output byte group of 16 within a padded block)
 __global__ void unpack_kernel(const uint4* __restrict__ src, size_t row_bytes, int bb, int bp, int nsb, int N,
                               uint8_t* __restrict__ dst, size_t n_chunks) {
@@ -665,6 +678,15 @@ void q35_mmt_pack(int ggml_type, const void* W, void* packed, int K, int N, void
     pack_kernel<<<(unsigned) ((n_chunks + 255) / 256), 256, 0, (cudaStream_t) stream>>>(
         (const uint8_t*) W, (size_t) nsb * bb, bb, bp, nsb, N, (uint4*) packed, n_chunks);
     check("q35_mmt_pack");
+}
+
+void q35_mmt_gather_packed(int ggml_type, const void* packed, int K, const int* ids, int n, void* dst, void* stream) {
+    const int bb = fmt_bytes(ggml_type), bp = pad16(bb), nsb = K / 256;
+    if (!bb || K % 256) throw std::invalid_argument("q35_mmt_gather_packed: type / K");
+    const size_t n_chunks = q35_mmt_packed_bytes(ggml_type, K, n) / 16;
+    gather_packed_kernel<<<(unsigned) ((n_chunks + 255) / 256), 256, 0, (cudaStream_t) stream>>>(
+        (const uint4*) packed, ids, bp / 16, nsb, n, (uint4*) dst, n_chunks);
+    check("q35_mmt_gather_packed");
 }
 
 void q35_mmt_unpack(int ggml_type, const void* packed, void* W, int K, int N, void* stream) {

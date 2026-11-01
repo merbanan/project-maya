@@ -559,6 +559,12 @@ int main(int argc, char** argv) {
         if (resume == 0 || lookup.size() != resume) {   // (the lookup history is the prompt and the answer so far)
             lookup.reset();
             lookup.append(ids.data(), ids.size());
+            // the MTP draft head's vocabulary for this conversation (its first ids + the prompt's frequent later ones)
+            if (K > 0 && !use_df && !model.mtp_vocab_select(ids.data(), ids.size(), err)) {
+                std::printf("ERR %s\n", err.c_str());
+                std::fflush(stdout);
+                continue;
+            }
         } else {
             lookup.append(ids.data() + resume, ids.size() - resume);
         }
@@ -815,11 +821,14 @@ int main(int argc, char** argv) {
                     int d = 0;
                     if (spec_s) {   // a draw from the draft head's own (filtered) distribution, kept for the accept test
                         if (!topk_rows(model.mtp_logits(), model.draft_vocab(), 1, qd)) { failed = true; break; }
+                        if (model.draft_ids())   // (the head's slots to token ids)
+                            for (int i = 0; i < qd.back().n; ++i) qd.back().ids[i] = model.draft_id(qd.back().ids[i]);
                         d = draw(qd.back(), srng);
                     } else if (dev_chain) {
                         // (device-resident chain: draft j's argmax stays in d_next[j] and feeds the next step; the
                         // drafts reach the host once, after the last)
                         strata::kernels::q35_argmax_rows(model.mtp_logits(), model.draft_vocab(), model.draft_vocab(), 1, d_next + j, cs);
+                        if (model.draft_ids()) strata::kernels::q35_map_ids(d_next + j, model.draft_ids(), 1, cs);
                         if (j + 1 < k && !model.mtp_forward_dev(d_next + j, model.mtp_hidden(), pos + j, err)) {
                             std::printf("ERR %s\n", err.c_str()); failed = true; break;
                         }
@@ -839,6 +848,7 @@ int main(int argc, char** argv) {
                             cudaMemcpyAsync(&pc, d_conf, sizeof(float), cudaMemcpyDeviceToHost, cs);
                         }
                         if (!model.sync(err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
+                        d = model.draft_id(d);   // (the head's slot to its token id)
                         p_prod *= pc;
                     }
                     win.push_back(d);

@@ -128,6 +128,12 @@ public:
     /// The vocabulary drafts come from: the first N ids of the head (STRATA_DENSE_DRAFT_VOCAB, NInfer's reduced
     /// proposal head), else all of it.  MTP's logits rows and DFlash2's candidates use it.
     int draft_vocab() const;
+    /// The MTP draft head's rows: slot j of mtp_logits() is token draft_ids()[j] (device, draft_vocab() entries;
+    /// nullptr: slot j is token j).  mtp_vocab_select() picks them for a request: the first token ids, then the
+    /// prompt's most frequent tokens beyond them (STRATA_DENSE_MTP_VOCAB_EXTRA slots, default 4096; 0: off).
+    const int32_t* draft_ids() const;
+    int32_t draft_id(int slot) const;
+    bool mtp_vocab_select(const int32_t* prompt, size_t n, std::string& err);
     const float* mtp_hidden() const;
 
     // ---- the DFlash2 drafter (a separate GGUF, arch qwen35-dflash-draft): K drafts in one pass of its 5 layers

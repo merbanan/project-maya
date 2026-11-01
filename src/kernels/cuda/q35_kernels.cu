@@ -1588,6 +1588,16 @@ void q35_kv_expand_f16(const Q35Kv& kv, int n_keys, int n_kv, int D, uint16_t* k
     check("q35_kv_expand_f16");
 }
 
+__global__ void map_ids_kernel(int32_t* __restrict__ x, const int32_t* __restrict__ map, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = map[x[i]];
+}
+void q35_map_ids(int32_t* x, const int32_t* map, int n, void* stream) {
+    if (n <= 0) return;
+    map_ids_kernel<<<(n + 127) / 128, 128, 0, (cudaStream_t) stream>>>(x, map, n);
+    check("q35_map_ids");
+}
+
 void q35_gemv_f32_cols(const float* W, const float* x, int ldx, float* y, int n_in, int n_out, int T, void* stream) {
     gemv_f32_cols_kernel<<<dim3(n_out, (T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(W, x, ldx, y, n_in, n_out, T);
     check("q35_gemv_f32_cols");
