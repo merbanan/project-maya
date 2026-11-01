@@ -619,7 +619,8 @@ int DenseModel::draft_vocab() const { return impl_->head_mtp.dev ? impl_->head_m
 const int32_t* DenseModel::draft_ids() const { return impl_->head_mtp.dev ? impl_->mtp_ids_dev : nullptr; }
 int32_t DenseModel::draft_id(int slot) const { return impl_->head_mtp.dev ? impl_->mtp_ids[(size_t) slot] : slot; }
 
-bool DenseModel::mtp_vocab_select(const int32_t* prompt, size_t n, std::string& err) {
+bool DenseModel::mtp_vocab_select(const int32_t* prompt, size_t n, const int32_t* gen, size_t n_gen,
+                                  std::string& err) {
     Impl& I = *impl_;
     if (I.mtp_extra <= 0 || !I.mtp.attn || I.gemma || !I.head.packed) return true;
     const int N = I.head_draft.n_out, X = std::min(I.mtp_extra, N / 2), base = N - X, V = cfg_.n_vocab;
@@ -627,6 +628,8 @@ bool DenseModel::mtp_vocab_select(const int32_t* prompt, size_t n, std::string& 
     std::unordered_map<int32_t, int> cnt;
     for (size_t i = 0; i < n; ++i)
         if (prompt[i] >= base && prompt[i] < V) ++cnt[prompt[i]];
+    for (size_t i = 0; i < n_gen; ++i)
+        if (gen[i] >= base && gen[i] < V) cnt[gen[i]] += 4;
     std::vector<std::pair<int, int32_t>> by;
     by.reserve(cnt.size());
     for (const auto& kv : cnt) by.push_back({-kv.second, kv.first});

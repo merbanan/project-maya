@@ -133,7 +133,11 @@ public:
     /// prompt's most frequent tokens beyond them (STRATA_DENSE_MTP_VOCAB_EXTRA slots, default 4096; 0: off).
     const int32_t* draft_ids() const;
     int32_t draft_id(int slot) const;
-    bool mtp_vocab_select(const int32_t* prompt, size_t n, std::string& err);
+    bool mtp_vocab_select(const int32_t* prompt, size_t n, std::string& err) {
+        return mtp_vocab_select(prompt, n, nullptr, 0, err);
+    }
+    /// ... and the answer so far (`gen`, each counted 4 times: what is being written now is the better guess).
+    bool mtp_vocab_select(const int32_t* prompt, size_t n, const int32_t* gen, size_t n_gen, std::string& err);
     const float* mtp_hidden() const;
 
     // ---- the DFlash2 drafter (a separate GGUF, arch qwen35-dflash-draft): K drafts in one pass of its 5 layers

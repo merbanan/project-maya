@@ -34,6 +34,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -642,9 +643,15 @@ int main(int argc, char** argv) {
             if (in_think && produced >= think_budget && t != think_end) t = think_end;
         };
         long long lookup_rounds = 0;
+        // the answer so far, for the MTP draft head's vocabulary (re-picked every 64 tokens with the prompt's)
+        // (STRATA_DENSE_MTP_VOCAB_EVERY tokens, default 64; 0: the prompt's pick only)
+        static const long long vsel_every = std::getenv("STRATA_DENSE_MTP_VOCAB_EVERY") ? std::atoll(std::getenv("STRATA_DENSE_MTP_VOCAB_EVERY")) : 64;
+        std::vector<int32_t> vgen;
+        long long vsel_at = vsel_every > 0 ? vsel_every : LLONG_MAX;
         auto emit = [&](int32_t t) -> bool {        // false: the answer ends here
             if (in_think && t == think_end) in_think = false;
             lookup.append(t);
+            if (K > 0 && !use_df) vgen.push_back(t);
             ++produced;
             std::printf("T %d\n", t);
             if (sp.penalty_last_n > 0) { hist.push_back(t); if ((int) hist.size() > sp.penalty_last_n) hist.erase(hist.begin()); }
@@ -740,6 +747,12 @@ int main(int argc, char** argv) {
         };
         while (going) {
             if (in.stop.load()) { cancelled = true; break; }
+            if (K > 0 && !use_df && produced >= vsel_at) {
+                vsel_at = produced + vsel_every;
+                if (!model.mtp_vocab_select(ids.data(), ids.size(), vgen.data(), vgen.size(), err)) {
+                    std::printf("ERR %s\n", err.c_str()); failed = true; break;
+                }
+            }
             const int64_t pos = model.position();
             Clock::time_point t_rp = Clock::now();
             int k = (int) std::min<long long>(K, std::min<long long>(budget - produced, model.max_context() - pos - 1));
