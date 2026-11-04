@@ -780,7 +780,7 @@ int main(int argc, char** argv) {
                 for (int64_t j = 1; j < n; ++j)
                     if (ids[(size_t) j] == im_start) { shared_at[0] = j; if (j > (int64_t) resume) anchors.push_back(j); break; }
             }
-            if (diverge_at > (int64_t) resume && diverge_at < n) anchors.push_back(diverge_at);
+            if (diverge_at >= 1024 && diverge_at > (int64_t) resume && diverge_at < n) anchors.push_back(diverge_at);   // (not a few tokens)
             std::sort(anchors.begin(), anchors.end());
             anchors.erase(std::unique(anchors.begin(), anchors.end()), anchors.end());
         }
