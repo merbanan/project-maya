@@ -103,6 +103,12 @@ public:
     bool ckpt_save(int slot, std::string& err);
     bool ckpt_restore(int slot, int64_t pos, std::string& err);
     uint64_t ckpt_bytes() const;
+    /// A parked conversation (host memory the caller owns): the recurrent state as a checkpoint has it, then every
+    /// attention layer's K/V cells of positions 0 .. n - 1 (the MTP block's too).  park_restore() puts both back and
+    /// sets the position to n.  Not for sliding-window rings (Gemma 4): park_bytes() is 0 there.
+    uint64_t park_bytes(int64_t n) const;
+    bool park_save(void* host, int64_t n, std::string& err);
+    bool park_restore(const void* host, int64_t n, std::string& err);
 
     /// Images (GENI, STRATA_DENSE_VISION=1 at load): an image's tokens sit at cells cell .. cell + nx * ny - 1 (row
     /// i at grid x = i % nx, y = i / nx); their embedding rows (E floats each, the images' in order) replace the

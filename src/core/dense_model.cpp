@@ -2427,6 +2427,67 @@ bool DenseModel::ckpt_restore(int slot, int64_t pos, std::string& err) {
     return sync(err);
 }
 
+namespace {
+// every K/V buffer of the attention layers (the MTP block's included): (device pointer, bytes a cell); a cell is one
+// kv head's position, the cells of a head contiguous (kvh * max_ctx + pos)
+std::vector<std::pair<uint8_t*, uint64_t>> park_kv_parts(DenseModel::Impl& I, const DenseConfig& c) {
+    std::vector<std::pair<uint8_t*, uint64_t>> v;
+    const uint64_t D = (uint64_t) c.head_dim;
+    auto add = [&](Layer& L) {
+        if (!L.attn || !L.kv.k) return;
+        const int m = L.kv.mode;
+        v.push_back({(uint8_t*) L.kv.k, m == 0 ? D * 2 : D});
+        v.push_back({(uint8_t*) L.kv.v, m == 0 ? D * 2 : m == 2 ? D : D / 2});
+        if (m != 0) { v.push_back({(uint8_t*) L.kv.ks, D / 32 * 2}); v.push_back({(uint8_t*) L.kv.vs, D / 32 * 2}); }
+    };
+    for (Layer& L : I.layers) add(L);
+    add(I.mtp);
+    return v;
+}
+}  // namespace
+
+uint64_t DenseModel::park_bytes(int64_t n) const {
+    Impl& I = *impl_;
+    if (I.gemma || I.swa_ring > 0 || n < 0 || n > max_context_) return 0;
+    uint64_t b = ckpt_bytes();
+    for (auto& [p, cb] : park_kv_parts(I, cfg_)) b += cb * (uint64_t) n * (uint64_t) cfg_.n_head_kv;
+    return b;
+}
+
+bool DenseModel::park_save(void* host, int64_t n, std::string& err) {
+    Impl& I = *impl_;
+    if (pending_ || n != pos_ || park_bytes(n) == 0) { err = "dense model: cannot park this state"; return false; }
+    uint8_t* h = (uint8_t*) host;
+    for (auto& [p, b] : ckpt_parts(I, cfg_)) {
+        cudaMemcpyAsync(h, p, b, cudaMemcpyDeviceToHost, I.stream);
+        h += b;
+    }
+    const uint64_t HK = (uint64_t) cfg_.n_head_kv, mc = (uint64_t) max_context_;
+    for (auto& [p, cb] : park_kv_parts(I, cfg_)) {   // (each head's first n cells)
+        cudaMemcpy2DAsync(h, cb * n, p, cb * mc, cb * n, HK, cudaMemcpyDeviceToHost, I.stream);
+        h += cb * n * HK;
+    }
+    return sync(err);
+}
+
+bool DenseModel::park_restore(const void* host, int64_t n, std::string& err) {
+    Impl& I = *impl_;
+    if (park_bytes(n) == 0) { err = "dense model: cannot restore a parked state"; return false; }
+    const uint8_t* h = (const uint8_t*) host;
+    for (auto& [p, b] : ckpt_parts(I, cfg_)) {
+        cudaMemcpyAsync(p, h, b, cudaMemcpyHostToDevice, I.stream);
+        h += b;
+    }
+    const uint64_t HK = (uint64_t) cfg_.n_head_kv, mc = (uint64_t) max_context_;
+    for (auto& [p, cb] : park_kv_parts(I, cfg_)) {
+        cudaMemcpy2DAsync(p, cb * mc, h, cb * n, cb * n, HK, cudaMemcpyHostToDevice, I.stream);
+        h += cb * n * HK;
+    }
+    pos_ = n;
+    pending_ = 0;
+    return sync(err);
+}
+
 // ---------------------------------------------------------------------------------------------------- Gemma 4
 // llama.cpp src/models/gemma4.cpp (E2B / E4B: dense FFN, per-layer embeddings, shared K/V in the last layers)
 bool DenseModel::load_gemma4(int64_t max_context, std::string& err) {

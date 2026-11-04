@@ -486,7 +486,7 @@ int main(int argc, char** argv) {
     // a prompt's last message header, in pinned host memory; a later prompt that shares that prefix but not the rest
     // of the history (an agent dropped the reasoning, rewrote a tool call) restores it instead of reading from 0
     const int n_ckpt = std::getenv("STRATA_DENSE_CKPTS") ? std::max(0, std::atoi(std::getenv("STRATA_DENSE_CKPTS"))) : 8;
-    struct Ckpt { int64_t len = -1; uint64_t hash = 0, used = 0; };
+    struct Ckpt { int64_t len = -1; uint64_t hash = 0, used = 0; bool shared = false; };   // (shared: a prefix other conversations share)
     std::vector<Ckpt> ckpts((size_t) n_ckpt);
     uint64_t ckpt_clock = 0;
     auto prefix_hash = [](const std::vector<int32_t>& v, int64_t n) {
@@ -494,6 +494,53 @@ int main(int argc, char** argv) {
         for (int64_t i = 0; i < n; ++i) { h ^= (uint32_t) v[(size_t) i]; h *= 1099511628211ull; }
         return h;
     };
+    // parked conversations (STRATA_DENSE_PARK_GB of host memory, default 16; 0: off): a prompt that does not continue
+    // the conversation in the model first copies that conversation out (its state and K/V cells), and a prompt that
+    // continues a parked one copies it back instead of reading it again - two agents taking turns on one engine
+    const double park_gb = std::getenv("STRATA_DENSE_PARK_GB") ? std::atof(std::getenv("STRATA_DENSE_PARK_GB")) : 16.0;
+    const uint64_t park_budget = park_gb > 0 && model.park_bytes(1) > 0 ? (uint64_t) (park_gb * 1073741824.0) : 0;
+    const size_t park_min = std::getenv("STRATA_DENSE_PARK_MIN") ? (size_t) std::atoll(std::getenv("STRATA_DENSE_PARK_MIN")) : 2048;
+    struct HostBuf { uint8_t* p = nullptr; uint64_t cap = 0; bool pinned = false; };
+    struct Park { std::vector<int32_t> toks; HostBuf buf; uint64_t used = 0; };
+    std::vector<Park> parks;
+    std::vector<HostBuf> spare;   // buffers of restored parks, reused by the next park
+    uint64_t park_held = 0;       // bytes of every buffer (parks and spares)
+    auto buf_free = [&](HostBuf& b) {
+        if (b.p) { if (b.pinned) cudaFreeHost(b.p); else std::free(b.p); park_held -= b.cap; }
+        b = HostBuf{};
+    };
+    // a buffer of `need` bytes: a spare, else a new one (in steps of 512 MiB, so a grown conversation fits the next
+    // time) after freeing spares and the least recently used parks to stay inside the budget
+    auto buf_get = [&](uint64_t need, HostBuf& out) {
+        int best = -1;
+        for (int i = 0; i < (int) spare.size(); ++i)
+            if (spare[(size_t) i].cap >= need && (best < 0 || spare[(size_t) i].cap < spare[(size_t) best].cap)) best = i;
+        if (best >= 0) { out = spare[(size_t) best]; spare.erase(spare.begin() + best); return true; }
+        const uint64_t cap = (need + (512ull << 20) - 1) / (512ull << 20) * (512ull << 20);
+        if (cap > park_budget) return false;
+        while (park_held + cap > park_budget && !spare.empty()) { buf_free(spare.back()); spare.pop_back(); }
+        while (park_held + cap > park_budget && !parks.empty()) {
+            size_t lru = 0;
+            for (size_t i = 1; i < parks.size(); ++i) if (parks[i].used < parks[lru].used) lru = i;
+            std::fprintf(stderr, "strata-dense: dropped the parked conversation of %zu tokens\n", parks[lru].toks.size());
+            buf_free(parks[lru].buf);
+            parks.erase(parks.begin() + (std::ptrdiff_t) lru);
+        }
+        out = HostBuf{nullptr, cap, true};
+        if (cudaHostAlloc((void**) &out.p, cap, cudaHostAllocDefault) != cudaSuccess) {
+            cudaGetLastError();
+            out.p = nullptr;
+            out.pinned = false;
+            out.p = (uint8_t*) std::malloc(cap);   // (pageable: slower copies, still far faster than reading again)
+            if (!out.p) { out = HostBuf{}; return false; }
+        }
+        park_held += cap;
+        return true;
+    };
+    uint64_t park_clock = 0;
+    if (park_budget > 0)
+        std::fprintf(stderr, "strata-dense: parked conversations in up to %.1f GiB of host memory (%.1f MiB a 1K tokens)\n",
+                     park_budget / 1073741824.0, (model.park_bytes(1024) - model.park_bytes(0)) / 1048576.0);
     if (n_ckpt > 0)
         std::fprintf(stderr, "strata-dense: %d prefix checkpoints of %.0f MiB (pinned host memory, on first use), "
                      "at the last header %d\n", n_ckpt, model.ckpt_bytes() / 1048576.0, im_start);
@@ -613,21 +660,92 @@ int main(int argc, char** argv) {
         size_t resume = 0;
         if (!fed.empty() && fed.size() < idk.size() && std::equal(fed.begin(), fed.end(), idk.begin())) resume = fed.size();
         bool restored = false;
-        if (resume == 0 && !fed.empty() && n_ckpt > 0) {
-            // the K/V cache holds fed's tokens: a checkpoint inside the common prefix of fed and the prompt is valid
+        int64_t diverge_at = -1;   // where the prompt leaves the conversation in the model: a checkpoint is taken there
+        auto common = [&](const std::vector<int32_t>& h) {   // (one token of the prompt is always left to read)
             size_t cp = 0;
-            while (cp < fed.size() && cp + 1 < idk.size() && fed[cp] == idk[cp]) ++cp;
+            while (cp < h.size() && cp + 1 < idk.size() && h[cp] == idk[cp]) ++cp;
+            return cp;
+        };
+        auto best_ckpt = [&](size_t cp) {   // the longest checkpoint of the prompt inside its first cp tokens
             int best = -1;
             for (int c = 0; c < n_ckpt; ++c)
                 if (ckpts[(size_t) c].len > 0 && (size_t) ckpts[(size_t) c].len <= cp &&
                     (best < 0 || ckpts[(size_t) c].len > ckpts[(size_t) best].len) &&
                     ckpts[(size_t) c].hash == prefix_hash(idk, ckpts[(size_t) c].len))
                     best = c;
-            std::fprintf(stderr, "strata-dense: history diverges at %zu of %zu; checkpoint %d\n", cp, fed.size(), best);
-            if (best >= 0 && model.ckpt_restore(best, ckpts[(size_t) best].len, err)) {
-                resume = (size_t) ckpts[(size_t) best].len;
+            return best;
+        };
+        if (resume == 0 && !fed.empty()) {
+            // the K/V cache holds fed's tokens: a checkpoint inside the common prefix of fed and the prompt is valid;
+            // a parked conversation brings its own K/V, then its own state (the prompt continues it) or a checkpoint
+            const size_t cp = common(fed);
+            const int ck = n_ckpt > 0 ? best_ckpt(cp) : -1;
+            size_t got = ck >= 0 ? (size_t) ckpts[(size_t) ck].len : 0;
+            int pk = -1, pk_ck = -1;
+            for (int i = 0; i < (int) parks.size(); ++i) {
+                const size_t c = common(parks[(size_t) i].toks);
+                const int k = c == parks[(size_t) i].toks.size() || n_ckpt == 0 ? -1 : best_ckpt(c);
+                const size_t g = c == parks[(size_t) i].toks.size() ? c : k >= 0 ? (size_t) ckpts[(size_t) k].len : 0;
+                if (g > got) { got = g; pk = i; pk_ck = k; }
+            }
+            diverge_at = (int64_t) cp;
+            std::fprintf(stderr, "strata-dense: history diverges at %zu of %zu; checkpoint %d, parked %d\n", cp, fed.size(),
+                         pk >= 0 ? pk_ck : ck, pk);
+            // the conversation in the model is parked when the prompt leaves it for good (not a rewritten last turn)
+            if (park_budget > 0 && fed.size() >= park_min && fed.size() - cp >= std::max(park_min, fed.size() / 4)) {
+                const auto t0 = Clock::now();
+                for (size_t i = 0; i < parks.size();)   // (an older copy of the same conversation)
+                    if (parks[i].toks.size() <= fed.size() && std::equal(parks[i].toks.begin(), parks[i].toks.end(), fed.begin())) {
+                        if ((int) i == pk) { ++i; continue; }
+                        spare.push_back(parks[i].buf);
+                        if (pk > (int) i) --pk;
+                        parks.erase(parks.begin() + (std::ptrdiff_t) i);
+                    } else ++i;
+                const uint64_t need = model.park_bytes((int64_t) fed.size());
+                HostBuf hb;
+                // (the park to restore keeps its buffer: the eviction must not take it)
+                Park keep;
+                if (pk >= 0) { keep = std::move(parks[(size_t) pk]); parks.erase(parks.begin() + pk); }
+                if (buf_get(need, hb)) {
+                    if (model.park_save(hb.p, (int64_t) fed.size(), err)) {
+                        parks.push_back({fed, hb, ++park_clock});
+                        std::fprintf(stderr, "strata-dense: parked %zu tokens (%.2f GiB) in %.0f ms\n", fed.size(),
+                                     need / 1073741824.0, ms_since(t0));
+                    } else {
+                        std::fprintf(stderr, "strata-dense: %s\n", err.c_str());
+                        spare.push_back(hb);
+                    }
+                }
+                if (pk >= 0) { parks.push_back(std::move(keep)); pk = (int) parks.size() - 1; }
+            }
+            if (pk >= 0) {
+                const auto t0 = Clock::now();
+                Park& P = parks[(size_t) pk];
+                if (model.park_restore(P.buf.p, (int64_t) P.toks.size(), err)) {
+                    std::fprintf(stderr, "strata-dense: restored %zu parked tokens in %.0f ms\n", P.toks.size(), ms_since(t0));
+                    fed = std::move(P.toks);
+                    resume = fed.size();
+                    spare.push_back(P.buf);
+                    parks.erase(parks.begin() + pk);
+                    restored = true;
+                    if (pk_ck >= 0) {   // (the prompt leaves the parked conversation: its checkpoint over the parked K/V)
+                        if (model.ckpt_restore(pk_ck, ckpts[(size_t) pk_ck].len, err)) {
+                            resume = (size_t) ckpts[(size_t) pk_ck].len;
+                            fed.resize(resume);
+                            ckpts[(size_t) pk_ck].used = ++ckpt_clock;
+                        } else resume = 0;
+                    }
+                } else {
+                    std::fprintf(stderr, "strata-dense: %s\n", err.c_str());
+                    buf_free(P.buf);
+                    parks.erase(parks.begin() + pk);
+                    resume = 0;   // (the copy may have left part of the K/V overwritten)
+                    fed.clear();
+                }
+            } else if (ck >= 0 && model.ckpt_restore(ck, ckpts[(size_t) ck].len, err)) {
+                resume = (size_t) ckpts[(size_t) ck].len;
                 fed.resize(resume);
-                ckpts[(size_t) best].used = ++ckpt_clock;
+                ckpts[(size_t) ck].used = ++ckpt_clock;
                 restored = true;
             }
         }
@@ -651,13 +769,26 @@ int main(int argc, char** argv) {
         bool cancelled = false, failed = false;
         const auto t_prompt = Clock::now();
         const int ch = model.chunk();
-        int64_t anchor_at = -1;   // the last message header (a checkpoint), when it is still to be read
-        if (n_ckpt > 0 && im_start >= 0)
-            for (int64_t j = n - 1; j > (int64_t) resume; --j)
-                if (ids[(size_t) j] == im_start) { anchor_at = j; break; }
+        // checkpoints still to be read: the last message header, the first one after the system prompt (agents
+        // sharing it), and where the prompt left the conversation in the model (two conversations taking turns)
+        std::vector<int64_t> anchors;
+        int64_t shared_at[2] = {-1, diverge_at};   // (the anchors other conversations share: evicted last)
+        if (n_ckpt > 0) {
+            if (im_start >= 0) {
+                for (int64_t j = n - 1; j > (int64_t) resume; --j)
+                    if (ids[(size_t) j] == im_start) { anchors.push_back(j); break; }
+                for (int64_t j = 1; j < n; ++j)
+                    if (ids[(size_t) j] == im_start) { shared_at[0] = j; if (j > (int64_t) resume) anchors.push_back(j); break; }
+            }
+            if (diverge_at > (int64_t) resume && diverge_at < n) anchors.push_back(diverge_at);
+            std::sort(anchors.begin(), anchors.end());
+            anchors.erase(std::unique(anchors.begin(), anchors.end()), anchors.end());
+        }
+        size_t next_anchor = 0;
         for (int64_t i = (int64_t) resume; i < n && !failed;) {
             int T = (int) std::min<int64_t>(ch, n - i);
-            if (anchor_at > i && anchor_at < i + T) T = (int) (anchor_at - i);   // a chunk ends at the header
+            const int64_t anchor_at = next_anchor < anchors.size() ? anchors[next_anchor] : -1;
+            if (anchor_at > i && anchor_at < i + T) T = (int) (anchor_at - i);   // a chunk ends at the anchor
             const bool last = i + T == n;
             if (!model.forward(ids.data() + i, T, false, last ? strata::core::DenseModel::kLast : strata::core::DenseModel::kNone, err)) {
                 std::printf("ERR %s\n", err.c_str()); failed = true; break;
@@ -676,16 +807,25 @@ int main(int argc, char** argv) {
             fed.insert(fed.end(), idk.begin() + i, idk.begin() + i + T);
             i += T;
             if (i == anchor_at) {
+                ++next_anchor;
                 const uint64_t h = prefix_hash(idk, i);
+                const bool shared = i == shared_at[0] || i == shared_at[1];
                 int slot = -1;
                 for (int c = 0; c < n_ckpt && slot < 0; ++c)
-                    if (ckpts[(size_t) c].len == i && ckpts[(size_t) c].hash == h) slot = -2;   // (already there)
+                    if (ckpts[(size_t) c].len == i && ckpts[(size_t) c].hash == h) {   // (already there)
+                        slot = -2;
+                        ckpts[(size_t) c].shared |= shared;
+                    }
                 if (slot == -1) {
+                    // the least recently used, a conversation's own (last header) checkpoints before the shared ones
                     slot = 0;
-                    for (int c = 1; c < n_ckpt; ++c)
-                        if (ckpts[(size_t) c].used < ckpts[(size_t) slot].used) slot = c;
+                    for (int c = 1; c < n_ckpt; ++c) {
+                        const Ckpt& a = ckpts[(size_t) c];
+                        const Ckpt& b = ckpts[(size_t) slot];
+                        if (a.shared != b.shared ? !a.shared : a.used < b.used) slot = c;
+                    }
                     if (model.ckpt_save(slot, err)) {
-                        ckpts[(size_t) slot] = {i, h, ++ckpt_clock};
+                        ckpts[(size_t) slot] = {i, h, ++ckpt_clock, shared};
                         std::fprintf(stderr, "strata-dense: checkpoint %d at position %lld\n", slot, (long long) i);
                     }
                     else { std::fprintf(stderr, "strata-dense: %s\n", err.c_str()); ckpts[(size_t) slot].len = -1; }
@@ -1115,7 +1255,7 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         std::fprintf(stderr, "strata-dense: prompt %lld tokens = %zu reused%s + %lld read in %.0f ms (%.0f tok/s), %lld generated "
                      "in %.0f ms (%.1f tok/s)%s; %s %lld rounds (%lld by lookup), %lld of %lld drafts kept (%.2f tokens a round, drafter %.1f ms a draft)\n",
-                     (long long) n, resume, restored ? " (checkpoint)" : "", (long long) (n - (long long) resume), prompt_ms,
+                     (long long) n, resume, restored ? " (restored)" : "", (long long) (n - (long long) resume), prompt_ms,
                      prompt_ms > 0 ? 1000.0 * (n - (long long) resume) / prompt_ms : 0.0, produced, decode_ms,
                      decode_ms > 0 ? 1000.0 * produced / decode_ms : 0.0, cancelled ? " (cancelled)" : "",
                      use_df ? model.dflash_kind() : "MTP", rounds, lookup_rounds, accepted, drafted, rounds ? (double) (accepted + rounds) / rounds : 0.0,
