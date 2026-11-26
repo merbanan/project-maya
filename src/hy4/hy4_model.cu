@@ -4135,6 +4135,15 @@ struct Model::Impl {
             }
             eg_table = pk.data(*tt);
             eg_bytes = tt->bytes;
+#if !defined(_WIN32)
+            // a lookup reads one 96-byte row of tens of GB: without this, each page fault reads the kernel's read-around
+            // (128 KB by default) into the page cache - ~30x the pages the rows need, pushing the CPU lane's experts out
+            // of the RAM (read from the disk again at their next use).  HY4_EG_RANDOM=0: the kernel's default
+            if (const char* er = std::getenv("HY4_EG_RANDOM"); er == nullptr || std::atoi(er) != 0) {
+                const uintptr_t a = (uintptr_t) eg_table, b = a & ~(uintptr_t) 4095;
+                (void) madvise((void*) b, eg_bytes + (a - b), MADV_RANDOM);
+            }
+#endif
             if (pk.has("engram_eps")) eg_eps = (float) pk.num("engram_eps");
             if (const char* ee = std::getenv("HY4_ENGRAM_EPS")) eg_eps = (float) std::atof(ee);
             if (!(eg_eps > 0.0f) || eg_eps > 1.0f) {
@@ -5494,9 +5503,11 @@ struct Model::Impl {
         int probe_l = -1;
         for (Layer& l : L) {
             if (!l.partial()) continue;
-            if (!l.cex.q4x_can()) return;   // (every lane layer of the form, or none)
-            per = std::max(per, (double) (2 * l.cex.q4x_gu + l.cex.q4x_d));
             lane_b += (double) (g.n_expert - l.n_res) * (double) (2 * l.cex.g_stride + l.cex.d_stride);
+            // (the layers of the form alone - a size with IQ2_XXS experts in some layers and other types in the rest,
+            //  as Maya-S's IQ3_XXS layers 24-41: the others run on the file's rows, an expert without a copy as ever)
+            if (!l.cex.q4x_can()) continue;
+            per = std::max(per, (double) (2 * l.cex.q4x_gu + l.cex.q4x_d));
             if (probe_l < 0) probe_l = l.il;
         }
         if (probe_l < 0 || per <= 0) return;
@@ -5577,7 +5588,7 @@ struct Model::Impl {
     void q4x_spawn() {
         const double budget = q4x_budget;
         for (Layer& l : L)
-            if (l.partial()) l.cex.q4x = std::make_shared<Q4xSet>(g.n_expert);
+            if (l.partial() && l.cex.q4x_gu > 0) l.cex.q4x = std::make_shared<Q4xSet>(g.n_expert);
         const int nodes = lane->nodes();
         q4x_builder = std::thread([this, budget, nodes] {
             lower_this_thread();
