@@ -1345,8 +1345,9 @@ constexpr int kTcLd = 584, kTcLdP = 40, kTcLdO = 516;   // (smem strides: F16 ro
 constexpr size_t kTcTileB = (size_t) 2 * 16 * kTcLd * 2;                   // (2 x 16 rows of F16: the Q staging alike)
 constexpr size_t kTcOutB = (size_t) 16 * kTcLdO * 4;
 constexpr size_t kTcUnionB = kTcTileB > kTcOutB ? kTcTileB : kTcOutB;
-constexpr size_t kTcSmem = kTcUnionB + (size_t) 8 * 2 * 256 * 4 + (size_t) 16 * 33 * 4 + (size_t) 2 * 16 * kTcLdP * 2;
-template <bool Q8>
+constexpr size_t kTcSmem = kTcUnionB + (size_t) 8 * 2 * 256 * 4 + (size_t) 16 * 33 * 4 + (size_t) 2 * 16 * kTcLdP * 2 +
+                           (size_t) (3 * 16 + 256) * 4;
+template <bool Q8, int NT>
 __global__ void __launch_bounds__(256) attn_tc_kernel(const float* __restrict__ q, int H, const void* __restrict__ cache_v,
                                                       int ring, const int* __restrict__ keys, int ldk,
                                                       const int* __restrict__ lo, const int* __restrict__ nk, float scale,
@@ -1359,10 +1360,18 @@ __global__ void __launch_bounds__(256) attn_tc_kernel(const float* __restrict__ 
     float* S = sp + 8 * 2 * 256;                                      // [16][33]
     __half* Ph = (__half*) (S + 16 * 33);                             // [16][kTcLdP]
     __half* Pl = Ph + 16 * kTcLdP;
+    float* mrun = (float*) (Pl + 16 * kTcLdP);   // [16] the chunk's running maximum a head, [16] its sum, [16] the step's
+    float* lrun = mrun + 16;                      //  rescale; [256] each accumulator element's row (rmap)
+    float* arun = lrun + 16;
+    float* rmap = arun + 16;
     const int c = blockIdx.x, hb = blockIdx.y * 16, t = blockIdx.z, tid = threadIdx.x, wp = tid >> 5;
-    const int n = nk[t], k0 = c * kKCmin;
+    const int n = nk[t], k0 = c * kKCmin * NT;
     if (k0 >= n) return;   // (attn_combine_kernel reads the chunks with keys only)
-    const int nr = min(kKCmin, n - k0);
+    if (tid < 16) {
+        mrun[tid] = -INFINITY;
+        lrun[tid] = 0.0f;
+    }
+    rmap[tid] = (float) (tid >> 4);
     // the queries, split, through the staging room into each warp's fragments of its k-steps
     for (int i = tid; i < 16 * 576; i += 256) {
         const int h = i / 576, d = i % 576;
@@ -1382,12 +1391,21 @@ __global__ void __launch_bounds__(256) attn_tc_kernel(const float* __restrict__ 
             wm::load_matrix_sync(qb[j], tile + 16 * kTcLd + d0, kTcLd);
         }
     __syncthreads();
-    // the chunk's 32 rows as F16 (rows past the keys: zero - their probabilities are 0, a NaN would not be)
+    wm::fragment<wm::accumulator, 16, 16, 16, float> frow;
+    wm::load_matrix_sync(frow, rmap, 16, wm::mem_row_major);
+    wm::fragment<wm::accumulator, 16, 16, 16, float> ov[4];
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) wm::fill_fragment(ov[nt], 0.0f);
+    for (int tt = 0; tt < NT; ++tt) {
+    const int kt0 = k0 + kKCmin * tt;
+    if (kt0 >= n) break;   // (uniform: the block's token)
+    const int nr = min(kKCmin, n - kt0);
+    // the step's 32 rows as F16 (rows past the keys: zero - their probabilities are 0, a NaN would not be)
     for (int i = tid; i < kKCmin * 72; i += 256) {
         const int r = i / 72, w = i % 72;
         uint4 u = make_uint4(0u, 0u, 0u, 0u);
         if (r < nr) {
-            const int p = keys ? keys[(size_t) t * ldk + k0 + r] : lo[t] + k0 + r, row = ring > 0 ? p % ring : p;
+            const int p = keys ? keys[(size_t) t * ldk + kt0 + r] : lo[t] + kt0 + r, row = ring > 0 ? p % ring : p;
             if (!Q8) {
                 u = ((const uint4*) cache_v)[(size_t) row * 72 + w];
             } else {
@@ -1427,7 +1445,8 @@ __global__ void __launch_bounds__(256) attn_tc_kernel(const float* __restrict__ 
         wm::store_matrix_sync(sp + (wp * 2 + tl) * 256, acc, 16, wm::mem_row_major);
     }
     __syncthreads();
-    // thread (head tid / 16, rows tid % 16 and + 16): the scores, the chunk's maximum and sum, the probabilities
+    // thread (head tid / 16, rows tid % 16 and + 16): the step's scores, the chunk's running maximum and sum (the
+    // step's rescale of the sums so far), the probabilities
     {
         const int h = tid >> 4, r = tid & 15;
         float v[2];
@@ -1441,10 +1460,12 @@ __global__ void __launch_bounds__(256) attn_tc_kernel(const float* __restrict__ 
         float mx = fmaxf(v[0], v[1]);
 #pragma unroll
         for (int k = 8; k >= 1; k >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, k));
+        const float m_old = mrun[h], m_new = fmaxf(m_old, mx);
+        const float alpha = m_old == m_new ? 1.0f : expf(m_old - m_new);
         float sum = 0.0f;
 #pragma unroll
         for (int tl = 0; tl < 2; ++tl) {
-            const float p = 16 * tl + r < nr ? expf(v[tl] - mx) : 0.0f;
+            const float p = 16 * tl + r < nr ? expf(v[tl] - m_new) : 0.0f;
             sum += p;
             const __half ph = __float2half_rn(p);
             Ph[h * kTcLdP + 16 * tl + r] = ph;
@@ -1452,17 +1473,18 @@ __global__ void __launch_bounds__(256) attn_tc_kernel(const float* __restrict__ 
         }
 #pragma unroll
         for (int k = 8; k >= 1; k >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, k);
+        __syncwarp();   // (every lane of the head read mrun first)
         if (r == 0) {
-            float* o = ws + (((size_t) t * H + hb + h) * nchunk + c) * (512 + 2);
-            o[0] = mx;
-            o[1] = sum;
+            mrun[h] = m_new;
+            lrun[h] = lrun[h] * alpha + sum;
+            arun[h] = alpha;
         }
     }
     __syncthreads();
-    // the weighted sums: warp w's 4 tiles of 16 output dimensions over the chunk's 32 rows
-    wm::fragment<wm::accumulator, 16, 16, 16, float> ov[4];
+    // the weighted sums: warp w's 4 tiles of 16 output dimensions, rescaled to the new maximum, plus the step's 32 rows
 #pragma unroll
-    for (int nt = 0; nt < 4; ++nt) wm::fill_fragment(ov[nt], 0.0f);
+    for (int nt = 0; nt < 4; ++nt)
+        for (int i = 0; i < ov[nt].num_elements; ++i) ov[nt].x[i] *= arun[(int) frow.x[i]];
 #pragma unroll
     for (int kt = 0; kt < 2; ++kt) {
         wm::fragment<wm::matrix_a, 16, 16, 16, __half, wm::row_major> pa, pb;
@@ -1476,7 +1498,13 @@ __global__ void __launch_bounds__(256) attn_tc_kernel(const float* __restrict__ 
             wm::mma_sync(ov[nt], pb, vb, ov[nt]);
         }
     }
-    __syncthreads();   // (the rows read: their room takes the outputs)
+    __syncthreads();   // (the step's rows and probabilities: the next step's room)
+    }
+    if (tid < 16) {
+        float* o = ws + (((size_t) t * H + hb + tid) * nchunk + c) * (512 + 2);
+        o[0] = mrun[tid];
+        o[1] = lrun[tid];
+    }
 #pragma unroll
     for (int nt = 0; nt < 4; ++nt) wm::store_matrix_sync(outst + wp * 64 + nt * 16, ov[nt], kTcLdO, wm::mem_row_major);
     __syncthreads();
@@ -3212,10 +3240,12 @@ bool attn_tc_on() {
         int major = 0;
         const bool ok = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
                         major >= 7 &&
-                        cudaFuncSetAttribute(attn_tc_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                             (int) kTcSmem) == cudaSuccess &&
-                        cudaFuncSetAttribute(attn_tc_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                             (int) kTcSmem) == cudaSuccess;
+                        cudaFuncSetAttribute(attn_tc_kernel<true, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcSmem) == cudaSuccess &&
+                        cudaFuncSetAttribute(attn_tc_kernel<false, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcSmem) == cudaSuccess &&
+                        cudaFuncSetAttribute(attn_tc_kernel<true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcSmem) == cudaSuccess &&
+                        cudaFuncSetAttribute(attn_tc_kernel<false, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcSmem) == cudaSuccess &&
+                        cudaFuncSetAttribute(attn_tc_kernel<true, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcSmem) == cudaSuccess &&
+                        cudaFuncSetAttribute(attn_tc_kernel<false, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcSmem) == cudaSuccess;
         if (!ok) (void) cudaGetLastError();
         v = ok ? 2 : 1;
         known[dev].store(v, std::memory_order_relaxed);
@@ -3234,7 +3264,7 @@ void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint1
     }
     // (every window of the token path - a decode step, a draft's verify window - in chunks of kKCmin: a token's sums are
     // the same whichever window it is in, so drafting does not change a greedy answer)
-    const int kc = T <= kMaxWin ? kKCmin : kKC, nchunk = (max_keys + kc - 1) / kc;
+    int kc = T <= kMaxWin ? kKCmin : kKC, nchunk = (max_keys + kc - 1) / kc;
     const int rb = q8 ? (int) kv_q8_row_bytes(kv_lora, n_rot) : 0;
     const int hb = attn_heads_a_block();
     // (8 heads a block - NVIDIA, or HY4_ATTN_HB=8 on AMD: attn2_kernel, attn_kernel's sums in fewer loads; HY4_ATTN_OLD:
@@ -3252,9 +3282,21 @@ void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint1
         else attn_kernel<false><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, 0);
     } else if (kc == kKCmin && H % 16 == 0 && attn_tc_on()) {
 #if !defined(MAYA_USE_HIP)
+        // (HY4_ATTN_TC_NT=2 / 4: a block's steps of 32 keys - the queries staged and split once for 64 / 128 keys,
+        //  fewer chunks for attn_combine_kernel; 1, the default: a step a block - a V100 at 16K, one token: 4 steps
+        //  36.1-36.4 tok/s against 37.8-38.0, fewer blocks than the GPU has room for)
+        static const int nt_env = std::getenv("HY4_ATTN_TC_NT") ? std::atoi(std::getenv("HY4_ATTN_TC_NT")) : 1;
+        const int NTv = nt_env >= 4 ? 4 : nt_env >= 2 ? 2 : 1;
+        kc = kKCmin * NTv;
+        nchunk = (max_keys + kc - 1) / kc;
         const dim3 g16((unsigned) nchunk, (unsigned) (H / 16), (unsigned) T);
-        if (q8) attn_tc_kernel<true><<<g16, 256, kTcSmem, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, ws, rb);
-        else attn_tc_kernel<false><<<g16, 256, kTcSmem, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, ws, 0);
+#define TC_(NTc)                                                                                                        \
+    if (q8) attn_tc_kernel<true, NTc><<<g16, 256, kTcSmem, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, ws, rb); \
+    else attn_tc_kernel<false, NTc><<<g16, 256, kTcSmem, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, ws, 0);
+        if (NTv == 4) { TC_(4) }
+        else if (NTv == 2) { TC_(2) }
+        else { TC_(1) }
+#undef TC_
 #endif
     } else {
         if (q8) attn2_kernel<true><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
